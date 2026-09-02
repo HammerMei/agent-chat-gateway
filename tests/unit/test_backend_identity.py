@@ -167,7 +167,7 @@ class TestSessionReuseRequiresMatchingIdentity(unittest.IsolatedAsyncioTestCase)
         await self._start(lifecycle, wc, state)
 
         agent.create_session.assert_not_called()
-        self.assertEqual(lifecycle._states["w1"].session_id, "old-session-id")
+        self.assertEqual(lifecycle.get_watcher_state("w1").session_id, "old-session-id")
 
     async def test_a_changed_working_directory_forces_a_fresh_session(self):
         """The failure this exists to prevent: same agent name, different session store."""
@@ -177,7 +177,7 @@ class TestSessionReuseRequiresMatchingIdentity(unittest.IsolatedAsyncioTestCase)
         await self._start(lifecycle, wc, state)
 
         agent.create_session.assert_called_once()
-        self.assertEqual(lifecycle._states["w1"].session_id, "fresh-session-id")
+        self.assertEqual(lifecycle.get_watcher_state("w1").session_id, "fresh-session-id")
 
     async def test_a_changed_backend_type_forces_a_fresh_session(self):
         lifecycle, _, agent, wc = self._make_lifecycle(agent_type="opencode")
@@ -204,7 +204,7 @@ class TestSessionReuseRequiresMatchingIdentity(unittest.IsolatedAsyncioTestCase)
         await self._start(lifecycle, wc, state)
 
         agent.create_session.assert_called_once()
-        self.assertEqual(lifecycle._states["w1"].session_id, "fresh-session-id")
+        self.assertEqual(lifecycle.get_watcher_state("w1").session_id, "fresh-session-id")
 
     async def test_a_record_with_no_room_forces_a_fresh_session(self):
         """An empty `room_id` is a mismatch, not an exemption.
@@ -350,7 +350,7 @@ class TestSessionReuseRequiresMatchingIdentity(unittest.IsolatedAsyncioTestCase)
         lifecycle, _, agent, wc = self._make_lifecycle()
 
         await self._start(lifecycle, wc, None)
-        first = lifecycle._states["w1"]
+        first = lifecycle.get_watcher_state("w1")
         self.assertEqual(first.session_id, "fresh-session-id")
         self.assertEqual(first.backend_identity, backend_identity("claude", "/srv/work"))
 
@@ -358,7 +358,7 @@ class TestSessionReuseRequiresMatchingIdentity(unittest.IsolatedAsyncioTestCase)
         await self._start(lifecycle2, wc2, first)
 
         agent2.create_session.assert_not_called()
-        self.assertEqual(lifecycle2._states["w1"].session_id, "fresh-session-id")
+        self.assertEqual(lifecycle2.get_watcher_state("w1").session_id, "fresh-session-id")
 
 
 if __name__ == "__main__":

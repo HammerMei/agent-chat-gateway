@@ -25,7 +25,7 @@ from gateway.core.state import (
     connector_name_of,
     save_state,
 )
-from tests.helpers import make_lifecycle, start_watcher
+from tests.helpers import install_record, make_lifecycle, register_processor, start_watcher
 
 
 class TestOneSessionOneRoom(unittest.TestCase):
@@ -386,7 +386,7 @@ class TestConfigRefusesARoomTwice(unittest.TestCase):
 class TestARefusedBindingLeavesNothingBehind(unittest.IsolatedAsyncioTestCase):
     """A refusal must not poison the state file.
 
-    `bind_session` raises after `self._states[wc.name]` has already been written. Left
+    `bind_session` raises after `self.get_watcher_state(wc.name)` has already been written. Left
     alone, `sync_watchers` persists that record and the freshly created backend session
     is never deleted — and then the *load-time* uniqueness check refuses to boot on the
     record the runtime conflict produced. A transient collision would become a daemon
@@ -427,8 +427,8 @@ class TestARefusedBindingLeavesNothingBehind(unittest.IsolatedAsyncioTestCase):
 
     async def test_the_watcher_state_is_not_left_behind(self):
         lc, _ = await self._start_with_refusing_bind()
-        self.assertNotIn(
-            "w1", lc._states,
+        self.assertIsNone(
+            lc.get_watcher_state("w1"),
             "a refused watcher must not leave a record for sync_watchers to persist",
         )
 
@@ -502,8 +502,10 @@ class TestAClearedWatermarkSurvivesToDisk(unittest.IsolatedAsyncioTestCase):
         # builds one tests something the system cannot do.
         processor = MagicMock()
         processor.stop = AsyncMock()
-        lc._processors["w1"] = processor
-        return lc
+        # Registered by the tests, together with the record: a processor cannot
+        # be resident for a watcher that has no record, and the lifecycle
+        # refuses to register one (`_set_processor`).
+        return lc, processor
 
     def _state(self):
         from gateway.core.state import WatcherState
@@ -514,10 +516,10 @@ class TestAClearedWatermarkSurvivesToDisk(unittest.IsolatedAsyncioTestCase):
         )
 
     async def test_a_deliberate_clear_erases_the_stored_mark(self):
-        lc = self._lifecycle(live_ts="")
+        lc, processor = self._lifecycle(live_ts="")
         state = self._state()
 
-        lc._states["w1"] = state
+        install_record(lc, state, as_name="w1", processor=processor)
         await lc._stop_processor("w1")
 
         self.assertEqual(
@@ -528,19 +530,19 @@ class TestAClearedWatermarkSurvivesToDisk(unittest.IsolatedAsyncioTestCase):
     async def test_no_opinion_leaves_the_stored_mark_alone(self):
         """The near miss: a quiet room reports `None`, and erasing on that would lose the
         outage window across every restart."""
-        lc = self._lifecycle(live_ts=None)
+        lc, processor = self._lifecycle(live_ts=None)
         state = self._state()
 
-        lc._states["w1"] = state
+        install_record(lc, state, as_name="w1", processor=processor)
         await lc._stop_processor("w1")
 
         self.assertEqual(state.last_processed_ts, "100")
 
     async def test_a_live_watermark_is_still_copied(self):
-        lc = self._lifecycle(live_ts="900")
+        lc, processor = self._lifecycle(live_ts="900")
         state = self._state()
 
-        lc._states["w1"] = state
+        install_record(lc, state, as_name="w1", processor=processor)
         await lc._stop_processor("w1")
 
         self.assertEqual(state.last_processed_ts, "900")

@@ -18,7 +18,7 @@ from unittest.mock import AsyncMock, MagicMock
 from gateway.core.lifecycle_sweep import LifecycleSweep
 from gateway.core.permission_state import PermissionRegistry, PermissionRequest
 from gateway.core.state import WatcherState, past_idle_ttl
-from tests.helpers import make_lifecycle
+from tests.helpers import install_record, make_lifecycle, register_processor
 
 TZ = timezone.utc
 NOW = datetime(2026, 8, 16, 12, 0, 0, tzinfo=TZ)
@@ -72,9 +72,9 @@ def _harness(records, *, processors=None, registry=None):
                                permission_registry=registry)
     lifecycle._attachment_workspace = MagicMock()
     for r in records:
-        lifecycle._states[r.watcher_name] = r
+        install_record(lifecycle, r, as_name=r.watcher_name)
     for name, proc in (processors or {}).items():
-        lifecycle._processors[name] = proc
+        register_processor(lifecycle, name, proc)
     sweep = LifecycleSweep(lifecycle, now=lambda: NOW)
     return sweep, lifecycle, connector
 
@@ -98,7 +98,7 @@ class TestTheSweepDropsAnIdleWatcher(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(dropped, ["w1"], "the drop completed")
         proc.stop.assert_awaited_once()
-        self.assertNotIn("w1", lifecycle._processors)
+        self.assertIsNone(lifecycle.get_processor("w1"))
         self.assertEqual(record.dropped_at, _iso(NOW))
         self.assertEqual(record.last_processed_ts, "the-records-own",
                          "a failed read keeps the record's own watermark")
@@ -114,7 +114,7 @@ class TestTheSweepDropsAnIdleWatcher(unittest.IsolatedAsyncioTestCase):
         # The record is settled from the sweep's own clock — one pass, one instant.
         self.assertEqual(record.dropped_at, _iso(NOW))
         # The runtime is released…
-        self.assertNotIn("w1", lifecycle._processors)
+        self.assertIsNone(lifecycle.get_processor("w1"))
         lifecycle._dispatcher.remove_processor.assert_called_once_with(
             "room-w1", proc)
         proc.stop.assert_awaited_once()
@@ -131,7 +131,7 @@ class TestTheSweepDropsAnIdleWatcher(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(await sweep.run_once(), [])
         self.assertEqual(record.dropped_at, "")
-        self.assertIn("w1", lifecycle._processors)
+        self.assertIsNotNone(lifecycle.get_processor("w1"))
 
     async def test_the_frozen_rule_decides_not_a_shared_default(self):
         """Two records the same age, different frozen TTLs — the sweep reads

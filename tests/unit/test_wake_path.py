@@ -30,6 +30,8 @@ from tests.helpers import (
     make_core_config,
     make_lifecycle,
     make_rc_config,
+    install_record,
+    pop_processor,
 )
 
 ROOM_ID = "wake-1"
@@ -135,7 +137,7 @@ class TestTheWakeResumesTheSameSession(unittest.IsolatedAsyncioTestCase):
             # slot released — record, session and connector room state intact.
             proc = lifecycle.processor_named(name)
             self.assertIsNotNone(proc)
-            lifecycle._processors.pop(name)
+            pop_processor(lifecycle, name)
             dispatcher.remove_processor(ROOM_ID, proc)
             self.assertIs(dispatcher.capacity(ROOM_ID), RoomCapacity.UNROUTED)
             self.assertIn(ROOM_ID, connector._rooms,
@@ -415,7 +417,7 @@ class TestAFailedRecreationKeepsTheRecord(unittest.IsolatedAsyncioTestCase):
             record = lifecycle.get_watcher_state(name)
             session_id = record.session_id
             proc = lifecycle.processor_named(name)
-            lifecycle._processors.pop(name)
+            pop_processor(lifecycle, name)
             dispatcher.remove_processor(ROOM_ID, proc)
 
             # 2. The wake, with a failure inside the start (context injection
@@ -477,7 +479,7 @@ class TestAWakeParkedOnTheLockRespectsShutdown(unittest.IsolatedAsyncioTestCase)
 
             await connector._on_unrouted_message(_doc("m1", 1500), _ACCESS)
             proc = lifecycle.processor_named(name)
-            lifecycle._processors.pop(name)
+            pop_processor(lifecycle, name)
             dispatcher.remove_processor(ROOM_ID, proc)
 
             # The wake, parked on the watcher lock (what the sweep's drop
@@ -588,7 +590,7 @@ class TestARuleLessManagerStillWakesRecords(unittest.IsolatedAsyncioTestCase):
             record = lifecycle.get_watcher_state(name)
             session_id = record.session_id
             proc = lifecycle.processor_named(name)
-            lifecycle._processors.pop(name)
+            pop_processor(lifecycle, name)
             dispatcher.remove_processor(ROOM_ID, proc)
 
             # The operator removes the last rule and restarts, in miniature:
@@ -632,7 +634,7 @@ class TestAWakePreservesTheRecordsRoomName(unittest.IsolatedAsyncioTestCase):
             name="rc-gdm-1", room_id="gdm-1",
             room_name="alice, bob", room_kind="group_dm",
         )
-        lifecycle._states["rc-gdm-1"] = record
+        install_record(lifecycle, record, as_name="rc-gdm-1")
 
         # The wake's offered ref: no participants — the tracked channel
         # state does not retain them.

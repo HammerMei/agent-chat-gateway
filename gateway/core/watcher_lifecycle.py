@@ -101,8 +101,15 @@ class WatcherLifecycle:
         self._attachment_workspace = AttachmentWorkspace(connector)
         self._blocked_agents: set[str] = set()
 
+        # Keyed by ROOM ID — the identity the design gives a watcher (§2.3),
+        # and the key `record_for_room` answers in O(1). Every write goes
+        # through `_install`/`_uninstall`, which keep `_room_of` in step.
         self._processors: dict[str, MessageProcessor] = {}
         self._states: dict[str, WatcherState] = {}
+        # watcher name → room id. The name is what operators type and what
+        # `WatcherConfig.name` carries, so every by-name read goes through
+        # this; it is the ONLY place the two identities meet.
+        self._room_of: dict[str, str] = {}
         # Per-watcher mutex: prevents concurrent pause/resume/reset commands for
         # the same watcher from racing through _stop_processor / the start.
         # The control socket can serve multiple simultaneous clients, so two
@@ -208,11 +215,96 @@ class WatcherLifecycle:
                 "its first message)", name,
             )
         for name, ws in persisted.items():
-            if (ws.rule_name or ws.config) and name not in self._states:
-                self._states[name] = ws
+            if (ws.rule_name or ws.config) and name not in self._room_of:
+                self._hydrate(ws)
 
-        self._state_store.save(self._states, prune=prune)
+        self._state_store.save(self._by_name(), prune=prune)
         return errors
+
+    # ── Two identities, one index ─────────────────────────────────────────────
+    #
+    # A record is stored under its ROOM ID and found by name through `_room_of`.
+    # These methods are the only code that touches the three together; a write
+    # that bypasses them is how the two identities come to disagree.
+
+    def _install(self, ws: WatcherState) -> None:
+        """Make `ws` the record for its room, and its name resolve to that room.
+
+        Strict on the one thing the design forbids: a name that already names a
+        DIFFERENT room. `start_watcher_in_room` refuses that case before it gets
+        here (step 0.5), so reaching it means a caller found a new way round —
+        raise, rather than silently re-point the operator's name at another
+        room's session, watermark and pause flag.
+        """
+        if not ws.room_id:
+            raise ValueError(
+                f"watcher '{ws.watcher_name}' has no room id — a record without "
+                f"one cannot be recreated and must not be installed")
+        held = self._room_of.get(ws.watcher_name)
+        if held is not None and held != ws.room_id:
+            raise RuntimeError(
+                f"watcher name '{ws.watcher_name}' already belongs to room "
+                f"'{held}'; refusing to re-point it at room '{ws.room_id}'")
+        previous = self._states.get(ws.room_id)
+        if previous is not None and previous.watcher_name != ws.watcher_name:
+            # The room's record is being replaced under a new name (a rename
+            # surfaced through recreation). The old name must stop resolving.
+            self._room_of.pop(previous.watcher_name, None)
+        self._states[ws.room_id] = ws
+        self._room_of[ws.watcher_name] = ws.room_id
+
+    def _uninstall(self, name: str) -> WatcherState | None:
+        """Remove the record a name resolves to, and the name. `None` if absent."""
+        room_id = self._room_of.pop(name, None)
+        if room_id is None:
+            return None
+        return self._states.pop(room_id, None)
+
+    def _hydrate(self, ws: WatcherState) -> bool:
+        """`_install` for the startup replay: skip and say why, never raise.
+
+        Two shapes of bad record, both left ON DISK — `StateStore.save` merges
+        disk with memory and removes only what it is told to prune, so skipping
+        here is non-destructive and an operator can still read the file.
+        """
+        if not ws.room_id:
+            logger.warning(
+                "Skipping persisted watcher '%s': it has no room id, so nothing "
+                "could recreate it. Left on disk for inspection.", ws.watcher_name)
+            return False
+        holder = self._states.get(ws.room_id)
+        if holder is not None:
+            logger.error(
+                "Skipping persisted watcher '%s': room %s already belongs to "
+                "watcher '%s'. Two records for one room violates sticky binding "
+                "(§2.4); the first one loaded wins, the other is left on disk.",
+                ws.watcher_name, ws.room_id, holder.watcher_name)
+            return False
+        self._install(ws)
+        return True
+
+    def _state_named(self, name: str) -> WatcherState | None:
+        room_id = self._room_of.get(name)
+        return None if room_id is None else self._states.get(room_id)
+
+    def _processor_named(self, name: str) -> "MessageProcessor | None":
+        room_id = self._room_of.get(name)
+        return None if room_id is None else self._processors.get(room_id)
+
+    def _set_processor(self, name: str, processor: "MessageProcessor") -> None:
+        room_id = self._room_of.get(name)
+        if room_id is None:
+            raise RuntimeError(
+                f"no record for watcher '{name}' — a processor cannot be "
+                f"registered before its record is installed")
+        self._processors[room_id] = processor
+
+    def _pop_processor(self, name: str) -> "MessageProcessor | None":
+        room_id = self._room_of.get(name)
+        return None if room_id is None else self._processors.pop(room_id, None)
+
+    def _by_name(self) -> dict[str, WatcherState]:
+        return {ws.watcher_name: ws for ws in self._states.values()}
 
     def _get_watcher_lock(self, name: str) -> asyncio.Lock:
         """Return (creating if needed) the per-watcher mutex for lifecycle ops."""
@@ -222,6 +314,13 @@ class WatcherLifecycle:
 
     def watcher_lock(self, name: str) -> asyncio.Lock:
         """The per-watcher mutex, for callers *outside* the lifecycle (§2.5).
+
+        Keyed by NAME, unlike `_states`/`_processors` (room id). Deliberate: a
+        lock is a mutex, not an identity, and it is taken BEFORE a record exists
+        — `WatcherManager._create` locks `wc.name` and only then calls
+        `start_watcher_in_room`, so there is no room-id index entry to key on
+        yet. Keying by name over-serialises at worst (two rooms that shared a
+        name in sequence share a lock object); it never routes anything.
 
         The manager's create/recreate takes this around the start it drives, so
         a wake cannot interleave with a pause's or an idle drop's teardown of
@@ -250,7 +349,7 @@ class WatcherLifecycle:
         name, which is #118's defect 1: the blank became the surviving copy
         on save, and the real session id was unrecoverable.
         """
-        record = self._states.get(name)
+        record = self._state_named(name)
         if record is None or not record.config:
             raise RuntimeError(
                 f"No watcher named '{name}' — pause acts on a record, and "
@@ -272,7 +371,7 @@ class WatcherLifecycle:
 
     async def _pause_locked(self, name: str) -> None:
         async with self._get_watcher_lock(name):
-            state = self._states.get(name)
+            state = self._state_named(name)
             if state is None or not state.config:
                 # Reclaimed while the pause waited on the lock — the same
                 # re-read rule resume and reset already apply (TOCTOU sweep
@@ -303,7 +402,7 @@ class WatcherLifecycle:
                     e,
                 )
             state.paused = True
-            self._state_store.save(self._states)
+            self._state_store.save(self._by_name())
             logger.info("Watcher '%s' paused", name)
 
     async def drop_idle(self, name: str, *, now) -> bool:
@@ -330,10 +429,10 @@ class WatcherLifecycle:
         sweep's injected clock (aware datetime).
         """
         async with self._get_watcher_lock(name):
-            state = self._states.get(name)
+            state = self._state_named(name)
             if state is None or state.paused or state.dropped_at:
                 return False
-            processor = self._processors.get(name)
+            processor = self._processor_named(name)
             if processor is None:
                 # Not resident: failed, or mid-transition. Boot owns failed
                 # records (§2.5, retry-at-every-start); a timer must not.
@@ -351,7 +450,7 @@ class WatcherLifecycle:
             if not past_idle_ttl(state, now):
                 return False
 
-            self._processors.pop(name, None)
+            self._pop_processor(name)
             if state.room_id:
                 self._dispatcher.remove_processor(state.room_id, processor)
                 # Capture the live watermark while the connector still holds the
@@ -385,7 +484,7 @@ class WatcherLifecycle:
             if state.session_id:
                 self._maps.remove_session(state.session_id)
             state.dropped_at = now.isoformat(timespec="seconds")
-            self._state_store.save(self._states)
+            self._state_store.save(self._by_name())
             logger.info(
                 "Watcher '%s' idled after %s day(s) without activity — session "
                 "kept, room still subscribed; its next message wakes it",
@@ -413,10 +512,10 @@ class WatcherLifecycle:
         record resident again, and a resident record is not idle.
         """
         async with self._get_watcher_lock(name):
-            state = self._states.get(name)
+            state = self._state_named(name)
             if state is None or state.paused or not state.dropped_at:
                 return False
-            if self._processors.get(name) is not None:
+            if self._processor_named(name) is not None:
                 return False
             if not past_expire_ttl(state, now):
                 return False
@@ -584,9 +683,9 @@ class WatcherLifecycle:
         # merges the stale disk row straight back. Restored, the record is
         # simply reclaimed again by whatever discovers it next, and that
         # retry re-attempts the prune — crash-honest, like the pop-last rule.
-        self._states.pop(name, None)
+        self._uninstall(name)
         try:
-            self._state_store.save(self._states, prune={name})
+            self._state_store.save(self._by_name(), prune={name})
         except Exception:
             # Restored DORMANT, not active-shaped (Codex round 27): the
             # cleanup above already stopped the processor and deleted the
@@ -599,7 +698,7 @@ class WatcherLifecycle:
             # this very prune.
             if not state.dropped_at:
                 state.dropped_at = now_iso()
-            self._states[name] = state
+            self._install(state)
             raise
 
     async def reclaim_room(
@@ -673,7 +772,7 @@ class WatcherLifecycle:
                 return None
             name = record.watcher_name
             async with self._get_watcher_lock(name):
-                if expected is not None and self._states.get(name) is not record:
+                if expected is not None and self._state_named(name) is not record:
                     # Re-checked UNDER the lock: the record was replaced while
                     # we waited, and the caller pinned this reclamation to the
                     # object it selected — the replacement is not its to
@@ -684,7 +783,7 @@ class WatcherLifecycle:
                     # while we waited. A stale snapshot has no authority over
                     # what just happened.
                     return None
-                if self._states.get(name) is not record:
+                if self._state_named(name) is not record:
                     # The record changed while we waited — an expiry reclaimed
                     # it, or a wake replaced it. Re-read and re-decide; the
                     # removal applies to the room, not to one snapshot of it.
@@ -697,7 +796,7 @@ class WatcherLifecycle:
                         room_id, name, reason,
                     )
                     return None
-                if self._processors.get(name) is not None:
+                if self._processor_named(name) is not None:
                     try:
                         await self._stop_processor(name)
                     except Exception as e:
@@ -759,7 +858,7 @@ class WatcherLifecycle:
         # refuses to. The raise is contained by the membership path's
         # safety-net logging; the room's first message then hits the start
         # guard and reports the same exit loudly.
-        existing = self._states.get(wc.name)
+        existing = self._state_named(wc.name)
         if existing is not None and existing.room_id and existing.room_id != room.id:
             raise RuntimeError(
                 f"Watcher name '{wc.name}' already belongs to room "
@@ -780,8 +879,8 @@ class WatcherLifecycle:
             backend_identity="",
             **provenance,
         )
-        self._states[wc.name] = ws
-        self._state_store.save(self._states)
+        self._install(ws)
+        self._state_store.save(self._by_name())
 
     async def resume_watcher(self, name: str) -> None:
         """Resume a paused watcher.
@@ -794,7 +893,7 @@ class WatcherLifecycle:
         provenance would wipe `rule`/`config`/`created_at`, and the next boot
         would prune the emptied record as an orphan (the A1 lesson, again).
         """
-        record = self._states.get(name)
+        record = self._state_named(name)
         wc = config_from_record(record) if record is not None else None
         if wc is None:
             raise RuntimeError(
@@ -813,7 +912,7 @@ class WatcherLifecycle:
 
     async def _resume_locked(self, name, wc, record) -> None:
         async with self._get_watcher_lock(name):
-            state = self._states.get(name)
+            state = self._state_named(name)
             if state is not None and state is not record:
                 # Replaced while the resume waited (TOCTOU sweep after Codex
                 # round 4): a reclaim-and-recreate cycle completed inside the
@@ -825,13 +924,13 @@ class WatcherLifecycle:
                     f"Watcher '{name}' was replaced while the resume waited — "
                     f"re-check 'list' and retry."
                 )
-            if name in self._processors:
+            if self._processor_named(name) is not None:
                 logger.info("Watcher '%s' is already running", name)
                 # Clear paused flag and persist — the watcher is already running
                 # so no restart is needed, but the flag must be updated.
                 if state:
                     state.paused = False
-                self._state_store.save(self._states)
+                self._state_store.save(self._by_name())
                 return
             if state is None or not state.config:
                 # The record was reclaimed while we waited on the lock (an
@@ -862,7 +961,7 @@ class WatcherLifecycle:
                 raise
             # The start constructed a fresh WatcherState with paused=False —
             # re-read and save what is actually in the map.
-            self._state_store.save(self._states)
+            self._state_store.save(self._by_name())
             logger.info("Watcher '%s' resumed", name)
 
     async def _resume_record(self, wc: WatcherConfig, record: WatcherState) -> None:
@@ -903,7 +1002,7 @@ class WatcherLifecycle:
         un-muted would erase an explicit instruction as a side effect of
         session hygiene. The operator resumes first, then resets.
         """
-        record = self._states.get(name)
+        record = self._state_named(name)
         wc = config_from_record(record) if record is not None else None
         if wc is None:
             raise RuntimeError(
@@ -933,7 +1032,7 @@ class WatcherLifecycle:
             # non-resident. The re-reads stay complete because every other
             # writer of these fields needs this same lock: nothing can change
             # them between the gates and the stop below.
-            state = self._states.get(name)
+            state = self._state_named(name)
             if state is None or not state.config:
                 # Reclaimed while the reset waited on the lock — same re-read
                 # rule as resume's.
@@ -994,7 +1093,7 @@ class WatcherLifecycle:
             except Exception as e:
                 logger.error("Failed to restart watcher '%s' after reset: %s", name, e)
                 raise
-            self._state_store.save(self._states)
+            self._state_store.save(self._by_name())
             logger.info("Watcher '%s' reset", name)
 
     def list_watchers(
@@ -1023,7 +1122,7 @@ class WatcherLifecycle:
           it.)
         """
         result = []
-        for name, state in sorted(self._state_store.merged_view(self._states).items()):
+        for name, state in sorted(self._state_store.merged_view(self._by_name()).items()):
             current = lifecycle_state(state, resident=self._is_resident(name))
             if current not in state_filter:
                 continue
@@ -1080,14 +1179,14 @@ class WatcherLifecycle:
         release it when the operation finishes — including when it *fails*, so a
         genuinely failed start reports `failed` the moment it gives up.
         """
-        if self._processors.get(name) is not None:
+        if self._processor_named(name) is not None:
             return True
         lock = self._watcher_locks.get(name)
         return lock is not None and lock.locked()
 
     def get_watcher_state(self, name: str):
         """Return the WatcherState for a watcher, or None if not found."""
-        return self._states.get(name)
+        return self._state_named(name)
 
     def get_processor(self, watcher_name: str) -> "MessageProcessor | None":
         """Return the active MessageProcessor for a watcher, or None if not running.
@@ -1096,7 +1195,7 @@ class WatcherLifecycle:
         processing queue, bypassing the connector layer entirely (and therefore
         the self-message filter that would drop messages sent by the bot user).
         """
-        return self._processors.get(watcher_name)
+        return self._processor_named(watcher_name)
 
     # ── Shutdown ──────────────────────────────────────────────────────────────
 
@@ -1113,7 +1212,8 @@ class WatcherLifecycle:
         the backends are even stopped — exceeding the ``stop_daemon()`` grace
         window and leaving ``opencode serve`` as an orphan process.
         """
-        names = list(self._processors)
+        names = [ws.watcher_name for ws in self._states.values()
+                 if ws.room_id in self._processors]
         results = await asyncio.gather(
             *[self._stop_processor(name) for name in names],
             return_exceptions=True,
@@ -1124,7 +1224,7 @@ class WatcherLifecycle:
 
     def save_state(self) -> None:
         """Persist current state (called before shutdown)."""
-        self._state_store.save(self._states)
+        self._state_store.save(self._by_name())
 
     # ── Read surface for the WatcherManager ──────────────────────────────────
     #
@@ -1135,44 +1235,29 @@ class WatcherLifecycle:
     def record_for_room(self, room_id: str) -> WatcherState | None:
         """The in-memory record bound to a room, if any (§2.4 sticky binding).
 
-        A linear scan because `_states` is keyed by the watcher HANDLE, while
-        §2.3's key table says it should be keyed by `(connector, room_id)`. That
-        re-keying has not happened — `_processors` and `_watcher_locks` are the
-        same — and it is **deliberately deferred**, not forgotten: it changes the
-        state file's shape, boot replay and every operator verb, so it is its own
-        increment (owner's call pending).
-
-        Two things this docstring used to say, both now false, and worth
-        correcting rather than deleting because they are why the deferral costs
-        something:
-
-        * "until cutover re-keys it" — the runtime cutover has happened, and did
-          not re-key these. The sentence quietly pointed at an event that was in
-          progress;
-        * "only consulted for rooms with no live processor, which is the rare
-          path" — it is now on the job path (`scheduler._get_sm_for_watcher`,
-          `_record_for`) and the wake path (`session_manager.inject_message`), so
-          it runs on every fire.
-
-        The cost is the reason §2.8 states the routing rule explicitly: while the
-        handle is the O(1) key and the room id is this scan, reaching for the
-        handle is the ergonomic choice, and it has been made wrongly six times.
+        A dict get: `_states` is keyed by room id, as §2.3's key table specifies.
+        It was a linear scan over name-keyed records for the whole first release
+        of dynamic watchers, which made the handle the O(1) key and the room id
+        the awkward one — the wrong way round, and the gradient six separate
+        fixes walked down (§2.8, "the routing rule"). The job path and the wake
+        path both come through here on every fire.
         """
-        for ws in self._states.values():
-            if ws.room_id == room_id:
-                return ws
-        return None
+        return self._states.get(room_id)
 
     def processor_named(self, name: str) -> MessageProcessor | None:
         """The live processor for a watcher name, or None when not resident."""
-        return self._processors.get(name)
+        return self._processor_named(name)
 
     def states(self) -> dict[str, WatcherState]:
-        """The in-memory records, by watcher name — the startup replay's
-        iteration source. After `sync_watchers` this includes hydrated
-        rule-derived records, which is the point: they are exactly the rooms a
-        restart would otherwise forget."""
-        return self._states
+        """The in-memory records, BY WATCHER NAME — a view built on each call.
+
+        The store itself is keyed by room id; this is the name-keyed shape the
+        callers want (the sweep and replay iterate `.values()`, `list` sorts
+        `.keys()`, `StateStore.save`/`merged_view` merge by name). O(n) per call
+        over the watchers of one connector, on lifecycle events, not messages.
+        A copy, not the dict: writes must go through `_install`/`_uninstall`.
+        """
+        return self._by_name()
 
     def resolve_agent_name(self, ref: str) -> str:
         """Public form of `_resolve_agent_name`, for the record's `agent` field —
@@ -1249,7 +1334,7 @@ class WatcherLifecycle:
         # watermark, even an operator's pause — with no log line and no
         # backstop that ever notices. Before the session provision below, so
         # the refusal mints nothing it would have to clean up.
-        existing = self._states.get(wc.name)
+        existing = self._state_named(wc.name)
         if existing is not None and existing.room_id and existing.room_id != room.id:
             raise RuntimeError(
                 f"Watcher name '{wc.name}' already belongs to room "
@@ -1325,15 +1410,15 @@ class WatcherLifecycle:
         # fresh session, silently discarding the frozen binding and watermark
         # the record on disk still carried. The rollbacks never save, so after
         # a restore memory matches disk again.
-        prior = self._states.get(wc.name)
+        prior = self._state_named(wc.name)
 
         def _rollback_record() -> None:
             if prior is not None:
-                self._states[wc.name] = prior
+                self._install(prior)
             else:
-                self._states.pop(wc.name, None)
+                self._uninstall(wc.name)
 
-        self._states[wc.name] = ws
+        self._install(ws)
         try:
             self._maps.bind_session(session_id, room.id, self._connector)
         except Exception:
@@ -1480,7 +1565,7 @@ class WatcherLifecycle:
             attachment_local_base=attachment_local_base,
             append_system_prompt_file=to_repeat,
         )
-        self._processors[wc.name] = processor
+        self._set_processor(wc.name, processor)
 
         # 7-8. Subscribe, then claim the room — one rollback covers both.
         #
@@ -1510,7 +1595,7 @@ class WatcherLifecycle:
                         room.id,
                         unsub_error,
                     )
-            self._processors.pop(wc.name, None)
+            self._pop_processor(wc.name)
             # Keep ws in _states (do NOT pop) so that the context_injected flag
             # and session_id are preserved for the next start.
             cleaned = await self._cleanup_startup_session_best_effort(
@@ -1525,7 +1610,7 @@ class WatcherLifecycle:
                 # session inherits context_injected=True from the old ws and
                 # the agent silently operates without its system context.
                 ws.context_injected = False
-            self._states[wc.name] = ws
+            self._install(ws)
             self._maps.remove_session(session_id)
             raise
 
@@ -1716,8 +1801,8 @@ class WatcherLifecycle:
         subscribed for the whole drain, widening the window in which arriving
         messages find no processor and are dropped by the dispatcher.
         """
-        processor = self._processors.pop(name, None)
-        state = self._states.get(name)
+        processor = self._pop_processor(name)
+        state = self._state_named(name)
         errors: list[str] = []
 
         # Step 1: Remove from dispatcher so no new messages are routed to this processor.

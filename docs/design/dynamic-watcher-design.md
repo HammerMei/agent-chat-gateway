@@ -419,13 +419,22 @@ the handle was free:
 
 1. it is the identity `schedule list`/`pause`/`delete` address, so it is
    load-bearing by design;
-2. more importantly, **the runtime dictionaries in `WatcherLifecycle` — records,
-   processors and per-room locks — are still keyed by the handle**, not by
-   `(connector, room_id)` as the first two rows of this table specify. That
-   re-keying has not happened (`core/watcher_lifecycle.py`, `record_for_room` is
-   a linear scan for exactly this reason). Until it does, the handle is the
-   ergonomic lookup and the room id is the awkward one, which is the wrong way
-   round and is the single cause behind the recurring defect described in §2.8.
+2. more importantly, for the whole first release of dynamic watchers **the
+   runtime dictionaries in `WatcherLifecycle` — records and processors — were
+   keyed by the handle**, not by `(connector, room_id)` as the first two rows
+   of this table specify, and `record_for_room` was a linear scan. That made the
+   handle the ergonomic lookup and the room id the awkward one — the wrong way
+   round, and the single cause behind the recurring defect described in §2.8.
+
+   **Re-keyed (owner, 2026-09-01).** `_states` and `_processors` are keyed by
+   room id; a name resolves through one index (`_room_of`), and every write goes
+   through `_install`/`_uninstall`, which keep the two in step and refuse a name
+   that already names a different room. `record_for_room` is a dict get. The
+   per-watcher **lock** stays keyed by name on purpose: it is a mutex, not an
+   identity, and it is taken before a record exists (`WatcherManager._create`
+   locks `wc.name`, then starts). The on-disk state file was never keyed — it is
+   a list — so nothing migrated. `tests/unit/test_lifecycle_keyed_by_room.py`
+   walks the dicts and fails on any key that is not its record's room id.
 
 The `room_name` on the state record is a **human-readable description of the
 room**, refreshed from inbound messages: the platform's own name for a named
@@ -1620,12 +1629,14 @@ The seam sites, so a reader can check them rather than rediscover them:
 **Why a rule and not six fixes.** The same defect — code reading the handle where
 a room id was available — was found and fixed six times across four review
 rounds, each time at a different site, each time correctly. It kept coming back
-because §2.3's runtime dictionaries are still keyed by the handle rather than by
-`(connector, room_id)`, so the handle is the cheap lookup and the id is the
-awkward one. Re-keying them is the change that makes the defect unrepresentable;
-it is deliberately **not** in this increment (it touches the state file's shape,
-boot replay and every operator verb), and until it lands this rule plus
-`tests/unit/test_job_room_identity.py` are what hold the line.
+because §2.3's runtime dictionaries were keyed by the handle rather than by
+`(connector, room_id)`, so the handle was the cheap lookup and the id the
+awkward one. They are now keyed by room id (§2.3), which removes the gradient.
+It does **not** make the defect unrepresentable — operators address watchers by
+name, so a by-name API has to exist and a job path can still be written against
+it — which is why this rule and `tests/unit/test_job_room_identity.py` remain
+the thing that holds the line, with the re-keying making the right choice the
+easy one rather than enforcing it.
 
 **Two conditions on the resurrection promise**, because "a job brings its watcher
 back" is true of neither an un-migrated job nor a connector that cannot look a

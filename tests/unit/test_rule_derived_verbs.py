@@ -18,7 +18,7 @@ import asyncio
 import unittest
 from unittest.mock import AsyncMock, MagicMock, patch
 
-from tests.helpers import make_rule_derived_record
+from tests.helpers import evict_record, install_record, make_rule_derived_record, pop_processor, register_processor
 from tests.unit.test_wake_path import (
     _ACCESS,
     _doc,
@@ -328,8 +328,8 @@ class TestVerbsOnRuleDerivedRecords(unittest.IsolatedAsyncioTestCase):
             for _ in range(5):  # past the pre-check, parked on the lock
                 await asyncio.sleep(0)
             # The reclaim, landing while the pause waits.
-            lifecycle._states.pop(NAME)
-            lifecycle._processors.pop(NAME, None)
+            evict_record(lifecycle, NAME)
+            pop_processor(lifecycle, NAME)
             lock.release()
 
             with self.assertRaises(RuntimeError) as ctx:
@@ -360,10 +360,10 @@ class TestVerbsOnRuleDerivedRecords(unittest.IsolatedAsyncioTestCase):
                 # own resident processor.
                 replacement = make_rule_derived_record(
                     name=NAME, room_id=original.room_id)
-                lifecycle._states[NAME] = replacement
+                install_record(lifecycle, replacement, as_name=NAME)
                 replacement_proc = MagicMock()
                 replacement_proc.stop = AsyncMock()
-                lifecycle._processors[NAME] = replacement_proc
+                register_processor(lifecycle, NAME, replacement_proc)
                 lock.release()
 
                 with self.assertRaises(RuntimeError) as ctx:
@@ -374,10 +374,10 @@ class TestVerbsOnRuleDerivedRecords(unittest.IsolatedAsyncioTestCase):
                 # Round 5: the gates run BEFORE the destructive stop — a
                 # rejected reset must not leave the replacement non-resident.
                 replacement_proc.stop.assert_not_awaited()
-                self.assertIs(lifecycle._processors.get(NAME), replacement_proc,
+                self.assertIs(lifecycle.get_processor(NAME), replacement_proc,
                               "the replacement's processor survived the "
                               "rejected verb")
-                lifecycle._processors.pop(NAME, None)
+                pop_processor(lifecycle, NAME)
 
     async def test_reset_refuses_a_pause_that_landed_while_it_waited(self):
         """Codex round 3: the paused refusal runs before the lock, so a pause
@@ -448,7 +448,7 @@ class TestVerbsOnRuleDerivedRecords(unittest.IsolatedAsyncioTestCase):
             # _recreate — which must block on the watcher lock the pause holds.
             for _ in range(50):
                 await asyncio.sleep(0)
-                if NAME not in lifecycle._processors:
+                if lifecycle.get_processor(NAME) is None:
                     break
 
             wake_task = asyncio.create_task(
@@ -501,10 +501,10 @@ class TestStopSurvivesACursorReadFailure(unittest.IsolatedAsyncioTestCase):
         )
         record = make_rule_derived_record(name="w1",
                                           last_processed_ts="persisted-mark")
-        lifecycle._states["w1"] = record
+        install_record(lifecycle, record, as_name="w1")
         proc = MagicMock()
         proc.stop = AsyncMock()
-        lifecycle._processors["w1"] = proc
+        register_processor(lifecycle, "w1", proc)
 
         await lifecycle.pause_watcher("w1")  # must not raise
 
@@ -513,7 +513,7 @@ class TestStopSurvivesACursorReadFailure(unittest.IsolatedAsyncioTestCase):
                          "the persisted mark stands when the live read fails")
         connector.unsubscribe_room.assert_awaited_once()
         proc.stop.assert_awaited_once()
-        self.assertNotIn("w1", lifecycle._processors)
+        self.assertIsNone(lifecycle.get_processor("w1"))
 
 
 class TestAMissingFrozenAgentFailsClosed(unittest.IsolatedAsyncioTestCase):

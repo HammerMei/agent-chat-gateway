@@ -383,3 +383,42 @@ def make_lifecycle(**overrides):
     }
     defaults.update(overrides)
     return WatcherLifecycle(**defaults)
+
+
+# ── Installing records into a WatcherLifecycle ────────────────────────────────
+#
+# `WatcherLifecycle` keys its records and processors by ROOM ID and finds them
+# by name through an index. A test that wrote `lifecycle._states[name] = r`
+# produced a state no code path can reach (a record under the wrong key, with
+# no name index) — and there were nine of them across six files. These go
+# through the lifecycle's own single write points instead.
+
+
+def install_record(lifecycle, record, *, as_name=None, processor=None):
+    """Install `record` the way the lifecycle does, optionally with a resident
+    processor. `as_name` is the key the test used to write under — kept so a
+    fixture whose key disagreed with the record's own name fails loudly here
+    rather than silently testing a record nothing could find."""
+    if as_name is not None and as_name != record.watcher_name:
+        raise AssertionError(
+            f"fixture installed {record.watcher_name!r} under key {as_name!r}")
+    lifecycle._install(record)
+    if processor is not None:
+        lifecycle._set_processor(record.watcher_name, processor)
+    return record
+
+
+def register_processor(lifecycle, name, processor):
+    """Make `processor` resident for the watcher `name` (record must exist)."""
+    lifecycle._set_processor(name, processor)
+    return processor
+
+
+def pop_processor(lifecycle, name):
+    return lifecycle._pop_processor(name)
+
+
+def evict_record(lifecycle, name):
+    """Drop the record and any processor under `name`, as a reclaim would."""
+    lifecycle._pop_processor(name)
+    return lifecycle._uninstall(name)

@@ -13,7 +13,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 from gateway.core.room_pattern import RoomPattern
 from gateway.core.watcher_rule import RoomMatcher, WatcherRule
-from tests.helpers import make_manager
+from tests.helpers import make_manager, pop_processor
 
 
 def _rule(name="ops", include=("ops-room",), connector="default",
@@ -68,7 +68,7 @@ class TestEagerStart(unittest.IsolatedAsyncioTestCase):
             # The restart, in miniature: the processor and its dispatcher
             # claim are gone, the record survives, and the eager loop runs
             # again.
-            proc = mgr._lifecycle._processors.pop(name)
+            proc = pop_processor(mgr._lifecycle, name)
             mgr._dispatcher.remove_processor("ops-room", proc)
             errors: list[str] = []
             await mgr._eager_start_rule_rooms(errors)
@@ -135,7 +135,7 @@ class TestEagerStart(unittest.IsolatedAsyncioTestCase):
 
             # The restart after the operator deleted the rule, in miniature:
             # processor gone, record hydrated, current rules EMPTY.
-            proc = mgr._lifecycle._processors.pop(name)
+            proc = pop_processor(mgr._lifecycle, name)
             mgr._dispatcher.remove_processor("ops-room", proc)
             mgr._watcher_rules = []
             errors: list[str] = []

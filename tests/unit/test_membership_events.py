@@ -22,6 +22,8 @@ from tests.helpers import (
     make_core_config,
     make_lifecycle,
     make_rule_derived_record,
+    install_record,
+    register_processor,
 )
 
 
@@ -38,9 +40,9 @@ def _harness(records, *, processors=None):
     )
     lifecycle._attachment_workspace = MagicMock()
     for r in records:
-        lifecycle._states[r.watcher_name] = r
+        install_record(lifecycle, r, as_name=r.watcher_name)
     for name, proc in (processors or {}).items():
-        lifecycle._processors[name] = proc
+        register_processor(lifecycle, name, proc)
     return lifecycle, connector
 
 
@@ -68,7 +70,7 @@ class TestARemovalReclaimsTheRecord(unittest.IsolatedAsyncioTestCase):
         # deletion — without prune the write restores the record from disk
         # and the next boot resurrects it (Codex round 3, P1).
         lifecycle._state_store.save.assert_called_with(
-            lifecycle._states, prune={"w1"})
+            lifecycle.states(), prune={"w1"})
 
     async def test_a_resident_watcher_is_stopped_first_then_reclaimed(self):
         """Expiry bails on residency; a remove cannot — the bot can be kicked
@@ -82,7 +84,7 @@ class TestARemovalReclaimsTheRecord(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(name, "w1")
         proc.stop.assert_awaited()
-        self.assertNotIn("w1", lifecycle._processors)
+        self.assertIsNone(lifecycle.get_processor("w1"))
         self.assertIsNone(lifecycle.get_watcher_state("w1"))
 
     async def test_pause_is_overridden_and_audited(self):
@@ -150,7 +152,7 @@ class TestARemovalReclaimsTheRecord(unittest.IsolatedAsyncioTestCase):
         connector.unsubscribe_room.assert_awaited_once()
         lifecycle._maps.remove_session.assert_called_with("sess-1")
         lifecycle._state_store.save.assert_called_with(
-            lifecycle._states, prune={"w1"})
+            lifecycle.states(), prune={"w1"})
         self.assertTrue(any("ghost" in line for line in captured.output),
                         "the accepted leak names the missing agent")
 
@@ -176,7 +178,7 @@ class TestARemovalReclaimsTheRecord(unittest.IsolatedAsyncioTestCase):
         default_backend.delete_session.assert_not_awaited()
         lifecycle._attachment_workspace.reclaim.assert_not_called()
         lifecycle._state_store.save.assert_called_with(
-            lifecycle._states, prune={"w1"})
+            lifecycle.states(), prune={"w1"})
         self.assertTrue(
             any("claude:/the/old/workdir" in line for line in captured.output),
             "the accepted leak names both identities")
@@ -378,7 +380,7 @@ class TestAJoinRegistersAnIdleRecord(unittest.IsolatedAsyncioTestCase):
         manager, lifecycle, connector = _add_harness()
         old = make_rule_derived_record(
             name="rc:eng-backend", room_id="old-room-id", paused=True)
-        lifecycle._states["rc:eng-backend"] = old
+        install_record(lifecycle, old, as_name="rc:eng-backend")
 
         with self.assertRaises(RuntimeError) as ctx:
             await manager.register_on_join(
@@ -400,7 +402,7 @@ class TestAJoinRegistersAnIdleRecord(unittest.IsolatedAsyncioTestCase):
 
         record = lifecycle.get_watcher_state(name)
         self.assertEqual(record.session_id, "", "no session is provisioned")
-        self.assertNotIn(name, lifecycle._processors, "no processor runs")
+        self.assertIsNone(lifecycle.get_processor(name), "no processor runs")
         connector.subscribe_room.assert_not_called()
         lifecycle._dispatcher.add_processor.assert_not_called()
 

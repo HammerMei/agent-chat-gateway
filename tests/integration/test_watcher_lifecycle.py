@@ -348,7 +348,7 @@ class TestAttachmentWorkspaceRollback(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(OSError):
                 await start_watcher(lc, wc, None)
 
-        self.assertNotIn("test-watcher", lc._states, "_states must be rolled back after setup() failure")
+        self.assertIsNone(lc.get_watcher_state("test-watcher"), "_states must be rolled back after setup() failure")
         maps.remove_session.assert_called_once()
 
 
@@ -414,7 +414,7 @@ class TestContextInjectedResetOnSubscribeFailure(unittest.IsolatedAsyncioTestCas
             with self.assertRaises(RuntimeError):
                 await start_watcher(lc, wc, None)
 
-        saved_ws = lc._states.get("test-watcher")
+        saved_ws = lc.get_watcher_state("test-watcher")
         self.assertIsNotNone(saved_ws)
         self.assertFalse(saved_ws.context_injected)
 
@@ -482,7 +482,7 @@ class TestContextInjectedResetOnSubscribeFailure(unittest.IsolatedAsyncioTestCas
             with self.assertRaises(RuntimeError):
                 await start_watcher(lc, wc, None)
 
-        saved_ws = lc._states.get("test-watcher2")
+        saved_ws = lc.get_watcher_state("test-watcher2")
         self.assertIsNotNone(saved_ws)
         self.assertEqual(saved_ws.session_id, "persisted-session")
 
@@ -721,7 +721,7 @@ class TestSyncWatchersPruneSemantics(unittest.IsolatedAsyncioTestCase):
         await lc.sync_watchers()
 
         self.assertEqual(lc._state_store.save.call_args.kwargs["prune"], set())
-        self.assertIs(lc._states["kept"], record, "hydrated, not forgotten")
+        self.assertIs(lc.get_watcher_state("kept"), record, "hydrated, not forgotten")
 
 
 if __name__ == "__main__":

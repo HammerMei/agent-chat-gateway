@@ -917,13 +917,13 @@ class TestWatermarkCapturedBeforeUnsubscribe(IsolatedTestCase):
         manager = make_manager(connector, agent, watcher_rules=[make_rule("w1")])
         await manager.run_once()
 
-        room_id = manager._lifecycle._states["default:w1"].room_id
+        room_id = manager._lifecycle.get_watcher_state("default:w1").room_id
         connector.seed(room_id, "2025-06-06T06:06:06Z")
 
         await manager.dispatch_command({"cmd": "pause", "watcher_name": "default:w1"})
 
         self.assertEqual(
-            manager._lifecycle._states["default:w1"].last_processed_ts,
+            manager._lifecycle.get_watcher_state("default:w1").last_processed_ts,
             "2025-06-06T06:06:06Z",
             "watermark was read after the unsubscribe popped the room entry",
         )
@@ -936,7 +936,7 @@ class TestWatermarkCapturedBeforeUnsubscribe(IsolatedTestCase):
         manager = make_manager(connector, agent, watcher_rules=[make_rule("w1")])
         await manager.run_once()
 
-        room_id = manager._lifecycle._states["default:w1"].room_id
+        room_id = manager._lifecycle.get_watcher_state("default:w1").room_id
         connector.seed(room_id, "2025-06-06T06:06:06Z")
         # Startup's own save already polled this room (before the seed), so
         # observe only the reads the pause itself performs.
@@ -958,7 +958,7 @@ class TestWatermarkCapturedBeforeUnsubscribe(IsolatedTestCase):
         manager = make_manager(connector, agent, watcher_rules=[make_rule("w1")])
         await manager.run_once()
 
-        room_id = manager._lifecycle._states["default:w1"].room_id
+        room_id = manager._lifecycle.get_watcher_state("default:w1").room_id
         connector.seed(room_id, "2025-07-07T07:07:07Z")
 
         await manager.dispatch_command({"cmd": "reset", "watcher_name": "default:w1"})
@@ -966,7 +966,7 @@ class TestWatermarkCapturedBeforeUnsubscribe(IsolatedTestCase):
         # reset restarts the watcher, so the surviving record is the new one —
         # it must have inherited the watermark rather than resetting to empty.
         self.assertEqual(
-            manager._lifecycle._states["default:w1"].last_processed_ts,
+            manager._lifecycle.get_watcher_state("default:w1").last_processed_ts,
             "2025-07-07T07:07:07Z",
         )
         await manager.shutdown()
@@ -978,12 +978,12 @@ class TestWatermarkCapturedBeforeUnsubscribe(IsolatedTestCase):
         manager = make_manager(connector, agent, watcher_rules=[make_rule("w1")])
         await manager.run_once()
 
-        manager._lifecycle._states["default:w1"].last_processed_ts = "known"
+        manager._lifecycle.get_watcher_state("default:w1").last_processed_ts = "known"
         # connector.rooms deliberately left empty — nothing live to report.
 
         await manager.dispatch_command({"cmd": "pause", "watcher_name": "default:w1"})
 
-        self.assertEqual(manager._lifecycle._states["default:w1"].last_processed_ts, "known")
+        self.assertEqual(manager._lifecycle.get_watcher_state("default:w1").last_processed_ts, "known")
         await manager.shutdown()
 
 
