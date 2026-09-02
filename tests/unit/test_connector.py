@@ -576,6 +576,23 @@ class TestFormatPromptPrefixToField(unittest.TestCase):
         prefix = connector.format_prompt_prefix(msg)
         self.assertIn("to: *", prefix)
 
+    def test_a_scheduled_injection_in_a_channel_is_to_me(self):
+        """Same rule as Mattermost's: a scheduled job's message has no mentions,
+        and rendering it as a broadcast told the agent to stay silent."""
+        import dataclasses
+
+        from gateway.core.connector import SCHEDULER_SENDER_ID, User
+
+        connector = _make_rc_connector_with_agents(["wavebro"])
+        msg = dataclasses.replace(
+            _make_msg_with_mentions("general", "alice", room_type="channel", mentions=[]),
+            sender=User(id=SCHEDULER_SENDER_ID, username=SCHEDULER_SENDER_ID,
+                        display_name="Scheduler"),
+        )
+        prefix = connector.format_prompt_prefix(msg)
+        self.assertIn("to: me", prefix)
+        self.assertNotIn("to: *", prefix)
+
     def test_channel_only_bot_mentioned(self):
         """Channel message @-mentioning only the bot → to: me"""
         connector = _make_rc_connector_with_agents(["wavebro"])

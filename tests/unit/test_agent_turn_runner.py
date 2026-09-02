@@ -733,3 +733,66 @@ class TestAgentTurnRunner(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestAScheduledTurnThatFallsSilentIsLoud(unittest.IsolatedAsyncioTestCase):
+    """A scheduled job fired, the agent ran, and answered with the termination
+    token alone. The room gets nothing, `run_count` advances, `schedule list`
+    says healthy — and until this WARNING the only trace was an INFO line an
+    operator had to correlate with the fire by timestamp. Measured on a live
+    deployment: 25 consecutive runs, zero posts, one confused owner.
+    """
+
+    def _run(self, runner, **kw):
+        return runner.run_turn(
+            session_id="ses_001", prompt="🖥️ Computer Part of the Minute: CPU Cooler",
+            working_directory="/tmp", room_id="room_1", thread_id=None, **kw,
+        )
+
+    async def test_a_token_only_reply_to_a_scheduled_prompt_warns_and_posts_nothing(self):
+        from gateway.core.agent_chain import AGENT_CHAIN_TERMINATION_TOKEN
+
+        runner, connector = _make_runner(_MockAgent(AgentResponse(text=AGENT_CHAIN_TERMINATION_TOKEN)))
+
+        with self.assertLogs("agent-chat-gateway.core.turn_runner", "WARNING") as logs:
+            terminated = await self._run(runner, is_scheduled=True)
+
+        self.assertFalse(terminated, "not an agent chain — the caller's accounting is unchanged")
+        connector.send_text.assert_not_called()
+        joined = "\n".join(logs.output)
+        self.assertIn("room_1", joined)
+        self.assertIn("produced no reply", joined)
+        self.assertIn("reply is what gets posted", joined, "says what to do about it")
+
+    async def test_the_same_reply_to_an_ordinary_message_stays_at_info(self):
+        """Silence in answer to a person or a broadcast is a legitimate choice
+        the routing rules ask for; only a scheduled prompt makes it suspect."""
+        import logging
+
+        from gateway.core.agent_chain import AGENT_CHAIN_TERMINATION_TOKEN
+
+        runner, connector = _make_runner(_MockAgent(AgentResponse(text=AGENT_CHAIN_TERMINATION_TOKEN)))
+
+        with self.assertLogs("agent-chat-gateway.core.turn_runner", "INFO") as logs:
+            await self._run(runner, is_scheduled=False)
+
+        self.assertFalse([r for r in logs.records if r.levelno >= logging.WARNING], logs.output)
+        connector.send_text.assert_not_called()
+
+    async def test_a_scheduled_reply_with_content_is_delivered_without_a_warning(self):
+        """The fence is on SILENCE, not on the token: a reply that says something
+        and then terminates posts the something, as any reply does."""
+        import logging
+
+        from gateway.core.agent_chain import AGENT_CHAIN_TERMINATION_TOKEN
+
+        runner, connector = _make_runner(
+            _MockAgent(AgentResponse(text=f"CPU cooler: keeps the chip alive.\n\n{AGENT_CHAIN_TERMINATION_TOKEN}")))
+
+        with self.assertLogs("agent-chat-gateway.core.turn_runner", "INFO") as logs:
+            await self._run(runner, is_scheduled=True)
+
+        self.assertFalse([r for r in logs.records if r.levelno >= logging.WARNING], logs.output)
+        connector.send_text.assert_called_once()
+        self.assertNotIn("end-of-agent-chain", connector.send_text.call_args.args[1].text)
+

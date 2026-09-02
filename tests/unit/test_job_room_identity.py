@@ -179,6 +179,24 @@ class TestTheReplyIsAddressedFromTheSameResolution(unittest.IsolatedAsyncioTestC
         manager._injected_processor.enqueue.assert_not_awaited()
 
 
+class TestTheInjectedMessageIsRecognisableAsScheduled(unittest.IsolatedAsyncioTestCase):
+    """The connectors render `to: me` and the turn runner warns on a silent
+    reply by recognising the sender the injection stamps. One constant, checked
+    here at the source so the three cannot drift apart."""
+
+    async def test_the_sender_is_the_scheduler_constant(self):
+        from gateway.core.connector import SCHEDULER_SENDER_ID, is_scheduled_message
+
+        manager = _manager(record=None,
+                           resolved=RoomRef(id="room-1", kind=RoomKind.CHANNEL, name="g"))
+
+        await manager.inject_message("room-1", "poke")
+
+        msg = manager._injected_processor.enqueue.await_args.args[0]
+        self.assertEqual(msg.sender.id, SCHEDULER_SENDER_ID)
+        self.assertTrue(is_scheduled_message(msg))
+
+
 class TestTheIdOutranksTheHandle(unittest.IsolatedAsyncioTestCase):
     """Defect 2. A handle can come to mean a different room; an id cannot."""
 

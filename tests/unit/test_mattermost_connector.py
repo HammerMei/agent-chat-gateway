@@ -139,6 +139,29 @@ class TestComputeToField(unittest.TestCase):
         msg = _msg(mentions=[])
         self.assertEqual(connector._compute_to_field(msg), "to: *")
 
+    def test_a_scheduled_injection_is_addressed_to_me_not_broadcast(self):
+        """The message a scheduled job injects has no mentions, so mention
+        arithmetic rendered it `to: *` — and the routing rules for a broadcast in
+        a channel say "be conservative; if you decide not to respond, output ONLY
+        the termination token". Measured on a live deployment: the agent did
+        exactly that, every minute, and a working job posted nothing. A job is
+        addressed to the agent it was created against."""
+        import dataclasses
+
+        from gateway.core.connector import SCHEDULER_SENDER_ID, User
+
+        connector = self._connector()
+        msg = dataclasses.replace(
+            _msg(mentions=[]),
+            sender=User(id=SCHEDULER_SENDER_ID, username=SCHEDULER_SENDER_ID,
+                        display_name="Scheduler"),
+        )
+
+        self.assertEqual(connector._compute_to_field(msg), "to: me")
+        prefix = connector.format_prompt_prefix(msg)
+        self.assertIn("from: scheduler", prefix)
+        self.assertIn("to: me", prefix)
+
     def test_bot_mentioned_directly(self):
         connector = self._connector()
         msg = _msg(mentions=["hammer.mei"])

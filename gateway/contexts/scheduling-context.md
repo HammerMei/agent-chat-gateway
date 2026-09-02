@@ -94,7 +94,7 @@ agent-chat-gateway schedule resume <job-id>   # Re-enable a paused task
 
 ## Notes
 
-- Scheduled messages are injected directly into your agent session — they do not appear as chat messages in the room.
+- The job's **message is a prompt to you**, delivered into your own session when the job fires, with the header `from: scheduler | … | to: me`. The prompt itself is never shown in the room — **your reply is what gets posted**. So write the message as an instruction to yourself ("Post one computer part with a one-line fact"), not as the finished text you want to appear; a message that already reads as the announcement gives you nothing to add, and answering it with `<end-of-agent-chain>` posts nothing at all, every run.
 - The minimum scheduling interval is 1 minute.
 - Job IDs look like `acg-a3f2b1c0`. Use `agent-chat-gateway schedule list` to find a job's ID.
 - If the gateway is restarted, any jobs missed during downtime will be fired immediately on startup.

@@ -43,6 +43,15 @@ agent-chat-gateway schedule create WATCHER MESSAGE [OPTIONS]
 `WATCHER` is the name of the watcher (chat room binding) that will receive the injected message.
 `MESSAGE` is the prompt that gets sent to the agent when the job fires.
 
+**Write `MESSAGE` as an instruction to the agent, not as the text you want to
+see.** The message is delivered into the agent's own session (headed
+`from: scheduler | … | to: me`) and is never shown in the room; **the agent's
+reply is what gets posted**. `"Post one computer part of the day with a
+one-line fact"` produces a post every run; `"🖥️ Computer part: CPU cooler"`
+gives the agent nothing to add, and an agent with nothing to add answers with
+its silence token — the job then fires on schedule and posts nothing. The
+daemon logs a WARNING naming the room when that happens.
+
 ### Options
 
 | Option | Description |

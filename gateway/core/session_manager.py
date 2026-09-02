@@ -18,6 +18,7 @@ from datetime import UTC, datetime
 from ..agents import AgentBackend
 from .config import CoreConfig
 from .connector import (
+    SCHEDULER_SENDER_ID,
     Connector,
     IncomingMessage,
     MembershipHook,
@@ -1008,7 +1009,8 @@ class SessionManager:
             # which is exactly the "scheduled stock report" scenario in #53.
             timestamp=str(int(datetime.now(UTC).timestamp() * 1000)),
             room=Room(id=room.id, name=room_name, type=room.kind.value),
-            sender=User(id="scheduler", username="scheduler", display_name="Scheduler"),
+            sender=User(id=SCHEDULER_SENDER_ID, username=SCHEDULER_SENDER_ID,
+                        display_name="Scheduler"),
             role=UserRole.OWNER,
             text=text,
             attachments=[],

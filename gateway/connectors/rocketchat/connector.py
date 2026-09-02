@@ -37,6 +37,7 @@ from ...core.connector import (
     MessageHandler,
     Room,
     RoomCapacity,
+    is_scheduled_message,
 )
 from ...core.dispatch import RoomAlreadyRoutedError
 from ...core.paths import resolve_under
@@ -1823,6 +1824,14 @@ class RocketChatConnector(Connector):
         Usernames from ``msg.mentions`` are sanitized with ``_PREFIX_UNSAFE_RE``
         before use in the trusted header — the same treatment as room and sender.
         """
+        # A scheduled job's message is addressed to the agent it was created
+        # against — `to: me`, before any mention arithmetic. Derived from
+        # mentions it rendered as `to: *`, and the routing rules for a broadcast
+        # in a channel say "be conservative; if you decide not to respond, output
+        # ONLY the termination token" — which is exactly what the agent did, every
+        # minute, so a working job produced nothing in the room and looked broken.
+        if is_scheduled_message(msg):
+            return "to: me"
         # DMs are always addressed to this bot, regardless of mentions metadata.
         if msg.room.type == "dm":
             return "to: me"

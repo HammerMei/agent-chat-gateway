@@ -104,6 +104,25 @@ class Room:
     type: str = "channel"
 
 
+# The sender id `SessionManager.inject_message` stamps on a scheduled job's
+# message. One name, so the connectors' prompt-prefix `to:` field and the turn
+# runner can recognise a scheduled turn without three copies of a string.
+SCHEDULER_SENDER_ID = "scheduler"
+
+
+def is_scheduled_message(msg: "IncomingMessage") -> bool:
+    """Did this message come from the scheduler rather than a person or an agent?
+
+    Load-bearing for two decisions. The prompt prefix renders it `to: me` — a
+    scheduled job is addressed to the agent it was created against, and a
+    mention-derived `to: *` told the agent it was an unaddressed broadcast in a
+    channel, which the routing rules say to answer with silence. And the turn
+    runner warns when the reply to one is empty after stripping the termination
+    token, because that silence was the whole symptom of a job "not working".
+    """
+    return msg.sender.id == SCHEDULER_SENDER_ID
+
+
 @dataclass
 class User:
     """Platform-agnostic sender descriptor."""

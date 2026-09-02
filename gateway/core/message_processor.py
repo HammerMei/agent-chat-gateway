@@ -26,7 +26,7 @@ from .agent_chain import build_agent_chain_context
 from .agent_turn_runner import AgentTurnRunner, _user_facing_agent_error_message
 from .attachment_workspace import localize_attachment_paths
 from .config import CoreConfig, WatcherConfig
-from .connector import Attachment, Connector, IncomingMessage, Room, UserRole
+from .connector import Attachment, Connector, IncomingMessage, Room, UserRole, is_scheduled_message
 from .injected_context_builder import InjectedContextBuilder
 from .paths import watcher_prompt_key
 from .prompt_builder import build_catchup_prompt, build_prompt
@@ -458,6 +458,7 @@ class MessageProcessor:
             is_agent_chain=is_agent_chain,
             agent_chain_context=agent_chain_context,
             append_system_prompt_file=self._append_system_prompt_file,
+            is_scheduled=is_scheduled_message(msg),
         )
 
     async def _process_batch(self, batch: list[IncomingMessage]) -> None:
@@ -589,6 +590,7 @@ class MessageProcessor:
             is_agent_chain=is_agent_chain,
             agent_chain_context=agent_chain_context,
             append_system_prompt_file=self._append_system_prompt_file,
+            is_scheduled=is_scheduled_message(anchor),
         )
 
     async def _ensure_context_injected(self) -> None:
