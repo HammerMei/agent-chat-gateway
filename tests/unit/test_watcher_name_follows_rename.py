@@ -287,6 +287,37 @@ class TestTheProcessorReissuesItsIdentityOnRename(unittest.IsolatedAsyncioTestCa
         self.assertEqual(call.kwargs["path_key"], watcher_prompt_key("mm", "room_1"),
                          "the same file the session was started with")
         self.assertEqual(processor._append_system_prompt_file, "/runtime/system-prompts/k.md")
+        self.assertIs(call.kwargs["already_delivered"], False,
+                      "a rename is a re-delivery; the keyword is required by both backends")
+
+    async def test_the_rewrite_reaches_a_real_backend_signature(self):
+        """The first version omitted the required `already_delivered` keyword; a
+        bare AsyncMock accepted the call and the test passed while every real
+        rename raised TypeError (Codex, PR #140). A stub with the base method's
+        exact signature lets Python enforce it — `create_autospec` did not."""
+        from gateway.core.config import WatcherConfig
+        from tests.helpers import MockAgentBackend, make_processor
+
+        seen = {}
+
+        class _Backend(MockAgentBackend):
+            async def ensure_durable_instructions(   # the base signature, verbatim
+                self, session_id, working_directory, timeout, content, *,
+                path_key, already_delivered,
+            ):
+                seen.update(content=content, path_key=path_key, already_delivered=already_delivered)
+                return "/p.md"
+
+        injector = MagicMock()
+        injector.build = AsyncMock(return_value="header")
+        wc = WatcherConfig(name="mm:a", connector="mm", room="a", agent="default")
+        processor = make_processor(agent=_Backend(), watcher_id="mm:a", connector_name="mm",
+                                   context_injector=injector, watcher_config=wc)
+
+        await processor.rename("mm:b", room_name="b")   # a bad call raises TypeError here
+
+        self.assertEqual(processor._append_system_prompt_file, "/p.md")
+        self.assertIs(seen["already_delivered"], False)
 
     async def test_without_an_injector_only_the_name_moves(self):
         from tests.helpers import make_processor

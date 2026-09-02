@@ -628,6 +628,12 @@ class MessageProcessor:
             self._config.timeout_for(self._agent_name),
             content,
             path_key=watcher_prompt_key(self._connector_name, self._room.id),
+            # A rename IS a re-delivery: the agent must learn the new handle, so
+            # a backend that delivers by sending (OpenCode) sends again. Claude
+            # rewrites the file regardless. Required keyword — the first version
+            # omitted it, every rename raised TypeError into the lifecycle's
+            # catch, and the header never changed (Codex, PR #140).
+            already_delivered=False,
         )
         if to_repeat is not None:
             self._append_system_prompt_file = to_repeat

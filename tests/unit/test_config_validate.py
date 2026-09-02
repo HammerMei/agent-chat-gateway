@@ -574,6 +574,26 @@ class TestValidateConfigLint(_ValidateConfigTestBase):
             f"the structural error must still be reported: {result.errors}",
         )
 
+    def test_a_non_string_top_level_key_is_reported_not_a_traceback(self):
+        """YAML admits `1: value`; the unknown-key path sorted and difflib-matched
+        the raw key and raised TypeError out of `config validate` and daemon
+        startup alike (Codex, PR #140)."""
+        cfg = self._write("""\
+            connectors:
+              - name: rc
+                type: script
+            agents:
+              a:
+                type: claude
+                working_directory: /tmp
+            1: value
+            watchers_typo: []
+            """)
+
+        result = self._validate(cfg)   # must not raise
+
+        self.assertTrue(any("'1'" in e and "does not use" in e for e in result.errors), result.errors)
+
     def test_lint_off_by_default(self):
         cfg = self._write(f"""\
             connectors:

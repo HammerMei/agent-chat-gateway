@@ -51,6 +51,15 @@ class TestExampleAndFixtureConfigsMatchSchema:
     must validate cleanly — if this fails, either the schema drifted from a
     parser change, or the example/fixture drifted from the documented format."""
 
+    def test_a_bare_watcher_rules_key_is_schema_valid(self, validator):
+        """The loaders normalise a YAML null to an empty list; the schema used to
+        admit only an array, so a config that started and passed `config
+        validate` failed editor/CI validation (Codex, PR #140)."""
+        doc = _load_yaml(REPO_ROOT / "config.example.yaml")
+        doc["watcher_rules"] = None
+        errors = list(validator.iter_errors(doc))
+        assert not errors, "\n".join(str(e) for e in errors)
+
     def test_config_example_yaml_is_schema_valid(self, validator):
         doc = _load_yaml(REPO_ROOT / "config.example.yaml")
         errors = list(validator.iter_errors(doc))

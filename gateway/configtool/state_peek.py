@@ -79,7 +79,11 @@ def stranded_by_rule(
             # when nothing will ever run again (Codex review of #129).
             # Active AND paused jobs both count: paused is an operator
             # choice that resuming re-arms.
-            if job.get("status") == JobStatus.COMPLETED.value:
+            # CANCELLED is terminal too: hidden from `schedule list` by default,
+            # never fires without an explicit resume, purged after the same TTL.
+            # Counting one told the operator a job "keeps running" that the
+            # gateway had already stopped (Codex, PR #140).
+            if job.get("status") in (JobStatus.COMPLETED.value, JobStatus.CANCELLED.value):
                 continue
             # isinstance first: a non-string `watcher` (a list or mapping in
             # a hand-edited jobs.json) is UNHASHABLE, so the membership test

@@ -113,8 +113,14 @@ TOP_LEVEL_KEYS: frozenset[str] = frozenset({
 
 
 def unknown_top_level_keys(raw: Mapping) -> list[str]:
-    """The top-level keys config.yaml sets that mean nothing, sorted."""
-    return sorted(set(raw) - TOP_LEVEL_KEYS)
+    """The top-level keys config.yaml sets that mean nothing, sorted, as strings.
+
+    YAML admits non-string keys (`1: value`, `true: x`); rendered with `str`
+    so the message and its `difflib` hint never see a mixed-type list — an
+    integer key raised TypeError out of both loaders instead of the normal
+    unknown-key error (Codex, PR #140).
+    """
+    return sorted(str(k) for k in raw if k not in TOP_LEVEL_KEYS)
 
 
 def unknown_top_level_message(unknown: list[str]) -> str:

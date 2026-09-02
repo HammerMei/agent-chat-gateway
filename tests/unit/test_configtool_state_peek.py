@@ -97,6 +97,7 @@ class TestStrandedByRule(unittest.TestCase):
             {"id": "j1", "watcher": "rc:general", "status": "completed"},
             {"id": "j2", "watcher": "rc:general", "status": "active"},
             {"id": "j3", "watcher": "rc:general", "status": "paused"},
+            {"id": "j4", "watcher": "rc:general", "status": "cancelled"},   # terminal too
         ])
         self.assertEqual(stranded_by_rule("my-rule", states, jobs), (1, 2))
 

@@ -127,7 +127,8 @@
       }
     },
     "watcher_rules": {
-      "type": "array",
+      "type": ["array", "null"],
+      "description": "The watcher rules. A bare `watcher_rules:` (YAML null) is the same as an empty list, as the loaders treat it.",
       "items": {
         "$ref": "#/$defs/watcher"
       }
