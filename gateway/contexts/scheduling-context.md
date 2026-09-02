@@ -89,7 +89,7 @@ agent-chat-gateway schedule delete <job-id>   # e.g.: agent-chat-gateway schedul
 
 ```bash
 agent-chat-gateway schedule pause <job-id>    # Temporarily stop a recurring task
-agent-chat-gateway schedule resume <job-id>   # Re-enable a paused task
+agent-chat-gateway schedule resume <job-id>   # Re-enable a paused task, or restore a cancelled one
 ```
 
 ## Notes

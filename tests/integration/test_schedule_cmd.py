@@ -1235,6 +1235,19 @@ class TestScheduleList(_ScheduleCLITestBase):
         self.assertIn("acg-22222222", stdout)
         self.assertIn("completed", stdout)
 
+    def test_list_all_renders_a_cancelled_job_with_when(self):
+        self._start_daemon({"schedule-list": {"ok": True, "jobs": [{
+            "id": "acg-c1", "watcher": "rc:general", "status": "cancelled",
+            "cron": "* * * * *", "run_count": 2, "times": 0, "next_run": None,
+            "cancelled_at": "2026-09-02T10:00:00+00:00",
+            "cancel_reason": "the bot was removed", "message": "poke",
+        }]}})
+
+        stdout, _, code = self._run(["schedule", "list", "--all"])
+
+        self.assertEqual(code, 0)
+        self.assertIn("cancelled 2026-09-02 10:00:00", stdout)
+
     def test_list_default_omits_completed_jobs(self):
         """Without --all, include_completed defaults to False."""
         received: list[dict] = []
@@ -1387,17 +1400,21 @@ class TestScheduleResume(_ScheduleCLITestBase):
         """Owner, 2026-09-02: a cancellation keeps the record so it can be undone,
         and resume is the undo — status back to ACTIVE, next_run recomputed, and
         the cancellation's own fields cleared so the job does not read as both."""
+        from datetime import UTC, datetime
         from unittest.mock import MagicMock
 
         from gateway.control import ControlServer
-        from gateway.schedule_types import JobStatus
+        from gateway.schedule_types import JobStatus, ScheduledJob
 
+        # A real job, not a MagicMock: every attribute of a mock is truthy, so
+        # `assertTrue(job.next_run)` could not tell a recomputed next_run from
+        # none at all (internal review).
+        job = ScheduledJob(id="acg-c1", watcher="rc:x", connector="rc", room_id="R1",
+                           message="m", cron="* * * * *", timezone="UTC",
+                           status=JobStatus.CANCELLED,
+                           cancelled_at="2026-09-02T10:00:00+00:00",
+                           cancel_reason="the bot was removed from the room")
         mock_store = MagicMock()
-        job = MagicMock()
-        job.status = JobStatus.CANCELLED
-        job.cancelled_at = "2026-09-02T10:00:00+00:00"
-        job.cancel_reason = "the bot was removed from the room"
-        job.cron, job.timezone = "* * * * *", "UTC"
         mock_store.get = MagicMock(return_value=job)
 
         server = ControlServer(entries=[], job_store=mock_store)
@@ -1407,7 +1424,7 @@ class TestScheduleResume(_ScheduleCLITestBase):
         self.assertEqual(job.status, JobStatus.ACTIVE)
         self.assertIsNone(job.cancelled_at)
         self.assertEqual(job.cancel_reason, "")
-        self.assertTrue(job.next_run)
+        self.assertGreater(datetime.fromisoformat(job.next_run), datetime.now(UTC))
         mock_store.update.assert_called_once_with(job)
 
     def test_control_pause_refuses_a_cancelled_job_and_points_at_resume(self):

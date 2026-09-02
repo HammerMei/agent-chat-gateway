@@ -25,7 +25,7 @@ class JobStatus(str, Enum):
                 job's connector left the config). The record stays in jobs.json
                 with ``cancelled_at`` and ``cancel_reason`` for the same TTL as a
                 completed job, so an accidental cancellation can be seen and undone:
-                ``schedule resume`` restores it. Only ``schedule delete`` removes.
+                ``schedule resume`` restores it. Only ``schedule delete`` removes it early.
     """
     ACTIVE    = "active"
     PAUSED    = "paused"
@@ -88,7 +88,7 @@ class ScheduledJob:
     completed_at     : ISO 8601 UTC timestamp when status transitioned to COMPLETED.
     cancelled_at     : ISO 8601 UTC timestamp when status transitioned to CANCELLED.
     cancel_reason    : Why the gateway cancelled it — the same text as the AUDIT log line.
-                       None until the job completes.
+                       Empty unless cancelled; cleared by ``schedule resume``.
     """
 
     id: str = field(default_factory=_new_job_id)

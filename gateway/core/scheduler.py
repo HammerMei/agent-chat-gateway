@@ -374,7 +374,12 @@ class JobScheduler:
                 "The record is kept; 'agent-chat-gateway schedule resume %s' restores it.",
                 job.id, job.watcher, job.room_id, reason, job.id,
             )
-            return
+            # The copy, marked, not None: `_fire_catch_up` re-assigns this
+            # return and reads `.status` on its next missed slot (internal
+            # review — a bare `return` here raised AttributeError out of the
+            # catch-up loop and killed the scheduler task at startup).
+            job.status = JobStatus.CANCELLED
+            return job
 
         target = self._resolve_target(job)
         success = await self._inject(job, target)
@@ -474,9 +479,11 @@ class JobScheduler:
     def _connector_is_gone(self, job: ScheduledJob) -> bool:
         """The job names a connector, and no configured connector has that name.
 
-        A job that names NO connector (written before schema 2, never migrated)
-        is unknown, not gone — it is resolved by its handle, and refused if that
-        fails, but not cancelled on that evidence.
+        A job that names NO connector is unknown, not gone. Every job the
+        scheduler ever wrote names one (`connector` predates schema 2; schema 2
+        added `room_id`), so an empty field is a hand-edited or damaged record —
+        resolved by its handle, refused if that fails, never cancelled on that
+        evidence.
         """
         return bool(job.connector) and job.connector not in self._session_managers
 

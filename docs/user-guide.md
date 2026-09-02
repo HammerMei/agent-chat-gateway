@@ -505,9 +505,12 @@ watcher_rules:
 
 Each created watcher is named `<connector>:<room>` — that derived name is
 what `list` shows and what `pause`/`resume`/`reset`/`expire` act on. It follows
-the room: rename a channel and, from the next message in it, `list` shows the
-new name and the old one no longer resolves (the log carries an `AUDIT` line).
-Scripts should not store a watcher name; the room is the identity. Rules
+the room on Rocket.Chat and Mattermost: rename a channel or private group and,
+from the next message in it, `list` shows the new name and the old one no longer
+resolves (the log carries an `AUDIT` line). DM labels keep the counterpart's
+name as of creation, and a new name still held by another room's stale record
+is not taken until that record goes. Scripts should not store a watcher name;
+the room is the identity. Rules
 match top-down; the first rule that claims a room wins, and `agent-chat-gateway config
 validate` warns when an earlier rule shadows a later one completely.
 
@@ -749,18 +752,18 @@ agent-chat-gateway list --failed
 agent-chat-gateway list --active --paused
 
 # Pause a watcher (stops processing messages)
-agent-chat-gateway pause <watcher-name> [--connector NAME]
+agent-chat-gateway pause <watcher-name>
 
 # Resume a paused watcher
-agent-chat-gateway resume <watcher-name> [--connector NAME]
+agent-chat-gateway resume <watcher-name>
 
 # Reset a watcher (clear state, create new session)
-agent-chat-gateway reset <watcher-name> [--connector NAME]
+agent-chat-gateway reset <watcher-name>
 
 # Expire a watcher now: reclaim its record and files; the room's next message
 # recreates it. Refused on voice/script connectors — nothing arrives on its
 # own there to bring the watcher back — use `reset` on those instead.
-agent-chat-gateway expire <watcher-name> [--connector NAME]
+agent-chat-gateway expire <watcher-name>
 ```
 
 `list` reports the watchers the gateway has **state records** for, not the
@@ -1250,7 +1253,7 @@ To carry context into a session, use a handoff file instead — see
 To clear a watcher's state and create a fresh session:
 
 ```bash
-agent-chat-gateway reset <watcher-name> [--connector NAME]
+agent-chat-gateway reset <watcher-name>
 ```
 
 This:

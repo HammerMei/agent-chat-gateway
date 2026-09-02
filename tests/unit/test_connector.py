@@ -5450,48 +5450,48 @@ class TestAFrameRenamesTheSubscriptionsRoom(unittest.IsolatedAsyncioTestCase):
     The subscription's copy was taken at subscribe time; the message built from
     it carries the new name to the lifecycle, which re-derives the handle."""
 
-    def _connector(self):
-        from gateway.connectors.rocketchat.connector import (
-            RocketChatConnector,
-            _RoomSubscription,
-        )
+    def _connector(self, room_type="channel"):
+        from gateway.connectors.rocketchat.connector import _RoomSubscription
         from gateway.core.connector import Room
 
-        connector = RocketChatConnector.__new__(RocketChatConnector)
-        connector._config = MagicMock()
-        connector._config.name = "rc"
-        connector._rest = MagicMock()
-        connector._rooms = {"room-1": _RoomSubscription(
-            room=Room(id="room-1", name="general", type="channel"), last_processed_ts=None)}
-        connector._room_membership_gen = {}
-        connector._turn_store = None
+        connector = _make_connector()   # the shared builder, not a __new__ subset
+        connector._rooms["room-1"] = _RoomSubscription(
+            room=Room(id="room-1", name="general", type=room_type), last_processed_ts=None)
         connector.register_handler(AsyncMock(return_value=True))
         return connector
 
-    async def test_a_new_room_name_replaces_the_cached_one(self):
+    async def _deliver(self, connector, access):
         from gateway.connectors.rocketchat.normalize import FilterResult
 
-        connector = self._connector()
         rejected = FilterResult(accepted=False, reason="no mention", sender="alice",
                                 msg_ts="2025-01-01T00:00:01.000Z")
         with patch("gateway.connectors.rocketchat.connector.filter_rc_message",
                    return_value=rejected):
-            await connector._on_raw_ddp_message(
-                "room-1", {"_id": "m1", "rid": "room-1"},
-                access={"roomParticipant": True, "roomType": "c", "roomName": "general-new"})
+            await connector._on_raw_ddp_message("room-1", {"_id": "m1", "rid": "room-1"},
+                                                access=access)
 
+    async def test_a_new_room_name_replaces_the_cached_one(self):
+        connector = self._connector()
+        await self._deliver(connector, {"roomParticipant": True, "roomType": "c", "roomName": "general-new"})
         self.assertEqual(connector._rooms["room-1"].room.name, "general-new")
         self.assertEqual(connector._rooms["room-1"].room.type, "channel")
 
-    async def test_no_access_object_renames_nothing(self):
-        from gateway.connectors.rocketchat.normalize import FilterResult
+    async def test_a_private_group_is_renamed_too(self):
+        connector = self._connector(room_type="group")
+        await self._deliver(connector, {"roomParticipant": True, "roomType": "p", "roomName": "ops-new"})
+        self.assertEqual(connector._rooms["room-1"].room.name, "ops-new")
 
+    async def test_an_access_object_without_a_room_name_renames_nothing(self):
         connector = self._connector()
-        rejected = FilterResult(accepted=False, reason="no mention", sender="alice",
-                                msg_ts="2025-01-01T00:00:01.000Z")
-        with patch("gateway.connectors.rocketchat.connector.filter_rc_message",
-                   return_value=rejected):
-            await connector._on_raw_ddp_message("room-1", {"_id": "m1", "rid": "room-1"})
-
+        await self._deliver(connector, {"roomParticipant": True, "roomType": "c"})
         self.assertEqual(connector._rooms["room-1"].room.name, "general")
 
+    async def test_a_direct_room_is_not_renamed(self):
+        connector = self._connector(room_type="dm")
+        await self._deliver(connector, {"roomParticipant": True, "roomType": "d", "roomName": "x"})
+        self.assertEqual(connector._rooms["room-1"].room.name, "general")
+
+    async def test_no_access_object_renames_nothing(self):
+        connector = self._connector()
+        await self._deliver(connector, None)
+        self.assertEqual(connector._rooms["room-1"].room.name, "general")

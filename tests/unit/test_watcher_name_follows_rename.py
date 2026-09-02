@@ -28,7 +28,6 @@ def _lifecycle_with(name="mm:test-channel", room_id="R1", room_name="test-channe
     record.room_kind = room_kind
     record.room_type = "dm" if room_kind == "dm" else "channel"
     install_record(lifecycle, record)
-    lifecycle.save_state = MagicMock()
     return lifecycle, record
 
 
@@ -47,14 +46,25 @@ class TestTheHandleFollowsTheRoom(unittest.TestCase):
         self.assertIsNone(lifecycle.get_watcher_state("mm:test-channel"))
         self.assertIn("AUDIT", "\n".join(cm.output))
         _assert_consistent(self, lifecycle)
-        lifecycle.save_state.assert_called_once()
+
+    def test_the_old_name_is_pruned_from_the_file(self):
+        """`StateStore.save` merges by name. Without the prune the file kept a
+        frozen row under the old handle beside the live one, and the next boot
+        hydrated that row first — old handle, old session, old watermark
+        (internal review, P1)."""
+        lifecycle, _ = _lifecycle_with()
+
+        lifecycle.observe_room_name("R1", "test-channel-new")
+
+        lifecycle._state_store.save.assert_called_once()
+        self.assertEqual(lifecycle._state_store.save.call_args.kwargs.get("prune"), {"mm:test-channel"})
 
     def test_the_same_name_is_a_no_op(self):
         lifecycle, record = _lifecycle_with()
 
         self.assertIsNone(lifecycle.observe_room_name("R1", "test-channel"))
         self.assertEqual(record.watcher_name, "mm:test-channel")
-        lifecycle.save_state.assert_not_called()
+        lifecycle._state_store.save.assert_not_called()
 
     def test_an_unknown_room_or_an_empty_name_changes_nothing(self):
         lifecycle, record = _lifecycle_with()
@@ -87,10 +97,33 @@ class TestTheHandleFollowsTheRoom(unittest.TestCase):
 
         self.assertIsNone(taken)
         self.assertEqual(record.watcher_name, "mm:test-channel")
-        self.assertEqual(record.room_name, "renamed")
+        self.assertEqual(record.room_name, "test-channel",
+                         "nothing written — a refreshed description would stop the retry")
         self.assertIs(lifecycle.get_watcher_state("mm:renamed"), other)
         self.assertIn("still belongs to room R2", "\n".join(cm.output))
+        lifecycle._state_store.save.assert_not_called()
         _assert_consistent(self, lifecycle)
+
+    def test_once_the_holder_is_gone_the_next_frame_takes_the_name(self):
+        """The 'until' in the warning has to be able to fire: the first version
+        refreshed `room_name` in the collision case, and the same-name
+        short-circuit then made every later frame a no-op (internal review)."""
+        lifecycle, record = _lifecycle_with()
+        other = make_rule_derived_record(name="mm:renamed", room_id="R2", connector="mm")
+        install_record(lifecycle, other)
+        lifecycle.observe_room_name("R1", "renamed")          # refused, holder present
+        lifecycle._uninstall("mm:renamed")                    # the holder is reclaimed
+
+        self.assertEqual(lifecycle.observe_room_name("R1", "renamed"), "mm:renamed")
+        self.assertIs(lifecycle.get_watcher_state("mm:renamed"), record)
+
+    def test_a_private_group_is_renamed_and_a_group_dm_is_not(self):
+        lifecycle, record = _lifecycle_with(name="mm:ops", room_name="ops", room_kind="group")
+        self.assertEqual(lifecycle.observe_room_name("R1", "ops-new"), "mm:ops-new")
+
+        lifecycle2, record2 = _lifecycle_with(name="mm:gdm:abc", room_name="a, b", room_kind="group_dm")
+        self.assertIsNone(lifecycle2.observe_room_name("R1", "a, b, c"))
+        self.assertEqual(record2.watcher_name, "mm:gdm:abc")
 
     def test_a_dm_is_not_renamed_by_a_frame(self):
         """A DM's label derives from the participants, which no frame carries."""
@@ -184,3 +217,22 @@ class TestScheduleListNamesTheWatcherAsItIsNow(unittest.TestCase):
         result = server._handle_schedule_list({"cmd": "schedule-list"})
 
         self.assertEqual(result["jobs"][0]["watcher"], "mm:gone")
+
+    def test_the_connector_filter_reaches_the_store_and_a_room_less_job_is_left_alone(self):
+        from gateway.control import ControlServer
+        from gateway.schedule_types import ScheduledJob
+
+        job = ScheduledJob(id="acg-1", watcher="rc:legacy", connector="rc", room_id="",
+                           message="m", cron="* * * * *")
+        store = MagicMock()
+        store.list_jobs = MagicMock(return_value=[job])
+        entry = MagicMock()
+        entry.name = "rc"
+
+        server = ControlServer(entries=[entry], job_store=store)
+        result = server._handle_schedule_list({"cmd": "schedule-list", "connector": "rc"})
+
+        store.list_jobs.assert_called_once_with(connector="rc", include_completed=False)
+        entry.session_manager.record_for_room.assert_not_called()
+        self.assertEqual(result["jobs"][0]["watcher"], "rc:legacy")
+

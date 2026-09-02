@@ -26,7 +26,7 @@ import logging
 from dataclasses import dataclass, field
 from typing import Callable
 
-from ..schedule_types import ScheduledJob
+from ..schedule_types import JobStatus, ScheduledJob
 from .job_store import _SCHEMA_VERSION, JobStore
 
 logger = logging.getLogger("agent-chat-gateway.core.job_migrate")
@@ -243,9 +243,15 @@ async def _migrate_1_to_2(store: JobStore, entries) -> list[JobOutcome]:
     by_name = {e.name: e for e in entries}
     outcomes: list[JobOutcome] = []
 
-    # `list_jobs()` already excludes COMPLETED, which is the same set — a job
-    # that has finished has nothing left to fire, so nothing to migrate.
-    for job in store.list_jobs():
+    # Every job that can still fire, INCLUDING cancelled ones: a cancelled job
+    # is kept so `schedule resume` can restore it, and a restored job needs
+    # its room. Only COMPLETED has nothing left to fire — the same exclusion
+    # `jobs_missing_room_id` makes, so the two cannot disagree about whether a
+    # migration is still owed (internal review: they did, and the startup
+    # warning became permanent for a cancelled pre-schema-2 job).
+    for job in store.list_jobs(include_completed=True):
+        if job.status == JobStatus.COMPLETED:
+            continue
         if job.room_id:
             outcomes.append(JobOutcome(
                 job.id, job.watcher, False, "already has a room id"))

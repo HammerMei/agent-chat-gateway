@@ -428,8 +428,8 @@ the handle was free:
 
    **Re-keyed (owner, 2026-09-01).** `_states` and `_processors` are keyed by
    room id; a name resolves through one index (`_room_of`), and every write goes
-   through `_install`/`_uninstall`, which keep the two in step and refuse a name
-   that already names a different room. `record_for_room` is a dict get. The
+   through `_install`/`_uninstall`/`_rename`, which keep the two in step and
+   refuse a name that already names a different room. `record_for_room` is a dict get. The
    per-watcher **lock** stays keyed by name on purpose: it is a mutex, not an
    identity, and it is taken before a record exists (`WatcherManager._create`
    locks `wc.name`, then starts). The on-disk state file was never keyed — it is
@@ -445,8 +445,8 @@ description — the counterpart for a 1:1, the participant list for a group DM
 named room's name has moved, the handle is re-derived through the same
 `watcher_label` the creation used, the name index and the per-watcher lock move
 with it, and an AUDIT line records the change. The handle is a function of the
-room's current name, computed, never an identity — a record caches it, nothing
-stores it. Both connectors read the current name off the frame (Mattermost
+room's current name, computed, never an identity — the state record and a job
+persist it as display metadata, and nothing keys on it. Both connectors read the current name off the frame (Mattermost
 `channel_name`, Rocket.Chat `roomName`); neither consumes a rename event, so
 the first message after a rename is when it shows. Direct rooms have no platform name
 to carry, and leaving the field empty for them made `list` show a blank column

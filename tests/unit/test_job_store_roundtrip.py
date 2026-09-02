@@ -444,7 +444,11 @@ class TestACancelledJobIsKeptNotRemoved(unittest.TestCase):
         self.path = Path(tempfile.mkdtemp()) / "jobs.json"
         self.store = JobStore(self.path)
         self.store.load()
+        # An ACTIVE job as a fire would find it: no completion, no cancellation.
+        # `FULLY_POPULATED` carries an old `completed_at`, which would let a
+        # purge keyed on the WRONG field pass (internal review).
         self.store.add(ScheduledJob(**{**FULLY_POPULATED, "status": JobStatus.ACTIVE,
+                                       "completed_at": None,
                                        "cancelled_at": None, "cancel_reason": ""}))
         self.job_id = FULLY_POPULATED["id"]
 
@@ -485,6 +489,21 @@ class TestACancelledJobIsKeptNotRemoved(unittest.TestCase):
         self.store.cancel(self.job_id, reason="r")
 
         self.assertEqual(self.store.remove_expired_completed(7), 0)
+
+    def test_the_purge_ages_a_cancelled_job_from_its_cancellation_not_its_completion(self):
+        self.store.cancel(self.job_id, reason="r")
+        job = self.store.get(self.job_id)
+        job.completed_at = "2020-01-01T00:00:00+00:00"   # stale, and not the field that counts
+
+        self.assertEqual(self.store.remove_expired_completed(7), 0)
+
+    def test_a_second_cancellation_keeps_the_first_evidence(self):
+        self.store.cancel(self.job_id, reason="first")
+        first_at = self.store.get(self.job_id).cancelled_at
+
+        self.assertTrue(self.store.cancel(self.job_id, reason="second"))
+        self.assertEqual(self.store.get(self.job_id).cancel_reason, "first")
+        self.assertEqual(self.store.get(self.job_id).cancelled_at, first_at)
 
     def test_cancelling_a_gone_job_is_false_not_an_error(self):
         self.assertFalse(self.store.cancel("acg-nope", reason="r"))

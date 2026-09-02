@@ -253,6 +253,22 @@ class WatcherLifecycle:
         self._states[ws.room_id] = ws
         self._room_of[ws.watcher_name] = ws.room_id
 
+    def _rename(self, ws: WatcherState, new: str) -> None:
+        """Move a record's name: the index entry and the per-watcher lock go with it.
+
+        The third writer of `_room_of`, beside `_install`/`_uninstall`, and the
+        only one that changes a name without changing a record. The caller has
+        checked that `new` names no other room. The lock is the SAME object under
+        the new name, so a holder keeps holding it and the next taker waits on
+        it rather than on a twin.
+        """
+        old = ws.watcher_name
+        self._room_of.pop(old, None)
+        self._room_of[new] = ws.room_id
+        if old in self._watcher_locks:
+            self._watcher_locks[new] = self._watcher_locks.pop(old)
+        ws.watcher_name = new
+
     def _uninstall(self, name: str) -> WatcherState | None:
         """Remove the record a name resolves to, and the name. `None` if absent."""
         room_id = self._room_of.pop(name, None)
@@ -683,9 +699,16 @@ class WatcherLifecycle:
         # merges the stale disk row straight back. Restored, the record is
         # simply reclaimed again by whatever discovers it next, and that
         # retry re-attempts the prune — crash-honest, like the pop-last rule.
-        self._uninstall(name)
+        # By the record's CURRENT name, not the one captured at entry: a frame
+        # can rename the room during the awaits above (`observe_room_name`
+        # takes no lock), and `_uninstall(name)` would then find nothing —
+        # the record stayed installed under its new handle, active-shaped,
+        # pointing at a session this method had just deleted, while the
+        # reclaim reported success (internal review). Both names are pruned.
+        current = state.watcher_name
+        self._uninstall(current)
         try:
-            self._state_store.save(self._by_name(), prune={name})
+            self._state_store.save(self._by_name(), prune={name, current})
         except Exception:
             # Restored DORMANT, not active-shaped (Codex round 27): the
             # cleanup above already stopped the processor and deleted the
@@ -1250,9 +1273,14 @@ class WatcherLifecycle:
 
         A handle already held by ANOTHER room is not taken: platforms keep names
         unique within a team, so that holder is a stale record of a room since
-        renamed away and not yet heard from. The description is refreshed, the
-        handle kept, and the collision logged — a rename must not re-point a
-        name at a second room (`_install`'s rule).
+        renamed away and not yet heard from. Nothing is written in that case —
+        not even `room_name`, because the same-name short-circuit above would
+        then stop this from ever being retried; the next frame tries again, and
+        succeeds once the holder has been heard from or reclaimed.
+
+        Persisted with the OLD name pruned: `StateStore.save` merges by name,
+        so without the prune the file kept a frozen row under the old handle,
+        and the next boot hydrated THAT row first (internal review).
         """
         ws = self._states.get(room_id)
         if ws is None or not name or ws.room_name == name:
@@ -1267,7 +1295,6 @@ class WatcherLifecycle:
             return None
         old = ws.watcher_name
         new = watcher_label(ws.connector, RoomRef(id=room_id, kind=kind, name=name))
-        taken = None
         if new != old:
             held = self._room_of.get(new)
             if held is not None and held != room_id:
@@ -1276,22 +1303,15 @@ class WatcherLifecycle:
                     "room %s — keeping '%s' until that record is heard from or "
                     "reclaimed", room_id, name, new, held, old,
                 )
-            else:
-                self._room_of.pop(old, None)
-                self._room_of[new] = room_id
-                if old in self._watcher_locks:
-                    # The same mutex object under the new name: a holder keeps
-                    # holding it, and the next taker waits on it, not on a twin.
-                    self._watcher_locks[new] = self._watcher_locks.pop(old)
-                ws.watcher_name = new
-                taken = new
-                logger.warning(
-                    "AUDIT: watcher '%s' is now '%s' — room %s was renamed to '%s'",
-                    old, new, room_id, name,
-                )
+                return None
+            self._rename(ws, new)
+            logger.warning(
+                "AUDIT: watcher '%s' is now '%s' — room %s was renamed to '%s'",
+                old, new, room_id, name,
+            )
         ws.room_name = name
-        self.save_state()
-        return taken
+        self._state_store.save(self._by_name(), prune={old} if new != old else None)
+        return new if new != old else None
 
     def record_for_room(self, room_id: str) -> WatcherState | None:
         """The in-memory record bound to a room, if any (§2.4 sticky binding).

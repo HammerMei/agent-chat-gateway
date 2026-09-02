@@ -324,8 +324,8 @@ Max stack depth 3 (Overview → detail → modal).
 
 `gateway/config_validate.py`'s `ValidationResult` gained `findings:
 list[Finding]` (`severity`, `entity_kind`, `entity_name`, `field`, `message`)
-alongside the existing flat string lists, which remain untouched (`acg
-config validate`'s CLI output is byte-identical — regression-tested). Honest
+alongside the existing flat string lists, which remain untouched
+(`agent-chat-gateway config validate`'s CLI output is byte-identical — regression-tested). Honest
 boundary, as designed: `_check_connectors`/`_lint_config` findings are
 per-entity (often per-field); a `GatewayConfig.from_file` load failure is
 inherently global (`entity_kind="global"`, `entity_name=None`) — the Overview

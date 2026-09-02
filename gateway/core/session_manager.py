@@ -917,8 +917,9 @@ class SessionManager:
             # record and processor kept.
             raise RuntimeError(
                 f"Watcher '{name}' is on connector '{self._connector.name}', "
-                f"which receives no unsolicited messages — nothing could bring "
-                f"an expired watcher back until the daemon restarts. Use "
+                f"which receives no unsolicited messages — nothing would bring "
+                f"an expired watcher back until the daemon restarts or a "
+                f"scheduled job happens to wake it. Use "
                 f"'agent-chat-gateway reset {name}' to clear its session instead."
             )
         # The destructive verbs join the shutdown barrier (internal review of

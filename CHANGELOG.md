@@ -27,7 +27,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   gateway creates each room's watcher on the room's first message (Rocket.Chat,
   Mattermost) or eagerly at startup for connectors with no inbound stream
   (voice, script, whose rules must name literal rooms). Rules match top-down;
-  the first rule that claims a room wins, and `acg config validate` warns about
+  the first rule that claims a room wins, and `agent-chat-gateway config validate` warns about
   rules an earlier rule shadows. Each created watcher is named
   `<connector>:<room>`, which is what `list` shows and the operator verbs act
   on. **The static shape — a `room:` key, or `rooms:` as a list — is a hard
@@ -61,7 +61,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   command is version-aware and safe to re-run, and it never guesses: a job whose
   room cannot be identified is reported and left alone.
 - **Operator verbs act on records, and there is a new one**:
-  `acg expire <watcher>` clears a room's session and reclaims its record and
+  `agent-chat-gateway expire <watcher>` clears a room's session and reclaims its record and
   files now (it overrides pause, audibly — the audit line names the room). It
   does NOT cancel the room's scheduled jobs: expire does not stop a rule
   watching a room, so the job records the room's id and brings the watcher back
@@ -172,8 +172,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **A scheduled job whose connector left the config is cancelled, not
   re-homed.** The fire used to hand such a job to whichever remaining connector
   held its room — under one account per agent, a different agent. It now
-  removes the job at its next slot with an audit line, the same way a room
-  removal does.
+  cancels the job at its next slot with an audit line, the same way a room
+  removal does (marked `cancelled` and kept — see the entry above).
 - **Mattermost replay revalidates membership first.** A removal while the
   WebSocket was down produced no `user_removed` event, and the bot's token can
   still read a public channel it has left, so a reconnect replay delivered a
@@ -186,7 +186,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   adapter had no `reclaim_durable_instructions`, so every expired OpenCode
   watcher left its `system-prompts/<key>.md` behind. The file is now removed,
   as `ClaudeBackend` already did.
-- **`acg schedule migrate` no longer hides work done at an unchanged version.**
+- **`agent-chat-gateway schedule migrate` no longer hides work done at an unchanged version.**
   A version-2 jobs file with a live job lacking a room id re-runs the 1→2 step;
   the CLI keyed "nothing to do" on the versions matching and hid the steps,
   outcomes and jobs needing attention. It now says "nothing to do" only when

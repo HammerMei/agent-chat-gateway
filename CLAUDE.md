@@ -34,9 +34,11 @@ practical use for collaboration; it only makes sense for framework-level testing
 On the runtime path — a scheduled fire, a wake, a failure notice, job
 cancellation — a watcher is identified by its **room id**. The handle
 (`<connector>:<room label>`) is what operators type and what `list` shows; it
-is **recomputed from the room's current name** on every inbound frame
-(`WatcherLifecycle.observe_room_name`), so it moves when a room is renamed and
-can be taken over by another room. Never persist a handle as a key. Resolve a
+is **recomputed from the room's current name** from the frames a discovering
+connector delivers (`WatcherLifecycle.observe_room_name`; named rooms only, and
+a handle another room's record still holds is not taken), so it moves when a
+room is renamed and can be taken over by another room. Never persist a handle
+as a key. Resolve a
 handle to a room id **once**, through `SessionManager.resolve_handle`, and pass
 the id from there. The full rule, its seam sites and the history behind it are
 in `docs/design/dynamic-watcher-design.md` §2.8 ("The routing rule");

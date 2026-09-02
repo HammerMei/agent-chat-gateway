@@ -1706,6 +1706,24 @@ class TestAJobWhoseConnectorIsGoneIsCancelled(unittest.IsolatedAsyncioTestCase):
 
         await scheduler._fire_due_jobs()
 
-        self.assertIsNotNone(store.get(job.id))
+        kept = store.get(job.id)
+        self.assertEqual(kept.status, JobStatus.ACTIVE, "refused, not cancelled")
+        self.assertIsNone(kept.cancelled_at)
         sm.inject_message.assert_not_awaited()
+
+    async def test_catch_up_over_several_missed_slots_survives_the_cancellation(self):
+        """`_fire_catch_up` re-assigns `_fire_once`'s return and reads `.status`
+        on the next missed slot. The cancel branch returned None, so a gone
+        connector with two or more missed slots raised AttributeError out of
+        the catch-up loop — which has no per-job isolation — and killed the
+        scheduler task at startup (internal review, P1)."""
+        three_min_ago = (datetime.now(UTC) - timedelta(minutes=3)).isoformat()
+        store, scheduler, job = self._store_and_scheduler(
+            {"bob": _make_sm_mock(room_id="R-shared")}, connector="retired",
+            room_id="R-shared", cron="* * * * *", last_run=three_min_ago,
+            last_attempted_at=three_min_ago)
+
+        await scheduler._catch_up_missed()   # must not raise
+
+        self.assertEqual(store.get(job.id).status, JobStatus.CANCELLED)
 

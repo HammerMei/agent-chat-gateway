@@ -190,6 +190,24 @@ class TestTheOneToTwoStep(_MigrateCase):
         self.assertEqual(report.changed, 1)
         entry.connector.resolve_room.assert_not_awaited()
 
+    async def test_a_cancelled_job_is_migrated_too(self):
+        """A cancelled job is kept so `schedule resume` can restore it, and a
+        restored job needs its room. `jobs_missing_room_id` counted it while
+        the step skipped it, so the startup warning became permanent and
+        `migrate` reported success with nothing done (internal review)."""
+        job = self._job()
+        job.update(status="cancelled", cancelled_at="2026-09-02T10:00:00+00:00",
+                   cancel_reason="the bot was removed")
+        self._write_file(2, [job])
+        store = self._store()
+        self.assertTrue(store.needs_migration())
+
+        report = await migrate(store, [_entry(records={"rc:general": _record("rc:general", "room-1")})])
+
+        self.assertEqual(store.get("acg-1").room_id, "room-1")
+        self.assertEqual(report.changed, 1)
+        self.assertFalse(store.needs_migration())
+
     async def test_without_a_record_the_connector_resolves_the_name(self):
         """The case right after an upgrade, where static-era records have been
         pruned and rule-derived ones do not exist until a room speaks."""

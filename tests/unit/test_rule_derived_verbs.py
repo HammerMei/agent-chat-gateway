@@ -685,6 +685,41 @@ class TestTheExpireVerb(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(result["ok"])
 
 
+class TestAReclaimSurvivesARenameInItsAwaitWindow(unittest.IsolatedAsyncioTestCase):
+    """`_reclaim_record_locked` awaited the session delete, the prompt reclaim
+    and a `to_thread`, then uninstalled by the NAME captured at entry. A frame
+    renaming the room inside that window re-pointed `_room_of` first, so the
+    uninstall found nothing: the record stayed installed under its new handle,
+    active-shaped, pointing at a session just deleted, and the reclaim reported
+    success (internal review, P2). It now uninstalls by the record's current
+    name and prunes both."""
+
+    _harness = _WakeSuite._harness
+    _settle = _WakeSuite._settle
+
+    async def test_the_record_is_gone_under_both_names(self):
+        connector, lifecycle, _ = await self._harness()
+        with patch("gateway.core.watcher_lifecycle.MessageProcessor") as MockProc:
+            MockProc.return_value.start = MagicMock()
+            MockProc.return_value.stop = AsyncMock()
+            await connector._on_unrouted_message(_doc("m1", 1500), _ACCESS)
+            record = lifecycle.get_watcher_state(NAME)
+            self.assertIsNotNone(record)
+            agent = lifecycle._agents["default"]
+
+            async def rename_mid_reclaim(*args, **kwargs):
+                self.assertEqual(lifecycle.observe_room_name(ROOM_ID, "eng-renamed"),
+                                 "rc:eng-renamed")
+            agent.reclaim_durable_instructions = rename_mid_reclaim
+
+            reclaimed = await lifecycle.reclaim_room(ROOM_ID, reason="test")
+
+        self.assertIsNotNone(reclaimed)
+        self.assertIsNone(lifecycle.record_for_room(ROOM_ID), "the record survived its own reclaim")
+        self.assertIsNone(lifecycle.get_watcher_state("rc:eng-renamed"))
+        self.assertIsNone(lifecycle.get_watcher_state(NAME))
+
+
 class TestControlResolvesRecordOnlyNames(unittest.TestCase):
 
     def test_a_record_only_name_finds_its_entry(self):

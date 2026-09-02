@@ -391,7 +391,7 @@ class JobStore:
         unrecoverable and, once the log rotated, unexplainable. The record now
         stays, with when and why, for `completed_job_ttl_days` like a completed
         job; `schedule resume` restores it. Only the operator's `schedule
-        delete` removes (owner, 2026-09-02).
+        delete` removes it early (owner, 2026-09-02).
 
         Written on the live object under the lock, like `set_room_id`, so a fire
         holding its own copy across an await cannot revert it — `write_fields`
@@ -402,6 +402,8 @@ class JobStore:
             job = self._jobs.get(job_id)
             if job is None:
                 return False
+            if job.status == JobStatus.CANCELLED:
+                return True   # the first cancellation's when-and-why is the evidence
             job.status = JobStatus.CANCELLED
             job.cancelled_at = datetime.now(UTC).isoformat()
             job.cancel_reason = reason

@@ -576,7 +576,7 @@ class ControlServer:
         if job.status == JobStatus.ACTIVE:
             return {"ok": True, "next_run": job.next_run}  # idempotent: already active
         # Compute next_run BEFORE mutating status so that a bad cron expression
-        # leaves the job in its current (paused) state rather than half-resuming.
+        # leaves the job in its current (paused or cancelled) state rather than half-resuming.
         try:
             next_run = compute_next_run(job.cron, job.timezone, after=datetime.now(UTC))
         except Exception as e:

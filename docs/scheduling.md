@@ -305,13 +305,16 @@ kept, not deleted**: `schedule list --all` shows it with `cancelled <time>`, and
 `data/jobs.json` carries `cancelled_at` and `cancel_reason`, so a job the
 gateway cancelled by mistake can be seen and undone — `schedule resume <id>`
 restores it. Cancelled jobs age out after `completed_job_ttl_days`, like
-completed ones. Only `schedule delete` removes a record outright.
+completed ones (with the TTL set to `0` they are purged on the next tick, so
+there is nothing to restore). Only `schedule delete` removes a record early.
 
 If a job's **connector is removed from `config.yaml`** (or renamed), the job is
 cancelled the same way at its next slot — marked, kept, with an audit line. It is never handed to another connector that happens to serve the same
 room: under one account per agent that would run the job as a different agent,
 with that agent's tools and account. Restore the connector under its old name
-before the next slot and the job fires as before.
+before the next slot and the job fires as before; `schedule resume` on the
+cancelled job while its connector is still absent only gets it cancelled again
+at the next slot.
 
 `agent-chat-gateway expire` does **not** cancel them. It clears a session and reclaims a
 record; it does not stop a rule watching the room (that is a rules edit, or

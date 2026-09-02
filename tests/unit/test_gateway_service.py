@@ -227,6 +227,8 @@ class TestTheCancellationClaimRule(unittest.TestCase):
         service._job_store.cancel.assert_called_once()
 
         self.assertEqual(service._job_store.cancel.call_args.args[0], "acg-1")
+        self.assertEqual(service._job_store.cancel.call_args.kwargs["reason"],
+                         "the bot was removed from the room, so the job could never deliver")
 
     def test_a_job_with_no_connector_is_cancelled_too(self):
         """The fallback claim: the scheduler would deliver it here, so a reclaim

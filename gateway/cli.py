@@ -107,8 +107,8 @@ def main():
              "its record and files (overrides pause, audibly). Scheduled jobs "
              "are KEPT — the room's next message, or the job itself, recreates "
              "the watcher. Refused on connectors that receive no unsolicited "
-             "messages (voice, script): nothing could bring the watcher back — "
-             "use 'reset' there",
+             "messages (voice, script): only a restart or a scheduled job would "
+             "bring the watcher back — use 'reset' there",
     )
     expire_p.add_argument("watcher_name", help="Watcher name as shown by 'list'")
 
@@ -291,7 +291,7 @@ def main():
     sched_pause_p.add_argument("job_id", help="Job ID")
 
     # schedule resume
-    sched_resume_p = schedule_sub.add_parser("resume", help="Resume a paused scheduled task")
+    sched_resume_p = schedule_sub.add_parser("resume", help="Resume a paused scheduled task, or restore a cancelled one")
     sched_resume_p.add_argument("job_id", help="Job ID")
 
     # schedule migrate
