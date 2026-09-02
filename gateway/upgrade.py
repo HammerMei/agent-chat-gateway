@@ -628,6 +628,34 @@ def _do_pip_upgrade() -> None:
     console.print("[green]Upgrade complete![/green]")
 
 
+def _restart_daemon_in_fresh_interpreter() -> int:
+    """Start the daemon from a NEW interpreter, so it runs the code just pulled.
+
+    Not `start_daemon()`. That double-forks, and a child of THIS process
+    inherits every module this process has already imported — which is the
+    PRE-upgrade release, because the CLI imports `.daemon` → `.service` → the
+    whole runtime before `run_upgrade` ever runs. `git pull` changed the files
+    on disk; nothing re-imported them. So `acg upgrade` used to report success
+    and restart a daemon running the old code, and it stayed old until someone
+    happened to `stop`/`start` by hand. Measured on a live deployment: two
+    consecutive upgrades, both restarted daemons whose command line still read
+    `agent-chat-gateway upgrade` — the fork — and neither ran the pulled code.
+    The mix is worse than "old": a module first imported lazily AFTER the fork
+    loads from disk and is new, so one process ran two releases at once.
+
+    A fresh `python -m gateway.cli start` imports from disk, picks up whatever
+    `uv sync` changed, and its parent blocks until the daemon signals it is up
+    — so the "Upgrade complete!" line below is printed only once the new
+    daemon is actually running. (Before, `start_daemon()` never returned — its
+    parent `sys.exit`s from `_wait_for_startup_signal` — so with a running
+    daemon that line was never printed at all.)
+
+    Returns the `start` command's exit status.
+    """
+    cmd = [sys.executable, "-m", "gateway.cli", "start"]
+    return subprocess.run(cmd).returncode
+
+
 def run_upgrade() -> None:
     """Entry point called by CLI."""
     console.print("[bold cyan]agent-chat-gateway upgrade[/bold cyan]")
@@ -694,8 +722,14 @@ def run_upgrade() -> None:
 
         if running:
             console.print("  Restarting daemon...")
-            from .cli import DEFAULT_CONFIG as _default_config
-            start_daemon(_default_config)
+            rc = _restart_daemon_in_fresh_interpreter()
+            if rc != 0:
+                console.print(
+                    f"[red]Error:[/red] the daemon did not start after the upgrade "
+                    f"(exit {rc}). The code is upgraded; start it with "
+                    f"'agent-chat-gateway start' and check the log."
+                )
+                sys.exit(rc)
 
         console.print(
             f"\n[green]Upgrade complete![/green] {old_version} → {new_version}\n"

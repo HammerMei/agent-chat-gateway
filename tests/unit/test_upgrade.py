@@ -310,12 +310,62 @@ class TestRunUpgrade:
             patch("gateway.upgrade.stop_daemon", stop_mock),
             patch("gateway.upgrade.start_daemon", start_mock),
             patch("gateway.upgrade._find_uv", return_value="uv"),
-            patch("subprocess.run", return_value=ok_result),
+            patch("subprocess.run", return_value=ok_result) as mock_run,
         ):
             run_upgrade()
 
         stop_mock.assert_called_once()
-        start_mock.assert_called_once()
+        # NOT in-process. `start_daemon()` forks, and the fork inherits this
+        # process's already-imported (pre-upgrade) modules — the daemon it
+        # produced ran the old release with a command line that still said
+        # `upgrade`. The restart has to be a fresh interpreter.
+        start_mock.assert_not_called()
+        starts = [c for c in mock_run.call_args_list if c.args and c.args[0][-1] == "start"]
+        assert len(starts) == 1, mock_run.call_args_list
+        cmd = starts[0].args[0]
+        assert cmd[0] == sys.executable, "a NEW interpreter, not a fork of this one"
+        assert cmd[1:] == ["-m", "gateway.cli", "start"]
+        # Ordering: pull and sync before the restart, so the new interpreter
+        # sees the pulled code and its dependencies.
+        order = [c.args[0][-1] if c.args else None for c in mock_run.call_args_list]
+        assert order.index("pull") < order.index("start")
+        assert order.index("sync") < order.index("start")
+
+    def test_run_upgrade_reports_a_daemon_that_failed_to_start(self, tmp_path: Path):
+        """The fresh `start`'s parent exits non-zero when the daemon does not come
+        up. That has to reach the operator as an error with the recovery step, not
+        be swallowed under "Upgrade complete!" — the code IS upgraded, only the
+        restart failed, and the message must say exactly that."""
+        from gateway.upgrade import run_upgrade
+
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        (repo / "pyproject.toml").write_text('[project]\nname = "x"\nversion = "0.2.0"\n')
+        (repo / "gateway").mkdir()
+        (repo / "gateway" / "contexts").mkdir()
+        meta_file = tmp_path / "install_meta.json"
+        meta_file.write_text(json.dumps({
+            "method": "git", "repo_path": str(repo),
+            "version": "0.1.0", "installed_at": "2026-01-01",
+        }))
+
+        def _run(cmd, *a, **kw):
+            r = MagicMock()
+            r.returncode = 3 if cmd[-1] == "start" else 0
+            return r
+
+        with (
+            patch("gateway.upgrade.META_FILE", meta_file),
+            patch("gateway.upgrade.is_running", return_value=(True, 12345)),
+            patch("gateway.upgrade.stop_daemon", MagicMock()),
+            patch("gateway.upgrade.start_daemon", MagicMock()),
+            patch("gateway.upgrade._find_uv", return_value="uv"),
+            patch("subprocess.run", side_effect=_run),
+        ):
+            with pytest.raises(SystemExit) as excinfo:
+                run_upgrade()
+
+        assert excinfo.value.code == 3
 
     def test_run_upgrade_git_pull_failure(self, tmp_path: Path):
         """Exits with error when git pull fails."""
