@@ -388,7 +388,7 @@
             "null"
           ],
           "minimum": 1,
-          "description": "Days with no message before this watcher's runtime object is dropped (session kept). Lives on the rule rather than the agent so two rules sharing an agent can differ. Must be strictly less than session_expire_days when both are set."
+          "description": "Days with no message before this watcher's runtime object is dropped (session kept) — the idle leg. Lives on the rule rather than the agent so two rules sharing an agent can differ. Independent of session_expire_days: the two legs are measured from different origins, so no ordering between them is required (both default to 15)."
         },
         "session_expire_days": {
           "type": [
@@ -396,7 +396,7 @@
             "null"
           ],
           "minimum": 1,
-          "description": "Days with no message before the session itself is dropped too."
+          "description": "Days after the watcher was DROPPED (not after its last message) before everything is reclaimed: record, backend session, prompt file, attachment workspace — the expiry leg. Measured from the drop, so an outage cannot carry a watcher from active straight to expired."
         },
         "context_inject_files": {
           "type": "array",

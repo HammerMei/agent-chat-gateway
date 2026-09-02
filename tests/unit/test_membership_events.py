@@ -106,6 +106,38 @@ class TestARemovalReclaimsTheRecord(unittest.IsolatedAsyncioTestCase):
         self.assertIn("room-w1", audit[0], "the audit names the room")
         self.assertIn("pause", audit[0].lower())
 
+    async def test_a_removal_with_no_record_still_cancels_the_rooms_jobs(self):
+        """`expire` reclaims the record but keeps the jobs. A removal that lands
+        before anything recreated the watcher finds no record — and used to skip
+        cancellation entirely, leaving room-id jobs firing at a room the bot had
+        left, every slot, with no record for reconciliation to revisit (Codex,
+        PR #140). A room-id job is cancellable by its room alone."""
+        cancelled = []
+        mgr = _bare_manager_with_membership(
+            _cancel_jobs=lambda room_id, name: cancelled.append((room_id, name)))
+        mgr._lifecycle.reclaim_room = AsyncMock(return_value=None)   # nothing reclaimed…
+        mgr._lifecycle.record_for_room = MagicMock(return_value=None)  # …because no record exists
+
+        await mgr._reclaim_removed_room("room-gone", reason="removed")
+
+        self.assertEqual(cancelled, [("room-gone", "")],
+                         "cancelled by room, with no legacy handle to give")
+
+    async def test_a_refused_reclaim_that_leaves_a_record_cancels_nothing(self):
+        """The other meaning of `None`: a record exists but was not reclaimed —
+        replaced under the identity pin, or static-era. The room is still served
+        and its jobs stay. Telling the two apart is what `record_for_room`
+        answers, and why `None` alone was never enough to cancel on."""
+        cancelled = []
+        mgr = _bare_manager_with_membership(
+            _cancel_jobs=lambda room_id, name: cancelled.append((room_id, name)))
+        mgr._lifecycle.reclaim_room = AsyncMock(return_value=None)
+        mgr._lifecycle.record_for_room = MagicMock(return_value=object())  # a record remains
+
+        await mgr._reclaim_removed_room("room-w1", reason="removed")
+
+        self.assertEqual(cancelled, [])
+
     async def test_no_record_is_an_idempotent_no_op(self):
         """A missed event discovered twice — the live event and a later REST
         failure, or the reconciliation — must reach the same end state."""

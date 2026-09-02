@@ -251,7 +251,12 @@ class JobScheduler:
             # Always reset completed_at to now — a hand-edited future timestamp
             # would otherwise make the job immune to TTL purge.
             job.completed_at = datetime.now(UTC).isoformat()
-            await asyncio.to_thread(self._store.update, job)
+            # Field-scoped for consistency with every other fire-path write, not
+            # because a copy is held: `job` here is the stored object from
+            # `list_due()` and nothing awaits between the read and this write,
+            # so `update(job)` could not have reverted anything. Verified by
+            # planting `update` back — no test can tell the two apart here.
+            await asyncio.to_thread(self._store.write_fields, job, FIRE_OWNED_FIELDS)
             return
 
         # For jobs with exactly one remaining run, fire once regardless of how long
@@ -393,7 +398,14 @@ class JobScheduler:
                     job.status = JobStatus.PAUSED
                     job.next_run = None
                 try:
-                    await asyncio.to_thread(self._store.update, job)
+                    # Field-scoped here too. The success path was converted first
+                    # and this branch was missed (Codex, PR #140): a migration
+                    # landing while the inject that then FAILED was in flight had
+                    # its room id reverted by this whole-object write of the
+                    # pre-await copy. Self-healing since `needs_migration` also
+                    # looks at the jobs, but a fire must not undo a migration.
+                    await asyncio.to_thread(
+                        self._store.write_fields, job, FIRE_OWNED_FIELDS)
                 except Exception as e:
                     logger.error("Failed to persist job %s after failed fire: %s", job.id, e)
                 return job

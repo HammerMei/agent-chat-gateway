@@ -223,7 +223,13 @@ async def _resolve_room_id(entry, job: ScheduledJob) -> tuple[str, str]:
             f"the connector knows no room named {room_name!r} — this job cannot "
             f"be migrated; delete it, or recreate it against a current watcher"
         )
-    return room.id, f"resolved {room_name!r}"
+    # Said out loud: this room was found by NAME, from the job's handle, not from
+    # a record. A static-era watcher whose name happened to be shaped like a
+    # derived handle (`<connector>:<something>` — static names forbade only `/`)
+    # could name a room other than the one it served, and nothing here can tell.
+    # The migration guide has the operator delete static-era jobs before this
+    # runs; the report line is what lets them catch one that slipped through.
+    return room.id, f"resolved by NAME {room_name!r} from the job's handle — verify this is the room the job meant"
 
 
 async def _migrate_1_to_2(store: JobStore, entries) -> list[JobOutcome]:

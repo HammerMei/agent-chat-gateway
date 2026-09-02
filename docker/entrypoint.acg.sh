@@ -182,7 +182,7 @@ config = {
             },
         }
     },
-    "watchers": [{
+    "watcher_rules": [{
         "name":               "e2e-watcher",
         "connector":          "rocketchat",
         "rooms":              watcher_rooms,

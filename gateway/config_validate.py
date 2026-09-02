@@ -554,9 +554,9 @@ def _check_state_orphans(config: GatewayConfig, result: ValidationResult) -> Non
                 f"'{st.watcher_name}' was written by an older version of this "
                 "gateway, which used a config format that no longer exists. "
                 "The next start will discard it, including its paused setting "
-                "and its session. To keep serving that room, add an entry "
-                "under 'watchers:' that matches it — it will start a new "
-                "session on the room's next message. See "
+                "and its session. To keep serving that room, add a rule "
+                "under 'watcher_rules:' whose rooms match it — it will start a "
+                "new session on the room's next message. See "
                 "docs/migration-dynamic-watchers.md."
             )
             result.warnings.append(msg)

@@ -2,7 +2,7 @@
 
 You can schedule recurring or one-time tasks using the `agent-chat-gateway schedule` CLI. When a user asks you to set up a recurring task, reminder, or automated job, use these commands.
 
-> **IMPORTANT — watcher name**: The `<watcher>` argument must be the **exact** watcher name from this gateway's configuration. Do NOT invent or guess a name. If you are unsure, run `agent-chat-gateway list --all` first and use a name shown there.
+> **IMPORTANT — watcher name**: The `<watcher>` argument is the watcher's **runtime handle** — `<connector>:<room label>`, e.g. `rc:general` or `mm:dm:alice` — which is what your own message header identifies you as and what `agent-chat-gateway list --all` shows. It is **not** the rule name from `config.yaml`: a rule creates one watcher per room, and `schedule create` rejects a rule name. Do NOT invent or guess a handle; if you are unsure, run `agent-chat-gateway list --all` first and use one shown there.
 >
 > **Check the STATE column before scheduling.** A scheduled message is injected into the watcher's running session, so a watcher that is not running cannot receive it at that moment. This does **not** mean you should refuse — it means you should tell the user and confirm.
 >

@@ -682,15 +682,29 @@ class SessionManager:
                 "reconciliation re-discovers it", room_id,
             )
             return
-        if name is not None and self._cancel_jobs is not None:
+        # `None` from reclaim_room covers two cases that must be told apart
+        # here: no record for the room at all, or a record that was not
+        # reclaimed (a replacement pinned by `expected`, or a static-era one).
+        # In the second the room is still served and its jobs must stay. In the
+        # first — `expire` reclaimed the record but kept the jobs, and the bot
+        # was removed before anything recreated the watcher (Codex, PR #140) —
+        # skipping cancellation left room-id jobs firing at a room the bot had
+        # left, every slot, with no record for reconciliation to revisit. The
+        # distinguishing fact is whether a record remains for the room.
+        room_still_served = (
+            name is None and self._lifecycle.record_for_room(room_id) is not None
+        )
+        if self._cancel_jobs is not None and not room_still_served:
             try:
                 # The ROOM, not just the handle. Matching jobs by handle was
                 # wrong in both directions once another room could take a
                 # handle over: it cancelled a live room's jobs under the audit
                 # line "the bot was removed from the room" — false for that
                 # room — and left this room's own jobs firing at a room the bot
-                # had left. Found by the sweep.
-                self._cancel_jobs(room_id, name)
+                # had left. Found by the sweep. A room-id job is cancellable by
+                # its room alone; only a pre-schema-2 job needs the handle, and
+                # with no record there is none to give.
+                self._cancel_jobs(room_id, name or "")
             except Exception:
                 logger.exception(
                     "Could not cancel scheduled jobs for reclaimed watcher "

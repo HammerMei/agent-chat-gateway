@@ -1600,3 +1600,53 @@ class TestAnAmbiguousRoomIsRefusedRatherThanGuessed(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestNoFirePathWriteRevertsAMigration(unittest.IsolatedAsyncioTestCase):
+    """The success path was converted to `write_fields` first and the finite-job
+    FAILURE branch was missed (Codex, PR #140): it still wrote the pre-await
+    copy back whole, so a `room_id` that `schedule migrate` wrote while the
+    inject was in flight — and the inject then failed — was reverted.
+
+    The migration is simulated exactly where it lands in production: inside the
+    awaited inject, after `_fire_once` took its copy. Planting `update` back
+    fails this test.
+
+    The catch-up COMPLETION write (`_fire_catch_up`) was converted too, for
+    consistency only: it writes the stored object with no await in between, so
+    `update` there could not revert anything, and no test can tell the two
+    apart — a test claiming otherwise was written and then removed once the
+    plant showed it did not discriminate.
+    """
+
+    def _store_and_scheduler(self, sm, **job_kwargs):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        store = JobStore(jobs_file=Path(tmp.name) / "jobs.json")
+        store.load()
+        job = _make_job(room_id="", **job_kwargs)
+        store.add(job)
+        scheduler = JobScheduler(store=store, session_managers={"rc-home": sm}, completed_job_ttl_days=7)
+        return store, scheduler, job
+
+    def _sm_whose_inject(self, store, job_id, *, returns):
+        sm = _make_sm_mock()
+
+        async def _inject(room_id, text):
+            store.set_room_id(job_id, "R-migrated")   # the migration lands mid-fire
+            return returns
+        sm.inject_message = AsyncMock(side_effect=_inject)
+        return sm
+
+    async def test_a_failed_finite_fire_keeps_the_migrated_room_id(self):
+        sm = _make_sm_mock()
+        store, scheduler, job = self._store_and_scheduler(
+            sm, times=3, next_run=(datetime.now(UTC) - timedelta(minutes=1)).isoformat())
+        sm.inject_message = self._sm_whose_inject(store, job.id, returns=False).inject_message
+
+        await scheduler._fire_due_jobs()
+
+        self.assertEqual(store.get(job.id).room_id, "R-migrated",
+                         "the failure branch wrote the pre-await copy back whole")
+        self.assertEqual(store.get(job.id).run_count, 0, "a failed finite fire consumes no run")
+

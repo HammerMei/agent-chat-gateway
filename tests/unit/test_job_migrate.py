@@ -197,10 +197,25 @@ class TestTheOneToTwoStep(_MigrateCase):
         store = self._store()
         entry = _entry(resolves={"general": _room("room-1")})
 
-        await migrate(store, [entry])
+        report = await migrate(store, [entry])
 
         self.assertEqual(store.get("acg-1").room_id, "room-1")
         entry.connector.resolve_room.assert_awaited_once_with("general")
+        # Said out loud in the report: a room found by NAME from the handle is a
+        # guess the operator should be able to spot — a static-era watcher whose
+        # name was shaped like a handle could have served another room.
+        detail = report.outcomes[0].detail
+        self.assertIn("by NAME", detail)
+        self.assertIn("verify", detail)
+
+    async def test_a_room_taken_from_the_record_is_not_flagged_as_by_name(self):
+        self._write_file(1, [self._job()])
+        store = self._store()
+        entry = _entry(records={"rc:general": _record("rc:general", "room-1")})
+
+        report = await migrate(store, [entry])
+
+        self.assertNotIn("by NAME", report.outcomes[0].detail)
 
     async def test_a_dm_job_resolves_through_the_at_spelling(self):
         self._write_file(1, [self._job(watcher="rc:dm:alice")])
