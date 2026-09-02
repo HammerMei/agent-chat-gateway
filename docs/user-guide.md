@@ -504,7 +504,10 @@ watcher_rules:
 ```
 
 Each created watcher is named `<connector>:<room>` — that derived name is
-what `list` shows and what `pause`/`resume`/`reset`/`expire` act on. Rules
+what `list` shows and what `pause`/`resume`/`reset`/`expire` act on. It follows
+the room: rename a channel and, from the next message in it, `list` shows the
+new name and the old one no longer resolves (the log carries an `AUDIT` line).
+Scripts should not store a watcher name; the room is the identity. Rules
 match top-down; the first rule that claims a room wins, and `agent-chat-gateway config
 validate` warns when an earlier rule shadows a later one completely.
 

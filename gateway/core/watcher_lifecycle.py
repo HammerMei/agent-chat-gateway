@@ -1232,6 +1232,67 @@ class WatcherLifecycle:
     # start machinery; these three are the whole seam between them, so neither
     # reaches into the other's dicts.
 
+    def observe_room_name(self, room_id: str, name: str) -> str | None:
+        """A frame carried the room's current platform name — follow a rename.
+
+        The handle `<connector>:<room label>` is a function of the room's
+        current name, never an identity (§2.3): the record is keyed by room id
+        and the handle is recomputed here, through the same `watcher_label` the
+        creation used, whenever a frame shows the name has moved. Returns the
+        new handle when one was taken, else None.
+
+        Owner, 2026-09-02: a renamed room kept its old handle until the watcher
+        happened to be recreated, so `list` showed a name the platform no longer
+        had, and the operator could type it against the wrong watcher once the
+        platform reused the name. DM kinds are not renamed here — their label
+        derives from the participants, which no frame carries (the RC frame has
+        no counterpart username); that staleness stays documented in §2.3.
+
+        A handle already held by ANOTHER room is not taken: platforms keep names
+        unique within a team, so that holder is a stale record of a room since
+        renamed away and not yet heard from. The description is refreshed, the
+        handle kept, and the collision logged — a rename must not re-point a
+        name at a second room (`_install`'s rule).
+        """
+        ws = self._states.get(room_id)
+        if ws is None or not name or ws.room_name == name:
+            return None
+        from .watcher_manager import RoomRef, watcher_label
+        from .watcher_rule import RoomKind
+        try:
+            kind = RoomKind(ws.room_kind or ws.room_type)
+        except ValueError:
+            kind = RoomKind.CHANNEL
+        if kind.is_direct:
+            return None
+        old = ws.watcher_name
+        new = watcher_label(ws.connector, RoomRef(id=room_id, kind=kind, name=name))
+        taken = None
+        if new != old:
+            held = self._room_of.get(new)
+            if held is not None and held != room_id:
+                logger.warning(
+                    "Room %s is now named '%s', but handle '%s' still belongs to "
+                    "room %s — keeping '%s' until that record is heard from or "
+                    "reclaimed", room_id, name, new, held, old,
+                )
+            else:
+                self._room_of.pop(old, None)
+                self._room_of[new] = room_id
+                if old in self._watcher_locks:
+                    # The same mutex object under the new name: a holder keeps
+                    # holding it, and the next taker waits on it, not on a twin.
+                    self._watcher_locks[new] = self._watcher_locks.pop(old)
+                ws.watcher_name = new
+                taken = new
+                logger.warning(
+                    "AUDIT: watcher '%s' is now '%s' — room %s was renamed to '%s'",
+                    old, new, room_id, name,
+                )
+        ws.room_name = name
+        self.save_state()
+        return taken
+
     def record_for_room(self, room_id: str) -> WatcherState | None:
         """The in-memory record bound to a room, if any (§2.4 sticky binding).
 

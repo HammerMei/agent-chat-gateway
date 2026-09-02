@@ -748,10 +748,9 @@ class WatcherManager:
             # kind below (Codex round 6): a wake from tracked state offers a
             # ref with no participants, so deriving the name from it degrades
             # a DM's description to the dm-/gdm-digest and overwrites the
-            # meaningful room_name the creation wrote. Accepted trade: a
-            # platform-side rename stays stale on the record until a
-            # creation-from-platform refreshes it — the same display-staleness
-            # class as issue #124.
+            # meaningful room_name the creation wrote. A platform-side rename
+            # reaches the record through `WatcherLifecycle.observe_room_name`
+            # on the next frame, which also re-derives the handle.
             name=record.room_name or room_description(room),
             # The record's own kind, not the offered room's: the record is what
             # this watcher was created against (§2.4), and a re-classification

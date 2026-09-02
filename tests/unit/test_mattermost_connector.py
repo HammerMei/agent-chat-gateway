@@ -389,6 +389,29 @@ class TestOnPostedEvent(unittest.IsolatedAsyncioTestCase):
         await connector.subscribe_room(room, watcher_id="w1")
         return connector
 
+    async def test_a_frame_with_a_new_channel_name_renames_the_channel_state(self):
+        """The frame's `channel_name` is the channel as it is NOW; the state's copy
+        was taken at subscribe. The message built from the state then carries the
+        new name to the lifecycle, which re-derives the handle (design §2.3)."""
+        connector = await self._connector_with_channel()
+        connector.register_handler(AsyncMock(return_value=True))
+        await connector._on_posted_event({
+            "post": {"id": "p1", "channel_id": "chan1", "user_id": "u1", "message": "hi",
+                     "root_id": "", "type": "", "create_at": 1},
+            "mentions": [], "channel_type": "O", "channel_name": "general-new",
+        })
+        self.assertEqual(connector._channels["chan1"].room.name, "general-new")
+        self.assertEqual(connector._channels["chan1"].room.type, "channel")
+
+    async def test_a_replayed_post_carries_no_name_and_renames_nothing(self):
+        connector = await self._connector_with_channel()
+        connector.register_handler(AsyncMock(return_value=True))
+        decoded = connector._synthesize_decoded_for_replay(
+            {"id": "p1", "channel_id": "chan1", "user_id": "u1", "message": "hi",
+             "root_id": "", "type": "", "create_at": 1})
+        await connector._on_posted_event(decoded, is_replay=True, replay_after_ts="0")
+        self.assertEqual(connector._channels["chan1"].room.name, "general")
+
     async def test_ignores_unsubscribed_channel(self):
         connector = _make_connector()
         received = []

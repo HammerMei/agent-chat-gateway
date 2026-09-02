@@ -437,9 +437,18 @@ the handle was free:
    walks the dicts and fails on any key that is not its record's room id.
 
 The `room_name` on the state record is a **human-readable description of the
-room**, refreshed from inbound messages: the platform's own name for a named
-room, and for the DM kinds the room's description — the counterpart for a 1:1,
-the participant list for a group DM (§2.4). Direct rooms have no platform name
+room**, refreshed from inbound messages (`WatcherLifecycle.observe_room_name`,
+reached from `SessionManager._on_inbound` on every claimed frame): the
+platform's own name for a named room, and for the DM kinds the room's
+description — the counterpart for a 1:1, the participant list for a group DM
+(§2.4). **The handle follows it** (owner, 2026-09-02): when a frame shows a
+named room's name has moved, the handle is re-derived through the same
+`watcher_label` the creation used, the name index and the per-watcher lock move
+with it, and an AUDIT line records the change. The handle is a function of the
+room's current name, computed, never an identity — a record caches it, nothing
+stores it. Both connectors read the current name off the frame (Mattermost
+`channel_name`, Rocket.Chat `roomName`); neither consumes a rename event, so
+the first message after a rename is when it shows. Direct rooms have no platform name
 to carry, and leaving the field empty for them made `list` show a blank column
 for exactly the rooms an operator cannot otherwise tell apart, so the
 description fills it instead. It is a display value and nothing keys on it.
@@ -534,21 +543,21 @@ gives up on readability:
 **A renamed counterpart is a known inconsistency, deliberately left.** This
 table used to claim a username was stable. It is not — Rocket.Chat allows a
 rename, the room id does not change with it, and the row now says so. A channel
-rename is picked up immediately, because the new name arrives on every frame; a
-username is not on the frame, so it comes from an `im.members` lookup cached per
-room.
+rename is followed on the next frame (above); a username is not on the frame,
+so it comes from an `im.members` lookup cached per room, and a DM's label keeps
+the counterpart's name as of creation.
 
 What that costs is smaller than it first looks, and the reason is worth stating
 because it is the part a reader would get wrong. Nothing binds to the name: a
 watcher is keyed `(connector, room_id)`, the state record caches the resolved
 `room_id`, and `participants` is explicitly not part of any key (§6.4). Nor does
 a restart re-derive the label — recreation reads the **materialized config
-persisted in the state record** (§2.4), so an existing watcher keeps the name it
-was created with, and a rename cannot split its session, its watermark or its
-idle clock. The stale name is visible only where a name is *derived*: a watcher
-created after the rename — first contact, or a recreation after expiry, at which
-point the session it would have joined is gone by design anyway. Within one
-process the cache can make even that fresh creation use the old name.
+persisted in the state record** (§2.4), so a rename cannot split a watcher's
+session, its watermark or its idle clock: the record is found by room id and
+its handle is then refreshed from the next frame. For the DM kinds the stale
+name is visible only where a name is *derived*: a watcher created after the
+rename — first contact, or a recreation after expiry. Within one process the
+cache can make even that fresh creation use the old name.
 
 So the defect is a label that can lag, not an identity that can break — **and
 that is a constraint on the creation path, not merely an observation about it.**
@@ -563,11 +572,11 @@ again each time. Caching user ids instead would not avoid that lookup — the
 label needs names, so ids would have to be resolved to names at the same point.
 
 What the verified immutability of DM membership (§6.4) justifies is caching the
-**kind**; the names are a snapshot and are documented here as one. Making the
-label follow a rename means deciding what a rename does to a *live* watcher's
-identity — whether it is renamed, or left alone and diverges from its room —
-and that is a §2.3 identity question, not a caching one. Deferred until watcher
-identity is revisited.
+**kind**; the names are a snapshot and are documented here as one. For named
+rooms the question "what does a rename do to a live watcher's identity" is
+answered above: nothing — identity is the room id, and the handle is
+recomputed. For DM labels it stays open, because no frame carries the
+counterpart's current name.
 
 **Group DMs deliberately do not encode their members in the label.** The
 tempting alternative is Mattermost's `channel_display_name`, which is exactly

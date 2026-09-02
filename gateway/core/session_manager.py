@@ -182,7 +182,7 @@ class SessionManager:
         A single-connector caller has no such barrier to run and should keep using
         `run_once()`.
         """
-        self._connector.register_handler(self._dispatcher.dispatch)
+        self._connector.register_handler(self._on_inbound)
         self._connector.register_capacity_check(self._dispatcher.capacity)
         if (self._watcher_manager is not None
                 and self._connector.supports_unsolicited_inbound()):
@@ -598,6 +598,18 @@ class SessionManager:
                     "than lost: %s",
                     ws.watcher_name, ws.room_id, e,
                 )
+
+    async def _on_inbound(self, msg) -> bool:
+        """The connector's handler: note the room's current name, then dispatch.
+
+        One seam every claimed message passes, so a rename is followed on the
+        first frame after it (`WatcherLifecycle.observe_room_name`). Only for
+        connectors that discover rooms — an eager connector's room name is the
+        configured literal, not a platform fact a frame could correct.
+        """
+        if self._connector.supports_unsolicited_inbound():
+            self._lifecycle.observe_room_name(msg.room.id, msg.room.name)
+        return await self._dispatcher.dispatch(msg)
 
     async def _route_unclaimed_room(self, room: RoomRef, trigger) -> None:
         """The router the connectors call for a room no watcher tracks (§2.2).

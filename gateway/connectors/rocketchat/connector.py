@@ -2146,6 +2146,13 @@ class RocketChatConnector(Connector):
         if not sub:
             logger.warning("Received message for unknown room_id=%s", room_id)
             return True
+        # `roomName` is the room's name as of THIS delivery; a rename shows up
+        # here first. Named kinds only — a direct room has no `roomName`.
+        current_name = (access or {}).get("roomName") or ""
+        if (current_name and sub.room.type in ("channel", "group")
+                and sub.room.name != current_name):
+            logger.info("Room %s was renamed '%s' → '%s'", room_id, sub.room.name, current_name)
+            sub.room = Room(id=sub.room.id, name=current_name, type=sub.room.type)
 
         # Which membership era this delivery belongs to, read before the first await. Every
         # path from here to the watermark commit is long — normalization, attachment

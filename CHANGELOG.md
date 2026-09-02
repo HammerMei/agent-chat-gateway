@@ -149,6 +149,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Runtime session continuity across restarts is unaffected.
 
 ### Fixed
+- **A watcher's name follows its room's rename.** The handle
+  `<connector>:<room>` was derived at creation and kept: after a channel rename,
+  `list` showed the old name until the watcher happened to be recreated, and the
+  old handle could be typed against the wrong watcher once the platform reused
+  it. It is now re-derived from the room's current name on the first message
+  after a rename (Mattermost `channel_name`, Rocket.Chat `roomName`), with an
+  `AUDIT` log line; `schedule list` shows each job's watcher as it is named now.
+  DM labels still carry the counterpart's name as of creation.
 - **A job the gateway cancels is kept, not deleted.** Cancellation (the bot
   removed from the room; the job's connector gone from the config) now marks
   the job `cancelled` with `cancelled_at` and `cancel_reason` instead of

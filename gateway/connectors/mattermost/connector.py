@@ -1715,6 +1715,16 @@ class MattermostConnector(Connector):
                 "dropping post", channel_id,
             )
             return
+        # The frame names the channel as it is NOW. A rename shows up here first
+        # (there is no `channel_updated` handling), and the message built below
+        # carries it to the lifecycle, which re-derives the watcher's handle.
+        # Named kinds only: a DM's `channel_name` is the opaque id pair.
+        current_name = decoded.get("channel_name")
+        if (current_name and state.room.type in ("channel", "group")
+                and state.room.name != current_name):
+            logger.info("Channel %s was renamed '%s' → '%s'",
+                        channel_id, state.room.name, current_name)
+            state.room = Room(id=state.room.id, name=current_name, type=state.room.type)
 
         msg_id = post.get("id", "")
         if msg_id and msg_id in state.seen_ids_set:

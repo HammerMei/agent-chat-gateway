@@ -5443,3 +5443,55 @@ class TestACancelledDeliveryIsNotAVerdict(unittest.IsolatedAsyncioTestCase):
             await connector._on_raw_ddp_message("room-1", self._doc())
 
         self.assertIn("m1", sub.seen_ids_set)
+
+
+class TestAFrameRenamesTheSubscriptionsRoom(unittest.IsolatedAsyncioTestCase):
+    """`roomName` on the per-delivery access object is the room as it is NOW.
+    The subscription's copy was taken at subscribe time; the message built from
+    it carries the new name to the lifecycle, which re-derives the handle."""
+
+    def _connector(self):
+        from gateway.connectors.rocketchat.connector import (
+            RocketChatConnector,
+            _RoomSubscription,
+        )
+        from gateway.core.connector import Room
+
+        connector = RocketChatConnector.__new__(RocketChatConnector)
+        connector._config = MagicMock()
+        connector._config.name = "rc"
+        connector._rest = MagicMock()
+        connector._rooms = {"room-1": _RoomSubscription(
+            room=Room(id="room-1", name="general", type="channel"), last_processed_ts=None)}
+        connector._room_membership_gen = {}
+        connector._turn_store = None
+        connector.register_handler(AsyncMock(return_value=True))
+        return connector
+
+    async def test_a_new_room_name_replaces_the_cached_one(self):
+        from gateway.connectors.rocketchat.normalize import FilterResult
+
+        connector = self._connector()
+        rejected = FilterResult(accepted=False, reason="no mention", sender="alice",
+                                msg_ts="2025-01-01T00:00:01.000Z")
+        with patch("gateway.connectors.rocketchat.connector.filter_rc_message",
+                   return_value=rejected):
+            await connector._on_raw_ddp_message(
+                "room-1", {"_id": "m1", "rid": "room-1"},
+                access={"roomParticipant": True, "roomType": "c", "roomName": "general-new"})
+
+        self.assertEqual(connector._rooms["room-1"].room.name, "general-new")
+        self.assertEqual(connector._rooms["room-1"].room.type, "channel")
+
+    async def test_no_access_object_renames_nothing(self):
+        from gateway.connectors.rocketchat.normalize import FilterResult
+
+        connector = self._connector()
+        rejected = FilterResult(accepted=False, reason="no mention", sender="alice",
+                                msg_ts="2025-01-01T00:00:01.000Z")
+        with patch("gateway.connectors.rocketchat.connector.filter_rc_message",
+                   return_value=rejected):
+            await connector._on_raw_ddp_message("room-1", {"_id": "m1", "rid": "room-1"})
+
+        self.assertEqual(connector._rooms["room-1"].room.name, "general")
+

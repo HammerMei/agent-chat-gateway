@@ -513,7 +513,20 @@ class ControlServer:
         include_completed = request.get("include_completed", False)
         try:
             jobs = self._job_store.list_jobs(connector=connector, include_completed=include_completed)
-            return {"ok": True, "jobs": [j.to_dict() for j in jobs]}
+            rows = [j.to_dict() for j in jobs]
+            # The WATCHER column is the handle as it is NOW, derived from the
+            # room the job records, not the spelling stored at creation: a
+            # handle follows a room rename (§2.3), and the operator must be
+            # able to type what this column shows into `pause`/`expire`.
+            by_name = {e.name: e for e in self._entries}
+            for row in rows:
+                entry = by_name.get(row.get("connector") or "")
+                if entry is None or not row.get("room_id"):
+                    continue
+                record = entry.session_manager.record_for_room(row["room_id"])
+                if record is not None and record.watcher_name:
+                    row["watcher"] = record.watcher_name
+            return {"ok": True, "jobs": rows}
         except Exception as e:
             return {"ok": False, "error": str(e)}
 
