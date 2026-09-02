@@ -195,6 +195,11 @@ no DMs — see [Templates and `rooms` inheritance](user-guide.md#templates-and-r
 On the Watcher Rules tab, the Rooms column shows each rule's **effective**
 matcher, inherited parts included.
 
+The same form also offers `connector` and `agent`, so a template can carry
+them and a rule that inherits it needs neither on itself — the loader
+resolves both from the template, and the rule's form shows them as
+`(from '<template>')`. Leave either blank on the template to not set it.
+
 Editing a field on a template shows a confirm dialog naming every entry
 that would be affected (scoped to entries that actually inherit *this*
 template and don't already override the field) before saving — so you know

@@ -150,6 +150,33 @@ class TemplateDetailScreen(ToolListEditorMixin, FormScreen):
     def _field_specs(self) -> tuple[FieldSpec, ...]:
         if self.kind == "connector":
             return FIELDS_BY_TYPE.get(self._connector_type(), ())
+        if self.kind == "watcher":
+            # `connector` and `agent` are inheritable from a watcher template —
+            # the loader resolves a rule's value from its `inherits:` block
+            # (gateway/config.py, "Shared with a template") and the user guide
+            # documents them as "required on the rule as it is finally
+            # resolved". The TUI could read them (the rule form showed
+            # "(from 'tmpl')") but not WRITE them: this form had no field for
+            # either, so the only way to put them on a template was by hand.
+            #
+            # Built per-instance, like the connector kind above, because the
+            # option lists come from the live config — and NOT added to
+            # `WATCHER_TEMPLATE_FIELDS`, which `RuleDetailScreen._field_specs`
+            # spreads after its own connector/agent specs; adding them there
+            # would render both fields twice on every rule form.
+            #
+            # Neither is required on a template ("nothing in a template is
+            # truly required" — `_required_field_keys` stays empty), so an
+            # unset one renders blank and saves as an absent key, exactly as
+            # the enum path in `_compose_field_row` already does for a rule.
+            connector_names = tuple(sorted(
+                c.get("name", "?") for c in self.cfg.connectors_raw))
+            agent_names = tuple(sorted(self.cfg.agents_raw))
+            return (
+                FieldSpec("connector", "enum", "Connector", options=connector_names),
+                FieldSpec("agent", "enum", "Agent", options=agent_names),
+                *WATCHER_TEMPLATE_FIELDS,
+            )
         return _STATIC_FIELDS_BY_KIND[self.kind][0]
 
     def _dataclass_defaults(self) -> dict[str, object]:
