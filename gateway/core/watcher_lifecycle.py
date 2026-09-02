@@ -1244,6 +1244,13 @@ class WatcherLifecycle:
         """
         return self._states.get(room_id)
 
+    def processor_for_room(self, room_id: str) -> "MessageProcessor | None":
+        """The live processor for a room, or None. The by-room twin of
+        `record_for_room`, for callers that hold a record — reading residency
+        through `record.watcher_name` was a by-name lookup of something already
+        in hand, and by-name lookups are what §2.8 fences."""
+        return self._processors.get(room_id)
+
     def processor_named(self, name: str) -> MessageProcessor | None:
         """The live processor for a watcher name, or None when not resident."""
         return self._processor_named(name)

@@ -231,7 +231,7 @@ async def _migrate_1_to_2(store: JobStore, entries) -> list[JobOutcome]:
 
     Idempotent: a job that already has one is skipped, so a re-run touches
     nothing. `connector` is filled in at the same time when it is missing —
-    `_get_sm_for_watcher` needs it, and a job with neither field cannot be
+    `_resolve_target` needs it, and a job with neither field cannot be
     routed to a manager at all.
     """
     by_name = {e.name: e for e in entries}

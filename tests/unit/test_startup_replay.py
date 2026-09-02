@@ -121,7 +121,7 @@ class TestStartupReplay(unittest.IsolatedAsyncioTestCase):
         mgr._connector.replay_room_since = AsyncMock()
         mgr._lifecycle.states = MagicMock(
             return_value={r.watcher_name: r for r in records})
-        mgr._lifecycle.processor_named = MagicMock(return_value=None)
+        mgr._lifecycle.processor_for_room = MagicMock(return_value=None)
         mgr._watcher_manager = MagicMock()
         mgr._watcher_manager.get_or_create = AsyncMock(return_value="proc")
         return mgr
@@ -202,7 +202,7 @@ class TestStartupReplay(unittest.IsolatedAsyncioTestCase):
         window = _window(mgr)
         mgr._connector.probe_missed_since = AsyncMock(return_value=True)
         # What the live path did between start_inbound and this loop.
-        mgr._lifecycle.processor_named = MagicMock(return_value="already-running")
+        mgr._lifecycle.processor_for_room = MagicMock(return_value="already-running")
         record.last_processed_ts = "9999999999999"
 
         await mgr._replay_persisted_records(window)
@@ -318,7 +318,7 @@ class TestBootRunsTheSweepsEvaluation(unittest.IsolatedAsyncioTestCase):
         # Asked, not remembered: a bare MagicMock answers truthily, and the
         # boot evaluation's residency re-check (round 18) would then skip
         # every record — the third instance of this exact trap.
-        mgr._lifecycle.processor_named = MagicMock(return_value=None)
+        mgr._lifecycle.processor_for_room = MagicMock(return_value=None)
         mgr._watcher_manager = MagicMock()
         mgr._watcher_manager.get_or_create = AsyncMock(return_value="proc")
         self._old = (datetime.now().astimezone()
@@ -355,7 +355,7 @@ class TestBootRunsTheSweepsEvaluation(unittest.IsolatedAsyncioTestCase):
         mgr._lifecycle.states = MagicMock(
             return_value={record.watcher_name: record})
         # …but a wake already made it resident.
-        mgr._lifecycle.processor_named = MagicMock(return_value="the-proc")
+        mgr._lifecycle.processor_for_room = MagicMock(return_value="the-proc")
 
         await mgr._evaluate_lifecycle_at_boot()
 

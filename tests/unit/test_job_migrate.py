@@ -212,7 +212,7 @@ class TestTheOneToTwoStep(_MigrateCase):
         self.assertEqual(store.get("acg-1").room_id, "room-dm")
 
     async def test_an_empty_connector_field_is_filled_in_too(self):
-        """`_get_sm_for_watcher` needs it, and a job with neither field cannot be
+        """`_resolve_target` needs it, and a job with neither field cannot be
         routed to a manager at all."""
         job = self._job()
         job["connector"] = ""
@@ -314,9 +314,9 @@ class TestAStaticEraNameIsNotARoomName(_MigrateCase):
         self._write_file(1, [self._job()])  # 'rc:general'
         store = self._store()
 
-        await migrate(self._store(), [_entry(resolves={"general": _room("room-1")})])
+        await migrate(store, [_entry(resolves={"general": _room("room-1")})])
 
-        self.assertEqual(self._store().get("acg-1").room_id, "room-1")
+        self.assertEqual(store.get("acg-1").room_id, "room-1")
 
 
 class TestNothingIsGuessed(_MigrateCase):

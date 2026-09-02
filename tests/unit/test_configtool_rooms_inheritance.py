@@ -30,18 +30,23 @@ from pathlib import Path
 import pytest
 import yaml
 from textual.widgets import (
-    Checkbox, DataTable, Input, Select, Static, TabbedContent,
+    Checkbox,
+    DataTable,
+    Input,
+    Select,
+    Static,
+    TabbedContent,
 )
 
 from gateway.config import GatewayConfig
 from gateway.configtool.app import ConfigToolApp
+from gateway.configtool.modals import ConfirmModal
 from gateway.configtool.model import EditableConfig
 from gateway.configtool.screens.rule_detail import (
     WATCHER_TEMPLATE_DATACLASS_DEFAULTS,
     WATCHER_TEMPLATE_FIELDS,
     rule_rooms_summary,
 )
-from gateway.configtool.modals import ConfirmModal
 from gateway.configtool.screens.template_detail import TemplateDetailScreen
 
 ROOMS_KEYS = ("rooms.include", "rooms.except_for", "rooms.direct", "rooms.group_direct")

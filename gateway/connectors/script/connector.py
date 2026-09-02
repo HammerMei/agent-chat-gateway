@@ -59,6 +59,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import uuid
+from typing import TYPE_CHECKING
 
 from ...agents.response import AgentResponse
 from ...core.connector import (
@@ -69,6 +70,9 @@ from ...core.connector import (
     User,
     UserRole,
 )
+
+if TYPE_CHECKING:
+    from ...core.watcher_manager import RoomRef
 
 logger = logging.getLogger("agent-chat-gateway.connectors.script")
 

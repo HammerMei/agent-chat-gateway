@@ -22,7 +22,6 @@ from __future__ import annotations
 import tempfile
 import textwrap
 import unittest
-from pathlib import Path
 
 from gateway.config import _deep_merge
 from gateway.configtool.model import EditableConfig, Provenance

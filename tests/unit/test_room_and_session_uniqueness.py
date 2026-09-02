@@ -25,7 +25,7 @@ from gateway.core.state import (
     connector_name_of,
     save_state,
 )
-from tests.helpers import install_record, make_lifecycle, register_processor, start_watcher
+from tests.helpers import install_record, make_lifecycle, start_watcher
 
 
 class TestOneSessionOneRoom(unittest.TestCase):

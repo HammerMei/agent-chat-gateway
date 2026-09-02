@@ -325,8 +325,8 @@ class GatewayService:
                 # the exemption itself: a job records the room it targets and can
                 # resurrect it, so there is no record to protect on its behalf.
                 cancel_jobs=(
-                    lambda name, room_id, _cn=cc.name: self._cancel_jobs_for(
-                        _cn, name, room_id)
+                    lambda room_id, legacy_handle, _cn=cc.name: self._cancel_jobs_for(
+                        _cn, room_id, legacy_handle=legacy_handle)
                 ),
             )
             self._entries.append(
@@ -348,9 +348,13 @@ class GatewayService:
         )
 
     def _cancel_jobs_for(
-        self, connector_name: str, watcher_name: str, room_id: str = ""
+        self, connector_name: str, room_id: str, *, legacy_handle: str
     ) -> None:
-        """Cancel every scheduled job targeting a reclaimed watcher (§2.7).
+        """Cancel every scheduled job targeting a reclaimed room (§2.7).
+
+        Room id first and required; `legacy_handle` is keyword-only and named
+        for what it is — the ONLY thing a job written before schema 2 has to be
+        matched by. Nothing else here reads a handle (§2.8).
 
         Fired by the membership-remove handler after `reclaim_room` succeeds:
         the room can never receive another message, so a job left in the store
@@ -366,7 +370,7 @@ class GatewayService:
             def _owner_of(job) -> str:
                 """Which connector would DELIVER this job.
 
-                The same order `JobScheduler._get_sm_for_watcher` uses, and
+                The same order `JobScheduler._resolve_target` uses, and
                 deliberately so: cancellation must claim exactly the jobs this
                 connector would have fired. `job.connector` when it names a
                 configured connector; otherwise the handle's prefix, the only
@@ -404,22 +408,22 @@ class GatewayService:
                     # Both directions were reachable.
                     return job.room_id == room_id
                 # Pre-schema-2: the handle is the only key there is.
-                return job.watcher == watcher_name
+                return job.watcher == legacy_handle
 
             doomed = [j for j in self._job_store.list_jobs()
                       if _claims_this_room(j)]
             for job in doomed:
                 self._job_store.remove(job.id)
                 logger.warning(
-                    "AUDIT: cancelled scheduled job %s (watcher '%s', "
+                    "AUDIT: cancelled scheduled job %s (watcher '%s', room %s, "
                     "connector '%s') — the bot was removed from the room, so "
-                    "the job could never deliver", job.id, watcher_name,
+                    "the job could never deliver", job.id, job.watcher, room_id,
                     connector_name,
                 )
         except Exception as e:
             logger.warning(
-                "Could not cancel scheduled jobs for reclaimed watcher '%s': %s",
-                watcher_name, e,
+                "Could not cancel scheduled jobs for reclaimed room %s: %s",
+                room_id, e,
             )
 
     async def _settle(

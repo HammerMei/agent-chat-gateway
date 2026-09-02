@@ -355,10 +355,11 @@ class JobScheduler:
             str(job.times) if job.times > 0 else "∞",
         )
 
-        success = await self._inject(job)
+        target = self._resolve_target(job)
+        success = await self._inject(job, target)
         if not success:
-            sm = self._get_sm_for_watcher(job)
-            watcher_state = self._record_for(sm, job)
+            sm, room_id = target if target is not None else (None, "")
+            watcher_state = sm.record_for_room(room_id) if sm is not None else None
             is_paused = watcher_state is not None and bool(watcher_state.paused)
 
             if is_paused:
@@ -375,7 +376,7 @@ class JobScheduler:
                     job.id,
                     job.watcher,
                 )
-                await self._notify_injection_failure(job, sm, watcher_state)
+                await self._notify_injection_failure(job, sm, room_id)
 
             if job.times > 0:
                 # Finite job: delivery failed — do NOT consume run_count so the
@@ -442,40 +443,35 @@ class JobScheduler:
 
         return job
 
-    def _get_sm_for_watcher(self, job: ScheduledJob) -> "SessionManager | None":
-        """Return the SessionManager that owns the job's watcher.
+    def _resolve_target(self, job: ScheduledJob) -> "tuple[SessionManager, str] | None":
+        """The manager and the ROOM this job fires into, resolved once per fire.
 
-        Prefers the connector named in job.connector; falls back to a linear
-        search when the connector field is absent or stale.
+        Every downstream step — inject, pause check, failure notice — takes the
+        room id this returns and nothing else. A fire used to resolve the same
+        job four times through four different methods, some by room and some by
+        handle, and the handle-taking ones were where the defect kept
+        reappearing (§2.8). One seam; one answer.
+
+        Manager first. `job.connector` when configured; otherwise, by room —
+        but only when exactly ONE manager holds the room. Room ids are
+        per-server, not per-connector, and the canonical multi-agent setup is
+        one account per agent in the same rooms, so several holders is the
+        normal case: taking the first meant `config.yaml` order decided which
+        agent ran the job, and another account posted the reply while the fire
+        logged success. Ambiguity is the operator's question, so: loud, None.
+
+        Room second. `job.room_id` when the job has one. A job written before
+        schema 2 has only its handle, which `resolve_handle` turns into whatever
+        room currently answers to that name — the single by-name lookup on this
+        path, and the reason `schedule migrate` exists.
         """
         sm = self._session_managers.get(job.connector)
-        if sm is not None:
-            return sm
-
-        # A job whose `connector` is empty or names a connector that is no longer
-        # configured. Two fallbacks, in order of how much they can be trusted.
-        # By ROOM first: the room id is the job's identity, and a record bound to
-        # it identifies the owning manager even when the room has been renamed
-        # and the handle no longer matches anything.
-        #
-        # But ONLY when exactly one manager holds it. Room ids are per-server,
-        # not per-connector, and the canonical multi-agent setup is one account
-        # per agent in the SAME rooms (CLAUDE.md) — so several managers holding a
-        # record for one room is the normal case, not the exotic one. Taking the
-        # first match meant `config.yaml` ordering decided which agent ran the
-        # job: measured, a job whose connector was renamed away was delivered
-        # into another agent's processor, and that agent's account posted the
-        # reply, while the fire logged an ordinary success. Before this branch
-        # the same case failed loudly with "no session manager owns watcher …".
-        #
-        # Ambiguity is not a routing problem to solve by guessing; it is a
-        # question only the operator can answer. So: loud.
-        if job.room_id:
+        if sm is None and job.room_id:
             owners = [m for m in self._session_managers.values()
                       if m.record_for_room(job.room_id) is not None]
             if len(owners) == 1:
-                return owners[0]
-            if owners:
+                sm = owners[0]
+            elif owners:
                 logger.error(
                     "Job %s targets room %s, which %d connectors have a record "
                     "for, and its own connector %r is not configured. Refusing "
@@ -485,25 +481,39 @@ class JobScheduler:
                     job.id, job.room_id, len(owners), job.connector,
                 )
                 return None
-        for manager in self._session_managers.values():
-            # By handle, last: `get_watcher_config` was removed with the static
-            # path, and calling it here raised AttributeError before the fire's
-            # failure accounting could run (Codex round 4). Kept because a job
-            # written before `room_id` existed has nothing else — and it is the
-            # weaker signal, since a handle can have been taken over by another
-            # room (§2.3).
-            if manager.get_watcher_state(job.watcher) is not None:
-                return manager
-        # Neither field can name a manager: an old job whose connector was
-        # renamed away and whose room has no live record. `schedule migrate`
-        # records both, which is what makes such a job resolvable again.
-        return None
+        if sm is None and not job.room_id:
+            # A handle embeds its connector's name, so at most one manager can
+            # answer for it — this cannot cross accounts the way a room can.
+            for manager in self._session_managers.values():
+                room_id = manager.resolve_handle(job.watcher)
+                if room_id:
+                    return manager, room_id
+        if sm is None:
+            logger.warning(
+                "Job %s: no session manager owns watcher %r (connector %r is "
+                "not configured and no room or record names one). "
+                "'agent-chat-gateway schedule migrate' records the room.",
+                job.id, job.watcher, job.connector,
+            )
+            return None
+
+        room_id = job.room_id or sm.resolve_handle(job.watcher)
+        if not room_id:
+            logger.warning(
+                "Job %s: watcher %r has no resolvable room — a job created "
+                "before schema 2 carries no room id and its watcher's record is "
+                "gone, so there is nothing to fire into. "
+                "'agent-chat-gateway schedule migrate' records one.",
+                job.id, job.watcher,
+            )
+            return None
+        return sm, room_id
 
     async def _notify_injection_failure(
         self,
         job: ScheduledJob,
         sm: "SessionManager | None",
-        watcher_state: object | None,
+        room_id: str,
     ) -> None:
         """Best-effort notification to the watcher's room when injection fails.
 
@@ -511,7 +521,7 @@ class JobScheduler:
         queue) so it reaches the room even while the watcher is stopped or
         draining.  Failures are logged but never re-raised.
         """
-        if sm is None:
+        if sm is None or not room_id:
             return
         retry_note = (
             "The run count was **not** consumed — it will retry at the next scheduled time."
@@ -523,62 +533,32 @@ class JobScheduler:
             f"(watcher `{job.watcher}` is not accepting messages). {retry_note}"
         )
         try:
-            # Addressed by the job's own room, not by its handle.
-            await sm.notify_watcher_room(
-                job.watcher, text, room_id=job.room_id,
-            )
+            await sm.notify_watcher_room(room_id, text)
         except Exception as e:
             logger.warning(
                 "Job %s: failed to send injection-failure notification: %s", job.id, e
             )
 
-    @staticmethod
-    def _record_for(sm, job: "ScheduledJob"):
-        """The record for THIS job's room, or None.
+    async def _inject(
+        self, job: ScheduledJob, target: "tuple[SessionManager, str] | None",
+    ) -> bool:
+        """Inject the job message into the room `_resolve_target` chose.
 
-        By room id when the job has one, and only then by handle. The handle is
-        the weaker key — another room can take it over once the original's record
-        is reclaimed, which this branch made routine by removing the expiry
-        exemption for job-bearing rooms.
-
-        Reading it by handle had two silent outcomes, both found by a sweep after
-        the same defect appeared three times elsewhere:
-
-        * the PAUSE check read the other room's flag, so a job whose own room was
-          gone logged "watcher is paused — skipping fire (expected)" and sent no
-          failure notice. Forever, every slot, self-labelled as normal.
-        * the failure NOTICE was addressed from it, so the warning went to the
-          room that had taken the handle.
+        Takes the resolution rather than redoing it — this method used to
+        resolve on its own, and an earlier version resolved by *attempting
+        delivery* into every manager with `except Exception: pass`, so a real
+        failure in the owning manager was indistinguishable from "no manager
+        has it". Resolving once, upstream, and injecting once means a failure
+        is reported as a failure, against the room it was actually for.
         """
-        if sm is None:
-            return None
-        if job.room_id:
-            return sm.record_for_room(job.room_id)
-        return sm.get_watcher_state(job.watcher)
-
-    async def _inject(self, job: ScheduledJob) -> bool:
-        """Inject the job message into the target watcher via SessionManager.
-
-        Resolution goes through `_get_sm_for_watcher`, which this method used to duplicate
-        — and the copy was not merely redundant, it was worse. It resolved by *attempting
-        delivery* into every manager in turn with `except Exception: pass`, so a real
-        failure in the manager that actually owns the watcher was indistinguishable from
-        "no manager has it", and the operator saw the generic message either way. Resolving
-        first and then injecting once means a failure is reported as a failure.
-        """
-        sm = self._get_sm_for_watcher(job)
-        if sm is None:
-            logger.warning(
-                "Job %s: no session manager owns watcher %r", job.id, job.watcher)
-            return False
+        if target is None:
+            return False  # `_resolve_target` already said why
+        sm, room_id = target
         try:
-            # The job's room id is its identity — the handle is only a label.
-            return await sm.inject_message(
-                job.watcher, job.message, room_id=job.room_id,
-            )
+            return await sm.inject_message(room_id, job.message)
         except Exception as e:
             logger.error(
-                "Job %s: inject_message failed for watcher %r: %s",
-                job.id, job.watcher, e,
+                "Job %s: inject_message failed for room %s (watcher %r): %s",
+                job.id, room_id, job.watcher, e,
             )
             return False

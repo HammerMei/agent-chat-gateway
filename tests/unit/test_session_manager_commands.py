@@ -408,39 +408,31 @@ class TestTheRouterWiring(unittest.IsolatedAsyncioTestCase):
             "rc", room, history_before_ts="2026-08-16T10:00:00+00:00")
 
 
-class TestNotifyWatcherRoomNeedsLoadedState(unittest.IsolatedAsyncioTestCase):
-    """`notify_watcher_room` reads in-memory state only, so a record this
-    process never loaded gets no notice.
+class TestNotifyWatcherRoomTakesARoomId(unittest.IsolatedAsyncioTestCase):
+    """`notify_watcher_room` is addressed by room id and nothing else.
 
-    Pinned rather than fixed: `list` shows such a record as `failed`, so the
-    two disagree — but a disk-only record can name a room the watcher has since
-    moved away from, and posting an alert into that room is worse than posting
-    none. The policy belongs with the notification issue, not here. This test
-    exists so that changing it is a decision rather than an accident.
+    It used to take a watcher name and look the room up — and a scheduled job's
+    failure notice once went to whichever room had taken the handle over. The
+    class this replaces pinned a policy about records "this process never
+    loaded"; with no lookup there is no such policy to pin.
     """
 
-    async def test_a_record_this_process_never_loaded_gets_no_notice(self):
+    async def test_an_empty_room_id_is_refused(self):
         mgr = _make_manager()
-        mgr._lifecycle.get_watcher_state = MagicMock(return_value=None)
 
-        sent = await mgr.notify_watcher_room("w1", "hello")
-
-        self.assertFalse(sent)
+        with self.assertRaises(ValueError):
+            await mgr.notify_watcher_room("", "hello")
         mgr._connector.send_text.assert_not_called()
 
-    async def test_a_loaded_record_does_get_one(self):
-        from gateway.core.state import WatcherState
-
+    async def test_the_notice_goes_to_the_room_it_was_given(self):
         mgr = _make_manager()
         mgr._connector.send_text = AsyncMock()
-        mgr._lifecycle.get_watcher_state = MagicMock(
-            return_value=WatcherState(watcher_name="w1", session_id="s", room_id="r1")
-        )
 
-        sent = await mgr.notify_watcher_room("w1", "hello")
+        sent = await mgr.notify_watcher_room("r1", "hello")
 
         self.assertTrue(sent)
         self.assertEqual(mgr._connector.send_text.call_args[0][0], "r1")
+
 
 if __name__ == "__main__":
     unittest.main()

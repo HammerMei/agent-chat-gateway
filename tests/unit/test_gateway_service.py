@@ -222,7 +222,7 @@ class TestTheCancellationClaimRule(unittest.TestCase):
     def test_a_job_on_this_connector_is_cancelled(self):
         service = self._service_with_jobs([("acg-1", "rc:general", "rc")])
 
-        service._cancel_jobs_for("rc", "rc:general", "room-1")
+        service._cancel_jobs_for("rc", "room-1", legacy_handle="rc:general")
 
         service._job_store.remove.assert_called_once_with("acg-1")
 
@@ -231,14 +231,14 @@ class TestTheCancellationClaimRule(unittest.TestCase):
         must be able to cancel it here."""
         service = self._service_with_jobs([("acg-1", "rc:general", "")])
 
-        service._cancel_jobs_for("rc", "rc:general", "room-1")
+        service._cancel_jobs_for("rc", "room-1", legacy_handle="rc:general")
 
         service._job_store.remove.assert_called_once_with("acg-1")
 
     def test_a_job_naming_a_connector_that_no_longer_exists_is_cancelled(self):
         service = self._service_with_jobs([("acg-1", "rc:general", "retired")])
 
-        service._cancel_jobs_for("rc", "rc:general", "room-1")
+        service._cancel_jobs_for("rc", "room-1", legacy_handle="rc:general")
 
         service._job_store.remove.assert_called_once_with("acg-1")
 
@@ -250,14 +250,14 @@ class TestTheCancellationClaimRule(unittest.TestCase):
         other.name = "mm"
         service._entries.append(other)
 
-        service._cancel_jobs_for("rc", "rc:general", "room-1")
+        service._cancel_jobs_for("rc", "room-1", legacy_handle="rc:general")
 
         service._job_store.remove.assert_not_called()
 
     def test_another_watchers_job_is_left_alone(self):
         service = self._service_with_jobs([("acg-1", "rc:dev", "rc")])
 
-        service._cancel_jobs_for("rc", "rc:general", "room-1")
+        service._cancel_jobs_for("rc", "room-1", legacy_handle="rc:general")
 
         service._job_store.remove.assert_not_called()
 class TestIdentityBarrier(unittest.IsolatedAsyncioTestCase):
@@ -835,7 +835,7 @@ class TestCancellationRequiresOwnershipNotJustTheRoom(unittest.TestCase):
             ("acg-theirs", "alice:general", "alice", "room-1"),
         ])
 
-        service._cancel_jobs_for("rc", "rc:general", "room-1")
+        service._cancel_jobs_for("rc", "room-1", legacy_handle="rc:general")
 
         self.assertEqual(self._removed(service), ["acg-mine"])
 
@@ -846,7 +846,7 @@ class TestCancellationRequiresOwnershipNotJustTheRoom(unittest.TestCase):
             ("acg-theirs", "alice:general", "alice", "room-1"),
         ])
 
-        service._cancel_jobs_for("rc", "rc:general", "room-1")
+        service._cancel_jobs_for("rc", "room-1", legacy_handle="rc:general")
 
         self.assertEqual(self._removed(service), [])
 
@@ -861,7 +861,7 @@ class TestCancellationRequiresOwnershipNotJustTheRoom(unittest.TestCase):
             ("acg-old", "rc:general", ""),
         ])
 
-        service._cancel_jobs_for("rc", "rc:general", "room-1")
+        service._cancel_jobs_for("rc", "room-1", legacy_handle="rc:general")
 
         self.assertEqual(self._removed(service), ["acg-old"])
 
@@ -870,7 +870,7 @@ class TestCancellationRequiresOwnershipNotJustTheRoom(unittest.TestCase):
             ("acg-old", "alice:general", ""),
         ])
 
-        service._cancel_jobs_for("rc", "rc:general", "room-1")
+        service._cancel_jobs_for("rc", "room-1", legacy_handle="rc:general")
 
         self.assertEqual(self._removed(service), [])
 
@@ -909,7 +909,7 @@ class TestCancellationMatchesByRoomNotByHandle(unittest.TestCase):
         """Room B holds the handle and is alive; the bot was removed from A."""
         service = self._service([("acg-b", "rc:general", "room-B")])
 
-        service._cancel_jobs_for("rc", "rc:general", "room-A")
+        service._cancel_jobs_for("rc", "room-A", legacy_handle="rc:general")
 
         service._job_store.remove.assert_not_called()
 
@@ -918,7 +918,7 @@ class TestCancellationMatchesByRoomNotByHandle(unittest.TestCase):
         renamed, so its record's handle differs. The room id still matches."""
         service = self._service([("acg-a", "rc:general", "room-A")])
 
-        service._cancel_jobs_for("rc", "rc:daily-standup", "room-A")
+        service._cancel_jobs_for("rc", "room-A", legacy_handle="rc:daily-standup")
 
         service._job_store.remove.assert_called_once_with("acg-a")
 
@@ -926,7 +926,7 @@ class TestCancellationMatchesByRoomNotByHandle(unittest.TestCase):
         """It has no id, so the handle is the only key it has."""
         service = self._service([("acg-old", "rc:general", "")])
 
-        service._cancel_jobs_for("rc", "rc:general", "room-A")
+        service._cancel_jobs_for("rc", "room-A", legacy_handle="rc:general")
 
         service._job_store.remove.assert_called_once_with("acg-old")
 

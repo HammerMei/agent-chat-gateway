@@ -18,7 +18,13 @@ import asyncio
 import unittest
 from unittest.mock import AsyncMock, MagicMock, patch
 
-from tests.helpers import evict_record, install_record, make_rule_derived_record, pop_processor, register_processor
+from tests.helpers import (
+    evict_record,
+    install_record,
+    make_rule_derived_record,
+    pop_processor,
+    register_processor,
+)
 from tests.unit.test_wake_path import (
     _ACCESS,
     _doc,

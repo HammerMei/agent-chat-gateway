@@ -132,7 +132,7 @@ def _make_sm_mock(inject_result: bool = True, paused: bool = False, room_id: str
     sm.get_watcher_state = MagicMock(return_value=watcher_state)
     # `record_for_room` answers only for the rooms this manager owns. A bare
     # MagicMock returns a truthy object for ANY room id, which would make
-    # `_get_sm_for_watcher`'s room-first loop match the first manager in the
+    # `_resolve_target`'s room-first loop match the first manager in the
     # dict whatever it was asked — so a future multi-manager test would pass
     # while delivery went to the wrong connector (review called it a loaded
     # gun, and it was: today the branch is only dead because every fixture
@@ -140,7 +140,17 @@ def _make_sm_mock(inject_result: bool = True, paused: bool = False, room_id: str
     sm._owned_rooms = {room_id} if room_id else set()
     sm.record_for_room = MagicMock(
         side_effect=lambda rid: watcher_state if rid in sm._owned_rooms else None)
+    # The one by-name entry on the runtime path (§2.8). Answers the room this
+    # mock owns for ANY handle, mirroring `get_watcher_state` above — a fixture
+    # that needs a handle to miss sets `resolve_handle` itself.
+    sm.resolve_handle = MagicMock(return_value=room_id)
     return sm
+
+
+def _manager_of(target):
+    """`_resolve_target` answers `(manager, room_id)` or None; tests about WHICH
+    manager was chosen read the first half."""
+    return target[0] if target is not None else None
 
 
 class TestJobSchedulerFiring(unittest.IsolatedAsyncioTestCase):
@@ -292,9 +302,11 @@ class TestJobSchedulerFiring(unittest.IsolatedAsyncioTestCase):
         await scheduler._fire_due_jobs()
         sm.notify_watcher_room.assert_awaited_once()
         call_args = sm.notify_watcher_room.call_args
-        notified_watcher = call_args[0][0]
+        notified_room = call_args[0][0]
         notified_text = call_args[0][1]
-        self.assertEqual(notified_watcher, job.watcher)
+        # Addressed by ROOM: the job has no room id, so `_resolve_target` asked
+        # the manager to resolve its handle once, and the notice goes there.
+        self.assertEqual(notified_room, sm.resolve_handle.return_value)
         self.assertIn("⚠️", notified_text)
 
     async def test_broken_job_does_not_block_other_jobs(self):
@@ -1202,13 +1214,12 @@ class TestInjectMessageWakesAnIdleRoom(unittest.IsolatedAsyncioTestCase):
         woken_processor.enqueue = AsyncMock(return_value=True)
 
         sm = make_bare_session_manager(_connector_name="rc")
-        sm._lifecycle.get_processor = MagicMock(return_value=None)  # idle
-        sm._lifecycle.get_watcher_state = MagicMock(return_value=self._record())
-        sm._lifecycle.get_watcher_config = MagicMock(return_value=None)
+        sm._lifecycle.processor_for_room = MagicMock(return_value=None)  # idle
+        sm._lifecycle.record_for_room = MagicMock(return_value=self._record())
         sm._watcher_manager = MagicMock()
         sm._watcher_manager.get_or_create = AsyncMock(return_value=woken_processor)
 
-        result = await sm.inject_message("rc-eng", "check stock prices")
+        result = await sm.inject_message("room-1", "check stock prices")
 
         self.assertTrue(result)
         woken_processor.enqueue.assert_awaited_once()
@@ -1230,15 +1241,15 @@ class TestInjectMessageWakesAnIdleRoom(unittest.IsolatedAsyncioTestCase):
         from tests.helpers import make_bare_session_manager
 
         sm = make_bare_session_manager(_connector_name="rc")
-        sm._lifecycle.get_processor = MagicMock(return_value=None)
-        sm._lifecycle.get_watcher_state = MagicMock(
+        sm._lifecycle.processor_for_room = MagicMock(return_value=None)
+        sm._lifecycle.record_for_room = MagicMock(
             return_value=self._record(paused=True))
         sm._watcher_manager = MagicMock()
         sm._watcher_manager.get_or_create = AsyncMock(return_value=None)
 
         with self.assertLogs("agent-chat-gateway.core.session_manager",
                              level=logging.WARNING):
-            result = await sm.inject_message("rc-eng", "hello")
+            result = await sm.inject_message("room-1", "hello")
 
         self.assertFalse(result)
 
@@ -1251,76 +1262,76 @@ class TestInjectMessageWakesAnIdleRoom(unittest.IsolatedAsyncioTestCase):
         from tests.helpers import make_bare_session_manager
 
         sm = make_bare_session_manager()
-        sm._lifecycle.get_processor = MagicMock(return_value=None)
+        sm._lifecycle.processor_for_room = MagicMock(return_value=None)
+        sm._lifecycle.record_for_room = MagicMock(return_value=self._record())
 
         with self.assertLogs("agent-chat-gateway.core.session_manager",
                              level=logging.WARNING):
-            result = await sm.inject_message("static-w", "hello")
+            result = await sm.inject_message("room-1", "hello")
 
         self.assertFalse(result)
 
 
-class TestInjectMessageWithNoResolvableRoom(unittest.IsolatedAsyncioTestCase):
-    """Inverted: no room means no injection, not an injection with no address.
+class TestAJobWithNoResolvableRoomIsNotFired(unittest.TestCase):
+    """No room means no injection, not an injection with no address.
 
-    This asserted the opposite — that a watcher with no persisted state was
-    still injected, with a warning that "room_id will be empty, which may cause
-    the agent response to be posted to the wrong room or dropped". That was
-    honest about the outcome and wrong about the decision: the agent then ran a
-    full turn (tool calls included) and the reply went nowhere, while `enqueue`
-    returning True made the fire count as a SUCCESS — so a finite scheduled job
-    burned a run on an undelivered message, every slot, forever.
-
-    Nothing is injected without a resolvable room now, and the message says what
-    to do about it.
+    Decided at the scheduler's ONE resolution seam (`_resolve_target`), not
+    inside `inject_message` — which now takes a room id and nothing else, so it
+    cannot even be asked the question. Before, a watcher with no persisted
+    state was still injected with a warning that the reply "may be dropped":
+    the agent ran a full turn and the reply went nowhere while `enqueue`
+    returning True counted the fire as a SUCCESS, burning a finite job's run
+    every slot, forever.
     """
 
-    async def test_a_watcher_with_no_room_is_not_injected(self):
-        import logging
-        from unittest.mock import AsyncMock, MagicMock
+    def _scheduler(self, sm):
+        scheduler = JobScheduler.__new__(JobScheduler)
+        scheduler._session_managers = {"rc": sm}
+        return scheduler
 
-        from tests.helpers import make_bare_session_manager
+    def test_a_legacy_job_whose_record_is_gone_resolves_to_nothing(self):
+        sm = _make_sm_mock(room_id="")
+        sm.resolve_handle = MagicMock(return_value="")
+        job = ScheduledJob(watcher="rc:general", connector="rc")   # no room_id
 
-        mock_processor = MagicMock()
-        mock_processor.enqueue = AsyncMock(return_value=True)
+        with self.assertLogs("agent-chat-gateway.core.scheduler", "WARNING") as log_ctx:
+            target = self._scheduler(sm)._resolve_target(job)
 
-        sm = make_bare_session_manager()
-        sm._lifecycle.get_processor = MagicMock(return_value=mock_processor)
-        sm._lifecycle.get_watcher_state = MagicMock(return_value=None)
-        sm._lifecycle.record_for_room = MagicMock(return_value=None)
+        self.assertIsNone(target, "an unaddressable job must not be fired")
+        self.assertTrue([r for r in log_ctx.output if "no resolvable room" in r],
+                        log_ctx.output)
 
-        with self.assertLogs(
-            "agent-chat-gateway.core.session_manager", level=logging.WARNING
-        ) as log_ctx:
-            result = await sm.inject_message("test-watcher", "hello")
-
-        self.assertFalse(result, "an unaddressable message must not be injected")
-        mock_processor.enqueue.assert_not_awaited()
-        self.assertTrue(
-            [r for r in log_ctx.output if "no resolvable room" in r],
-            f"expected the reason to be named: {log_ctx.output}",
-        )
-
-    async def test_the_message_points_at_the_migration(self):
+    def test_the_message_points_at_the_migration(self):
         """A job created before schema 2 carries no room id, and that is the
         common way to reach this — so the log says which command fixes it."""
-        import logging
-        from unittest.mock import AsyncMock, MagicMock
+        sm = _make_sm_mock(room_id="")
+        sm.resolve_handle = MagicMock(return_value="")
+        job = ScheduledJob(watcher="rc:general", connector="rc")
 
-        from tests.helpers import make_bare_session_manager
-
-        sm = make_bare_session_manager()
-        sm._lifecycle.get_processor = MagicMock(return_value=MagicMock(
-            enqueue=AsyncMock(return_value=True)))
-        sm._lifecycle.get_watcher_state = MagicMock(return_value=None)
-        sm._lifecycle.record_for_room = MagicMock(return_value=None)
-
-        with self.assertLogs(
-            "agent-chat-gateway.core.session_manager", level=logging.WARNING
-        ) as log_ctx:
-            await sm.inject_message("test-watcher", "hello")
+        with self.assertLogs("agent-chat-gateway.core.scheduler", "WARNING") as log_ctx:
+            self._scheduler(sm)._resolve_target(job)
 
         self.assertTrue([r for r in log_ctx.output if "schedule migrate" in r])
+
+    def test_a_legacy_job_is_resolved_through_the_handle_exactly_once(self):
+        """The single by-name lookup on the runtime path, and its answer is the
+        room every downstream step then takes."""
+        sm = _make_sm_mock(room_id="room-1")
+        job = ScheduledJob(watcher="rc:general", connector="rc")
+
+        target = self._scheduler(sm)._resolve_target(job)
+
+        self.assertEqual(target, (sm, "room-1"))
+        sm.resolve_handle.assert_called_once_with("rc:general")
+
+    def test_a_job_with_a_room_id_never_asks_by_name(self):
+        sm = _make_sm_mock(room_id="room-1")
+        job = ScheduledJob(watcher="rc:general", connector="rc", room_id="room-1")
+
+        target = self._scheduler(sm)._resolve_target(job)
+
+        self.assertEqual(target, (sm, "room-1"))
+        sm.resolve_handle.assert_not_called()
 
 
 class TestInjectMessageTimestampFormat(unittest.IsolatedAsyncioTestCase):
@@ -1350,18 +1361,17 @@ class TestInjectMessageTimestampFormat(unittest.IsolatedAsyncioTestCase):
         from gateway.core.state import WatcherState
 
         sm = make_bare_session_manager()
-        sm._lifecycle.get_processor = MagicMock(return_value=mock_processor)
-        # A real room, because this test is about the TIMESTAMP: injection now
-        # refuses an unaddressable message rather than sending it nowhere, so
-        # `None` here would fail for an unrelated reason and stop exercising the
-        # prompt prefix at all.
-        sm._lifecycle.get_watcher_state = MagicMock(return_value=WatcherState(
+        sm._lifecycle.processor_for_room = MagicMock(return_value=mock_processor)
+        # A real room, because this test is about the TIMESTAMP: injection
+        # refuses an unaddressable message rather than sending it nowhere, so a
+        # missing record would fail for an unrelated reason and stop exercising
+        # the prompt prefix at all.
+        sm._lifecycle.record_for_room = MagicMock(return_value=WatcherState(
             watcher_name="test-watcher", session_id="", room_id="room-1",
             room_name="general", room_type="channel", room_kind="channel",
         ))
-        sm._lifecycle.get_watcher_config = MagicMock(return_value=None)
 
-        result = await sm.inject_message("test-watcher", "check stock prices")
+        result = await sm.inject_message("room-1", "check stock prices")
         self.assertTrue(result)
         self.assertEqual(len(captured), 1)
         injected_msg = captured[0]
@@ -1390,7 +1400,7 @@ class TestInjectMessageTimestampFormat(unittest.IsolatedAsyncioTestCase):
 
 
 class TestInjectionResolvesOnceAndReportsFailure(unittest.IsolatedAsyncioTestCase):
-    """`_inject` used to re-implement `_get_sm_for_watcher`, and worse than it.
+    """`_inject` used to re-implement `_resolve_target`, and worse than it.
 
     Its copy resolved by *attempting delivery* into every manager in turn under
     `except Exception: pass`, so a real failure in the manager that owns the watcher was
@@ -1413,7 +1423,7 @@ class TestInjectionResolvesOnceAndReportsFailure(unittest.IsolatedAsyncioTestCas
         scheduler = self._scheduler({"rc-home": owner})
 
         with self.assertLogs("agent-chat-gateway.core.scheduler", "ERROR") as logs:
-            delivered = await scheduler._inject(_make_job())
+            delivered = await scheduler._inject(_make_job(), scheduler._resolve_target(_make_job()))
 
         self.assertFalse(delivered)
         joined = "\n".join(logs.output)
@@ -1428,7 +1438,7 @@ class TestInjectionResolvesOnceAndReportsFailure(unittest.IsolatedAsyncioTestCas
         stranger = _make_sm_mock()
         scheduler = self._scheduler({"rc-home": owner, "mm-eng": stranger})
 
-        delivered = await scheduler._inject(_make_job(connector="rc-home"))
+        delivered = await scheduler._inject(_make_job(connector="rc-home"), scheduler._resolve_target(_make_job(connector="rc-home")))
 
         self.assertFalse(delivered)
         stranger.inject_message.assert_not_awaited()
@@ -1440,18 +1450,18 @@ class TestInjectionResolvesOnceAndReportsFailure(unittest.IsolatedAsyncioTestCas
         owner = _make_sm_mock()
         scheduler = self._scheduler({"rc-home": owner})
 
-        delivered = await scheduler._inject(_make_job(connector="renamed-away"))
+        delivered = await scheduler._inject(_make_job(connector="renamed-away"), scheduler._resolve_target(_make_job(connector="renamed-away")))
 
         self.assertTrue(delivered)
         owner.inject_message.assert_awaited_once()
 
     async def test_no_owner_reports_a_lookup_miss(self):
         stranger = _make_sm_mock()
-        stranger.get_watcher_state = MagicMock(return_value=None)
+        stranger.resolve_handle = MagicMock(return_value="")   # never heard of it
         scheduler = self._scheduler({"mm-eng": stranger})
 
         with self.assertLogs("agent-chat-gateway.core.scheduler", "WARNING") as logs:
-            delivered = await scheduler._inject(_make_job(connector="gone"))
+            delivered = await scheduler._inject(_make_job(connector="gone"), scheduler._resolve_target(_make_job(connector="gone")))
 
         self.assertFalse(delivered)
         self.assertIn("no session manager owns watcher", "\n".join(logs.output))
@@ -1480,7 +1490,7 @@ class TestTheManagerIsFoundByRoomBeforeByHandle(unittest.TestCase):
         job = ScheduledJob(
             watcher="gone:general", connector="retired", room_id="room-mm")
 
-        self.assertIs(scheduler._get_sm_for_watcher(job), mm)
+        self.assertIs(_manager_of(scheduler._resolve_target(job)), mm)
 
     def test_the_named_connector_still_wins_when_it_is_configured(self):
         rc = _make_sm_mock(room_id="room-rc")
@@ -1488,7 +1498,7 @@ class TestTheManagerIsFoundByRoomBeforeByHandle(unittest.TestCase):
         scheduler = self._scheduler({"rc": rc, "mm": mm})
         job = ScheduledJob(watcher="rc:general", connector="rc", room_id="room-mm")
 
-        self.assertIs(scheduler._get_sm_for_watcher(job), rc)
+        self.assertIs(_manager_of(scheduler._resolve_target(job)), rc)
 
 
 class TestAnAmbiguousRoomIsRefusedRatherThanGuessed(unittest.TestCase):
@@ -1522,7 +1532,7 @@ class TestAnAmbiguousRoomIsRefusedRatherThanGuessed(unittest.TestCase):
         second = _make_sm_mock(room_id="room-shared")
         scheduler = self._scheduler({"bob": first, "alice-bot": second})
 
-        self.assertIsNone(scheduler._get_sm_for_watcher(self._job()))
+        self.assertIsNone(_manager_of(scheduler._resolve_target(self._job())))
 
     def test_the_refusal_is_logged_with_what_to_do(self):
         """A silent `None` would only surface as a job that stopped arriving."""
@@ -1532,7 +1542,7 @@ class TestAnAmbiguousRoomIsRefusedRatherThanGuessed(unittest.TestCase):
         })
 
         with self.assertLogs("agent-chat-gateway.core.scheduler", "ERROR") as cm:
-            scheduler._get_sm_for_watcher(self._job())
+            _manager_of(scheduler._resolve_target(self._job()))
 
         logged = "\n".join(cm.output)
         self.assertIn("room-shared", logged)
@@ -1546,7 +1556,7 @@ class TestAnAmbiguousRoomIsRefusedRatherThanGuessed(unittest.TestCase):
         other = _make_sm_mock(room_id="room-elsewhere")
         scheduler = self._scheduler({"bob": other, "alice-bot": owner})
 
-        self.assertIs(scheduler._get_sm_for_watcher(self._job()), owner)
+        self.assertIs(_manager_of(scheduler._resolve_target(self._job())), owner)
 
     def test_ambiguity_does_not_fall_through_to_the_handle(self):
         """Falling back to the handle after refusing the room would reinstate the
@@ -1557,29 +1567,34 @@ class TestAnAmbiguousRoomIsRefusedRatherThanGuessed(unittest.TestCase):
         second = _make_sm_mock(room_id="room-shared")
         scheduler = self._scheduler({"bob": first, "alice-bot": second})
 
-        self.assertIsNone(scheduler._get_sm_for_watcher(self._job()))
+        self.assertIsNone(_manager_of(scheduler._resolve_target(self._job())))
 
-    def test_with_no_room_owner_it_falls_through_to_the_handle(self):
+    def test_with_no_room_owner_it_does_not_fall_through_to_the_handle(self):
+        """The routing rule (§2.8): the handle is consulted ONLY when the job has
+        no room id. This job has one; nobody holds the room; its connector is
+        gone. Falling back to the handle here would reinstate the weaker key on
+        exactly the job that carries the stronger one — so: None, and loud.
+        Before this seam the same case silently resolved through the handle."""
         rc = _make_sm_mock(room_id="room-rc")
-        rc.get_watcher_state = MagicMock(
-            side_effect=lambda n: MagicMock() if n == "gone:general" else None)
         scheduler = self._scheduler({"rc": rc})
         job = ScheduledJob(
             watcher="gone:general", connector="retired", room_id="room-nobody")
 
-        self.assertIs(scheduler._get_sm_for_watcher(job), rc)
+        with self.assertLogs("agent-chat-gateway.core.scheduler", "WARNING"):
+            self.assertIsNone(scheduler._resolve_target(job))
+        rc.resolve_handle.assert_not_called()
 
     def test_neither_field_naming_a_manager_answers_none(self):
         """An old job whose connector was renamed away and whose room has no
         live record. `schedule migrate` records both, which is what makes such
         a job resolvable again."""
         rc = _make_sm_mock(room_id="room-rc")
-        rc.get_watcher_state = MagicMock(return_value=None)
+        rc.resolve_handle = MagicMock(return_value="")
         scheduler = self._scheduler({"rc": rc})
-        job = ScheduledJob(
-            watcher="gone:general", connector="retired", room_id="room-nobody")
+        job = ScheduledJob(watcher="gone:general", connector="retired")  # no id either
 
-        self.assertIsNone(scheduler._get_sm_for_watcher(job))
+        with self.assertLogs("agent-chat-gateway.core.scheduler", "WARNING"):
+            self.assertIsNone(scheduler._resolve_target(job))
 
 
 

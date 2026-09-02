@@ -29,6 +29,18 @@ Two watchers sharing the same RC username in the same room is a degenerate case 
 agents cannot see each other's responses (own-message filter). This setup has no
 practical use for collaboration; it only makes sense for framework-level testing.
 
+## A Watcher Is Addressed By Room Id, Not By Handle
+
+On the runtime path — a scheduled fire, a wake, a failure notice, job
+cancellation — a watcher is identified by its **room id**. The handle
+(`<connector>:<room label>`) is what operators type and what `list` shows; it
+moves when a room is renamed and can be taken over by another room. Resolve a
+handle to a room id **once**, through `SessionManager.resolve_handle`, and pass
+the id from there. The full rule, its seam sites and the history behind it are
+in `docs/design/dynamic-watcher-design.md` §2.8 ("The routing rule");
+`tests/unit/test_by_name_lookups_are_fenced.py` fails on any new by-name call
+outside the operator boundary.
+
 ## Test Fixtures Are Shared By Default
 
 **A test double, builder, or factory belongs in `tests/helpers.py` unless there

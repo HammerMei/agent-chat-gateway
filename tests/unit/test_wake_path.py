@@ -27,10 +27,10 @@ from gateway.core.watcher_manager import WatcherManager
 from gateway.core.watcher_rule import RoomMatcher, WatcherRule
 from tests.helpers import (
     MockAgentBackend,
+    install_record,
     make_core_config,
     make_lifecycle,
     make_rc_config,
-    install_record,
     pop_processor,
 )
 

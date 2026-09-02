@@ -1621,10 +1621,21 @@ it is written here because stating it once is what stops the seventh occurrence:
 > exists. A room id that resolves to more than one connector is ambiguous, not a
 > tie to break: refuse and log.
 
-The seam sites, so a reader can check them rather than rediscover them:
-`JobScheduler._get_sm_for_watcher`, `JobScheduler._record_for`,
-`SessionManager.inject_message`, `SessionManager.notify_watcher_room`,
-`GatewayService._cancel_jobs_for`, and `job_migrate._resolve_room_id`.
+The seam, so a reader can check it rather than rediscover it: a fire resolves
+its job **once** in `JobScheduler._resolve_target`, which answers
+`(manager, room_id)`; everything downstream — `SessionManager.inject_message`,
+`SessionManager.notify_watcher_room`, the pause check, and
+`GatewayService._cancel_jobs_for` — takes a room id and **has no parameter that
+could carry a handle**. A job written before schema 2 has only its handle, and
+`SessionManager.resolve_handle` is the one place on the runtime path that turns
+one into a room id. `job_migrate._resolve_room_id` reads the handle too, by
+design — recording the room is the migration's purpose.
+
+The fence is mechanical: `tests/unit/test_by_name_lookups_are_fenced.py` walks
+the runtime modules with `ast` and fails on any by-name lookup outside the
+operator boundary (control-socket verbs, where a human typed the name) and
+`resolve_handle`. Prose did not hold this line for a release; the signatures
+and the test do.
 
 **Why a rule and not six fixes.** The same defect — code reading the handle where
 a room id was available — was found and fixed six times across four review
