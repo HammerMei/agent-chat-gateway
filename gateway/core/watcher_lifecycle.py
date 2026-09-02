@@ -1135,9 +1135,28 @@ class WatcherLifecycle:
     def record_for_room(self, room_id: str) -> WatcherState | None:
         """The in-memory record bound to a room, if any (§2.4 sticky binding).
 
-        A linear scan because `_states` is keyed by watcher name until cutover
-        re-keys it to `(connector, room_id)` — and it is only consulted for
-        rooms with no live processor, which is the rare path.
+        A linear scan because `_states` is keyed by the watcher HANDLE, while
+        §2.3's key table says it should be keyed by `(connector, room_id)`. That
+        re-keying has not happened — `_processors` and `_watcher_locks` are the
+        same — and it is **deliberately deferred**, not forgotten: it changes the
+        state file's shape, boot replay and every operator verb, so it is its own
+        increment (owner's call pending).
+
+        Two things this docstring used to say, both now false, and worth
+        correcting rather than deleting because they are why the deferral costs
+        something:
+
+        * "until cutover re-keys it" — the runtime cutover has happened, and did
+          not re-key these. The sentence quietly pointed at an event that was in
+          progress;
+        * "only consulted for rooms with no live processor, which is the rare
+          path" — it is now on the job path (`scheduler._get_sm_for_watcher`,
+          `_record_for`) and the wake path (`session_manager.inject_message`), so
+          it runs on every fire.
+
+        The cost is the reason §2.8 states the routing rule explicitly: while the
+        handle is the O(1) key and the room id is this scan, reaching for the
+        handle is the ergonomic choice, and it has been made wrongly six times.
         """
         for ws in self._states.values():
             if ws.room_id == room_id:
