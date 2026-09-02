@@ -622,19 +622,32 @@ class MessageProcessor:
             self._watcher_config,
             agent_username=self._connector.agent_username,
         )
-        to_repeat = await self._agent.ensure_durable_instructions(
-            self._session_id,
-            self._working_directory,
-            self._config.timeout_for(self._agent_name),
-            content,
-            path_key=watcher_prompt_key(self._connector_name, self._room.id),
-            # A rename IS a re-delivery: the agent must learn the new handle, so
-            # a backend that delivers by sending (OpenCode) sends again. Claude
-            # rewrites the file regardless. Required keyword — the first version
-            # omitted it, every rename raised TypeError into the lifecycle's
-            # catch, and the header never changed (Codex, PR #140).
-            already_delivered=False,
-        )
+        try:
+            to_repeat = await self._agent.ensure_durable_instructions(
+                self._session_id,
+                self._working_directory,
+                self._config.timeout_for(self._agent_name),
+                content,
+                path_key=watcher_prompt_key(self._connector_name, self._room.id),
+                # A rename IS a re-delivery: the agent must learn the new handle,
+                # so a backend that delivers by sending (OpenCode) sends again.
+                # Claude rewrites the file regardless. Required keyword — the
+                # first version omitted it, every rename raised TypeError into
+                # the lifecycle's catch, and the header never changed (Codex,
+                # PR #140).
+                already_delivered=False,
+            )
+        except Exception:
+            # Arm the retry `_ensure_context_injected` runs on the next message:
+            # it returns at once while `context_injected` is set and the
+            # injector's status says done, so without this the old header
+            # would stand for the watcher's lifetime while the log promised a
+            # retry (Codex, PR #140). The renamed config is already in place,
+            # so that retry builds the new header.
+            if self._watcher_state is not None:
+                self._watcher_state.context_injected = False
+            self._context_injector.reset_session(self._session_id)
+            raise
         if to_repeat is not None:
             self._append_system_prompt_file = to_repeat
 

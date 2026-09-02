@@ -39,7 +39,13 @@ from .state import (
 )
 from .state_store import StateStore
 from .watcher_lifecycle import WatcherLifecycle
-from .watcher_manager import RoomRef, WatcherManager, first_matching_rule, room_label
+from .watcher_manager import (
+    RoomRef,
+    StaleRecordError,
+    WatcherManager,
+    first_matching_rule,
+    room_label,
+)
 from .watcher_rule import RoomKind
 
 logger = logging.getLogger("agent-chat-gateway.core.session_manager")
@@ -1027,9 +1033,21 @@ class SessionManager:
         # "a job cannot reach a room a message could not" true, not asserted.
         processor = self._lifecycle.processor_for_room(room_id)
         if processor is None and self._watcher_manager is not None and room is not None:
-            processor = await self._watcher_manager.get_or_create(
-                self._connector_name, room,
-            )
+            try:
+                processor = await self._watcher_manager.get_or_create(
+                    self._connector_name, room,
+                )
+            except StaleRecordError:
+                # The record this wake read was reclaimed while `get_or_create`
+                # waited on the watcher lock (an expiry, or `expire`). The
+                # contract is "raise, and the caller retries" — connector
+                # routing does; this path took the exception as a failed
+                # delivery and advanced `next_run`, which for a date-anchored
+                # one-shot meant next year (Codex, PR #140). One re-read: the
+                # room now has no record, so the retry takes `_create`.
+                processor = await self._watcher_manager.get_or_create(
+                    self._connector_name, room,
+                )
         label = record.watcher_name if record is not None else room_id
         if processor is None:
             logger.warning(

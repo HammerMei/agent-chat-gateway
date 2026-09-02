@@ -158,7 +158,7 @@ class TestTheHandleFollowsTheRoom(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(taken, "mm:test-channel-new")
         self.assertEqual(record.watcher_name, "mm:test-channel-new")
-        self.assertIn("could not take its new name", "\n".join(cm.output))
+        self.assertIn("could not rewrite its identity header", "\n".join(cm.output))
 
 class TestEveryClaimedFramePassesTheObserver(unittest.IsolatedAsyncioTestCase):
 
@@ -325,4 +325,92 @@ class TestTheProcessorReissuesItsIdentityOnRename(unittest.IsolatedAsyncioTestCa
         processor = make_processor(watcher_id="mm:a")
         await processor.rename("mm:b", room_name="b")
         self.assertEqual(processor.watcher_id, "mm:b")
+
+    async def test_a_failed_rewrite_arms_the_next_messages_retry(self):
+        """`_ensure_context_injected` returns at once while `context_injected`
+        is set and the injector's status says done — so the lifecycle's promised
+        "retry" never ran and the old header stood for the watcher's lifetime
+        (Codex, PR #140). A failure now clears both."""
+        from gateway.core.config import WatcherConfig
+        from tests.helpers import make_processor, make_rule_derived_record
+
+        injector = MagicMock()
+        injector.build = AsyncMock(return_value="header")
+        agent = MagicMock()
+        agent.ensure_durable_instructions = AsyncMock(side_effect=OSError("disk full"))
+        ws = make_rule_derived_record(name="mm:a", room_id="room_1")
+        ws.context_injected = True
+        wc = WatcherConfig(name="mm:a", connector="mm", room="a", agent="default")
+        processor = make_processor(agent=agent, watcher_id="mm:a", connector_name="mm",
+                                   context_injector=injector, watcher_config=wc, watcher_state=ws)
+
+        with self.assertRaises(OSError):
+            await processor.rename("mm:b", room_name="b")
+
+        self.assertFalse(ws.context_injected, "the next message must re-run the injection")
+        injector.reset_session.assert_called_once_with("ses_001")
+        self.assertEqual(processor.watcher_id, "mm:b", "the name moved even though the rewrite did not")
+
+
+class TestAStaleHandleIsRederivedEvenWhenTheRoomNameMatches(unittest.IsolatedAsyncioTestCase):
+    """A reset that captured its config before a rename and reinstalled the
+    record afterwards left the OLD handle beside the NEW room name. A
+    short-circuit on `room_name` then never re-derived it (Codex, PR #140);
+    the comparison is on the derived handle now."""
+
+    async def test_the_handle_catches_up_on_the_next_frame(self):
+        lifecycle, record = _lifecycle_with(name="mm:test-channel", room_name="test-channel-new")
+
+        taken = await lifecycle.observe_room_name("R1", "test-channel-new")
+
+        self.assertEqual(taken, "mm:test-channel-new")
+        self.assertEqual(record.watcher_name, "mm:test-channel-new")
+        self.assertIsNone(lifecycle.get_watcher_state("mm:test-channel"))
+
+    async def test_a_frame_that_changes_nothing_still_writes_nothing(self):
+        lifecycle, _ = _lifecycle_with()
+        self.assertIsNone(await lifecycle.observe_room_name("R1", "test-channel"))
+        lifecycle._state_store.save.assert_not_called()
+
+
+class TestAScheduledWakeRetriesPastAStaleRecord(unittest.IsolatedAsyncioTestCase):
+    """`get_or_create` raises `StaleRecordError` when the record it read was
+    reclaimed while it waited on the watcher lock; the contract is "the caller
+    retries". Connector routing does; `inject_message` took it as a failed
+    delivery and advanced `next_run` — for a date-anchored one-shot, to next
+    year (Codex, PR #140). One re-read: the room now has no record, so the
+    retry takes `_create`."""
+
+    async def test_the_second_attempt_delivers(self):
+        from gateway.core.watcher_manager import StaleRecordError
+
+        mgr = make_bare_session_manager()
+        mgr._connector_name = "rc"
+        record = make_rule_derived_record(name="rc:eng", room_id="R1")
+        processor = MagicMock()
+        processor.enqueue = AsyncMock(return_value=True)
+        mgr._lifecycle.record_for_room = MagicMock(return_value=record)
+        mgr._lifecycle.processor_for_room = MagicMock(return_value=None)
+        mgr._watcher_manager = MagicMock()
+        mgr._watcher_manager.get_or_create = AsyncMock(
+            side_effect=[StaleRecordError("reclaimed while waiting"), processor])
+
+        self.assertTrue(await mgr.inject_message("R1", "poke"))
+
+        self.assertEqual(mgr._watcher_manager.get_or_create.await_count, 2)
+        processor.enqueue.assert_awaited_once()
+
+    async def test_a_second_stale_record_is_not_retried_forever(self):
+        from gateway.core.watcher_manager import StaleRecordError
+
+        mgr = make_bare_session_manager()
+        mgr._connector_name = "rc"
+        mgr._lifecycle.record_for_room = MagicMock(return_value=make_rule_derived_record(name="rc:eng", room_id="R1"))
+        mgr._lifecycle.processor_for_room = MagicMock(return_value=None)
+        mgr._watcher_manager = MagicMock()
+        mgr._watcher_manager.get_or_create = AsyncMock(side_effect=StaleRecordError("again"))
+
+        with self.assertRaises(StaleRecordError):
+            await mgr.inject_message("R1", "poke")
+        self.assertEqual(mgr._watcher_manager.get_or_create.await_count, 2)
 

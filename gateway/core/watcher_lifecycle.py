@@ -1283,7 +1283,7 @@ class WatcherLifecycle:
         and the next boot hydrated THAT row first (internal review).
         """
         ws = self._states.get(room_id)
-        if ws is None or not name or ws.room_name == name:
+        if ws is None or not name:
             return None
         from .watcher_manager import RoomRef, watcher_label
         from .watcher_rule import RoomKind
@@ -1294,7 +1294,14 @@ class WatcherLifecycle:
         if kind.is_direct:
             return None
         old = ws.watcher_name
+        # Derived on every frame and compared as a HANDLE, not short-circuited
+        # on `room_name`: a reset that captured its config before a rename and
+        # reinstalled the record afterwards left the old handle beside the new
+        # room name, and a room-name short-circuit then never re-derived it
+        # (Codex, PR #140). `watcher_label` is string work; nothing to save.
         new = watcher_label(ws.connector, RoomRef(id=room_id, kind=kind, name=name))
+        if new == old and ws.room_name == name:
+            return None
         if new != old:
             held = self._room_of.get(new)
             if held is not None and held != room_id:
@@ -1326,9 +1333,9 @@ class WatcherLifecycle:
                     await processor.rename(new, room_name=name)
                 except Exception as exc:
                     logger.warning(
-                        "Watcher '%s': the running processor could not take its new "
-                        "name yet (%s) — its identity header is refreshed on the next "
-                        "context-injection retry", new, exc,
+                        "Watcher '%s': the running processor could not rewrite its "
+                        "identity header (%s) — it is rewritten with the next message "
+                        "the room delivers", new, exc,
                     )
         return new if new != old else None
 

@@ -576,6 +576,27 @@ class RocketChatConnector(Connector):
                 "not from before the removal",
                 sub.room.name,
             )
+            # And RECLAIMED, like the live removal and the participant-false
+            # paths: a removal while the socket was down raised no
+            # subscription event, and the reconciliation examines only paused
+            # and dropped records — so an active record, its processor,
+            # session and jobs stayed indefinitely (Codex, PR #140; the same
+            # gap Mattermost's replay had). Serialized per room like every
+            # membership hook, so it cannot complete around a re-add.
+            if self._membership_hook is not None:
+                async def _removed(rid=room_id):
+                    lock = self._membership_serial.setdefault(rid, asyncio.Lock())
+                    async with lock:
+                        try:
+                            await self._membership_hook.removed(rid)
+                        except Exception:
+                            logger.exception(
+                                "Membership removal (discovered on replay) for room "
+                                "%s failed — the safety nets cover it", rid,
+                            )
+                task = asyncio.create_task(_removed())
+                self._routing_tasks.add(task)
+                task.add_done_callback(self._routing_tasks.discard)
             return
         if member is None:
             # Unknown is not removal. The lookup failing is correlated with the outage

@@ -235,3 +235,37 @@ class TestAMattermostReplayRevalidatesMembership(unittest.IsolatedAsyncioTestCas
 
         c._on_posted_event.assert_awaited()
 
+
+class TestARocketChatReplayDiscoveringARemovalReclaimsTheRoom(unittest.IsolatedAsyncioTestCase):
+    """A removal while the socket was down raised no subscription event; the
+    reconnect replay confirms it (`is_room_member` False) and used to clear
+    connector-local marks only. Reconciliation examines paused and dropped
+    records, never this active one, so the record, processor, session and
+    jobs stayed indefinitely — the gap Mattermost's replay had (Codex, PR
+    #140). The removal hook now runs, serialized per room like the live one."""
+
+    async def test_the_membership_hook_is_invoked(self):
+        c, sub = _rc_connector([{"_id": "m1", "msg": "hi"}])
+        c._rest.is_room_member = AsyncMock(return_value=False)
+        c._membership_hook = MagicMock(removed=AsyncMock())
+        c._membership_serial, c._routing_tasks = {}, set()
+        c._note_membership_loss = MagicMock()
+
+        await c.replay_room_since("r1")
+        for _ in range(3):
+            await asyncio.sleep(0)
+
+        c._membership_hook.removed.assert_awaited_once_with("r1")
+        c._rest.get_room_history_page.assert_not_awaited()
+
+    async def test_without_a_hook_the_marks_are_still_dropped(self):
+        c, sub = _rc_connector([{"_id": "m1", "msg": "hi"}])
+        c._rest.is_room_member = AsyncMock(return_value=False)
+        c._membership_hook = None
+        c._note_membership_loss = MagicMock()
+
+        await c.replay_room_since("r1")
+
+        self.assertIsNone(sub.replay_boundary)
+        c._note_membership_loss.assert_called_once_with("r1")
+
