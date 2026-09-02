@@ -1687,7 +1687,10 @@ class TestAJobWhoseConnectorIsGoneIsCancelled(unittest.IsolatedAsyncioTestCase):
         with self.assertLogs("agent-chat-gateway.core.scheduler", "WARNING") as cm:
             await scheduler._fire_due_jobs()
 
-        self.assertIsNone(store.get(job.id), "the job is removed, not left to fail")
+        kept = store.get(job.id)
+        self.assertEqual(kept.status, JobStatus.CANCELLED, "marked and kept, not removed")
+        self.assertIn("retired", kept.cancel_reason)
+        self.assertTrue(kept.cancelled_at)
         survivor.inject_message.assert_not_awaited()
         logged = "\n".join(cm.output)
         self.assertIn("AUDIT: cancelled scheduled job", logged)

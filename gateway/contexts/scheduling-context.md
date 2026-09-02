@@ -75,7 +75,7 @@ agent-chat-gateway schedule create rc:general "Pulse check" --every 1m --times 5
 
 ```bash
 agent-chat-gateway schedule list              # Show active and paused tasks
-agent-chat-gateway schedule list --all        # Also show recently completed tasks
+agent-chat-gateway schedule list --all        # Also show recently completed or cancelled tasks
 agent-chat-gateway schedule list --connector rc-home  # Filter by connector
 ```
 

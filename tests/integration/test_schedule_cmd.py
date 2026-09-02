@@ -1383,6 +1383,51 @@ class TestScheduleResume(_ScheduleCLITestBase):
         # Must NOT call update — job state should not be mutated
         mock_store.update.assert_not_called()
 
+    def test_control_resume_restores_a_cancelled_job(self):
+        """Owner, 2026-09-02: a cancellation keeps the record so it can be undone,
+        and resume is the undo — status back to ACTIVE, next_run recomputed, and
+        the cancellation's own fields cleared so the job does not read as both."""
+        from unittest.mock import MagicMock
+
+        from gateway.control import ControlServer
+        from gateway.schedule_types import JobStatus
+
+        mock_store = MagicMock()
+        job = MagicMock()
+        job.status = JobStatus.CANCELLED
+        job.cancelled_at = "2026-09-02T10:00:00+00:00"
+        job.cancel_reason = "the bot was removed from the room"
+        job.cron, job.timezone = "* * * * *", "UTC"
+        mock_store.get = MagicMock(return_value=job)
+
+        server = ControlServer(entries=[], job_store=mock_store)
+        result = server._handle_schedule_resume({"cmd": "schedule-resume", "job_id": "acg-c1"})
+
+        self.assertTrue(result.get("ok"), result)
+        self.assertEqual(job.status, JobStatus.ACTIVE)
+        self.assertIsNone(job.cancelled_at)
+        self.assertEqual(job.cancel_reason, "")
+        self.assertTrue(job.next_run)
+        mock_store.update.assert_called_once_with(job)
+
+    def test_control_pause_refuses_a_cancelled_job_and_points_at_resume(self):
+        from unittest.mock import MagicMock
+
+        from gateway.control import ControlServer
+        from gateway.schedule_types import JobStatus
+
+        mock_store = MagicMock()
+        job = MagicMock()
+        job.status = JobStatus.CANCELLED
+        mock_store.get = MagicMock(return_value=job)
+
+        server = ControlServer(entries=[], job_store=mock_store)
+        result = server._handle_schedule_pause({"cmd": "schedule-pause", "job_id": "acg-c1"})
+
+        self.assertFalse(result.get("ok"))
+        self.assertIn("resume", result.get("error", ""))
+        mock_store.update.assert_not_called()
+
     def test_control_resume_completed_job_returns_error(self):
         """TC-4: resuming a COMPLETED job returns ok=False with a clear error message."""
         from unittest.mock import MagicMock

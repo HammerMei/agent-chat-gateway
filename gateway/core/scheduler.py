@@ -363,15 +363,16 @@ class JobScheduler:
         if self._connector_is_gone(job):
             # Owner's rule (PR #140): a job whose connector has left the config
             # is not re-homed and not left to fail at every slot — it is
-            # cancelled, with the same audit line a room removal writes. The
+            # cancelled (marked, kept), with the same audit line a room removal writes. The
             # scheduler owns this because the fire is the moment the job is
             # known to be undeliverable; nothing else touches it until then.
-            await asyncio.to_thread(self._store.remove, job.id)
+            reason = (f"connector '{job.connector}' is no longer configured, so "
+                      f"the job has no account to run under")
+            await asyncio.to_thread(self._store.cancel, job.id, reason=reason)
             logger.warning(
-                "AUDIT: cancelled scheduled job %s (watcher '%s', room %s, "
-                "connector '%s') — its connector is no longer configured, so "
-                "the job has no account to run under", job.id, job.watcher,
-                job.room_id, job.connector,
+                "AUDIT: cancelled scheduled job %s (watcher '%s', room %s) — %s. "
+                "The record is kept; 'agent-chat-gateway schedule resume %s' restores it.",
+                job.id, job.watcher, job.room_id, reason, job.id,
             )
             return
 

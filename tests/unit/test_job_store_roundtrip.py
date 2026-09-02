@@ -30,6 +30,7 @@ from pathlib import Path
 
 from gateway.core.job_store import JobStore
 from gateway.schedule_types import (
+    CANCELLATION_OWNED_FIELDS,
     CREATION_OWNED_FIELDS,
     FIRE_OWNED_FIELDS,
     MIGRATION_OWNED_FIELDS,
@@ -55,6 +56,8 @@ FULLY_POPULATED = dict(
     last_run="2026-01-01T09:00:00+00:00",
     last_attempted_at="2026-01-01T09:00:01+00:00",
     completed_at="2026-01-03T09:00:00+00:00",
+    cancelled_at="2026-01-04T09:00:00+00:00",
+    cancel_reason="the bot was removed from the room",
 )
 
 
@@ -157,12 +160,14 @@ class TestEveryFieldHasExactlyOneOwner(unittest.TestCase):
 
     def test_the_sets_partition_every_declared_field(self):
         declared = {f.name for f in dataclasses.fields(ScheduledJob)}
-        union = FIRE_OWNED_FIELDS | MIGRATION_OWNED_FIELDS | CREATION_OWNED_FIELDS
+        union = (FIRE_OWNED_FIELDS | MIGRATION_OWNED_FIELDS | CREATION_OWNED_FIELDS
+                 | CANCELLATION_OWNED_FIELDS)
 
         self.assertEqual(
             declared - union, set(),
             "a new ScheduledJob field must declare who writes it: add it to "
-            "FIRE_OWNED_FIELDS, MIGRATION_OWNED_FIELDS or CREATION_OWNED_FIELDS "
+            "FIRE_OWNED_FIELDS, MIGRATION_OWNED_FIELDS, CREATION_OWNED_FIELDS or "
+            "CANCELLATION_OWNED_FIELDS "
             "in gateway/schedule_types.py",
         )
         self.assertEqual(
@@ -181,6 +186,9 @@ class TestEveryFieldHasExactlyOneOwner(unittest.TestCase):
             ("fire", FIRE_OWNED_FIELDS, "migration", MIGRATION_OWNED_FIELDS),
             ("fire", FIRE_OWNED_FIELDS, "creation", CREATION_OWNED_FIELDS),
             ("migration", MIGRATION_OWNED_FIELDS, "creation", CREATION_OWNED_FIELDS),
+            ("cancellation", CANCELLATION_OWNED_FIELDS, "fire", FIRE_OWNED_FIELDS),
+            ("cancellation", CANCELLATION_OWNED_FIELDS, "migration", MIGRATION_OWNED_FIELDS),
+            ("cancellation", CANCELLATION_OWNED_FIELDS, "creation", CREATION_OWNED_FIELDS),
         ]
         for a_name, a, b_name, b in pairs:
             with self.subTest(pair=f"{a_name}/{b_name}"):
@@ -424,4 +432,60 @@ class TestASaveIsOneOperation(unittest.TestCase):
         self.assertEqual(on_disk["version"], 2)
         self.assertEqual(on_disk["jobs"][0]["room_id"], "R-1",
                          "a version-2 file must contain the migration it claims")
+
+
+class TestACancelledJobIsKeptNotRemoved(unittest.TestCase):
+    """Owner, 2026-09-02: the gateway's own cancellations used to `remove`,
+    leaving one log line as the only trace of a job that may have been killed by
+    mistake. The record now stays — marked, dated, with the reason — for the
+    same TTL as a completed job, hidden from `list` by default, restorable."""
+
+    def setUp(self):
+        self.path = Path(tempfile.mkdtemp()) / "jobs.json"
+        self.store = JobStore(self.path)
+        self.store.load()
+        self.store.add(ScheduledJob(**{**FULLY_POPULATED, "status": JobStatus.ACTIVE,
+                                       "cancelled_at": None, "cancel_reason": ""}))
+        self.job_id = FULLY_POPULATED["id"]
+
+    def test_cancel_marks_dates_and_explains(self):
+        self.assertTrue(self.store.cancel(self.job_id, reason="the bot was removed"))
+
+        on_disk = json.loads(self.path.read_text())["jobs"][0]
+        self.assertEqual(on_disk["status"], "cancelled")
+        self.assertTrue(on_disk["cancelled_at"])
+        self.assertEqual(on_disk["cancel_reason"], "the bot was removed")
+
+    def test_a_cancelled_job_is_hidden_by_default_and_never_due(self):
+        self.store.cancel(self.job_id, reason="r")
+
+        self.assertEqual(self.store.list_jobs(), [])
+        self.assertEqual([j.id for j in self.store.list_jobs(include_completed=True)], [self.job_id])
+        self.assertEqual(self.store.list_due(), [], "a cancelled job must not fire")
+
+    def test_a_fire_in_flight_cannot_resurrect_a_cancelled_job(self):
+        """The fire copied the job as ACTIVE before its await; the cancellation
+        landed during it. The fire's write-back is refused, like a deletion's."""
+        fire = copy.copy(self.store.get(self.job_id))
+        self.store.cancel(self.job_id, reason="r")
+        fire.run_count += 1
+
+        self.assertFalse(self.store.write_fields(fire, FIRE_OWNED_FIELDS))
+        self.assertEqual(self.store.get(self.job_id).status, JobStatus.CANCELLED)
+        self.assertEqual(self.store.get(self.job_id).run_count, FULLY_POPULATED["run_count"])
+
+    def test_it_is_purged_after_the_ttl_from_its_cancellation(self):
+        self.store.cancel(self.job_id, reason="r")
+        self.store.get(self.job_id).cancelled_at = "2020-01-01T00:00:00+00:00"
+
+        self.assertEqual(self.store.remove_expired_completed(7), 1)
+        self.assertIsNone(self.store.get(self.job_id))
+
+    def test_a_fresh_cancellation_survives_the_purge(self):
+        self.store.cancel(self.job_id, reason="r")
+
+        self.assertEqual(self.store.remove_expired_completed(7), 0)
+
+    def test_cancelling_a_gone_job_is_false_not_an_error(self):
+        self.assertFalse(self.store.cancel("acg-nope", reason="r"))
 

@@ -279,7 +279,7 @@ def main():
         "--all",
         action="store_true",
         dest="include_completed",
-        help="Also show recently completed tasks (within TTL window)",
+        help="Also show recently completed or cancelled tasks (within the TTL window)",
     )
 
     # schedule delete
@@ -947,6 +947,9 @@ def _run_schedule_list(args) -> None:
         if status == "completed":
             raw_ts = j.get("completed_at")
             next_run_str = f"done {_fmt_ts(raw_ts)}" if raw_ts else "done"
+        elif status == "cancelled":
+            raw_ts = j.get("cancelled_at")
+            next_run_str = f"cancelled {_fmt_ts(raw_ts)}" if raw_ts else "cancelled"
         else:
             next_run_str = _fmt_ts(j.get("next_run"))
         message = textwrap.shorten(j.get("message", ""), width=40, placeholder="…")

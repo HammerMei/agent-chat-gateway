@@ -536,6 +536,8 @@ class ControlServer:
             return {"ok": False, "error": f"Job {job_id!r} not found"}
         if job.status == JobStatus.COMPLETED:
             return {"ok": False, "error": f"Job {job_id!r} is already completed"}
+        if job.status == JobStatus.CANCELLED:
+            return {"ok": False, "error": f"Job {job_id!r} is cancelled — 'schedule resume' restores it"}
         if job.status == JobStatus.PAUSED:
             return {"ok": True}  # idempotent: already paused
         job.status = JobStatus.PAUSED
@@ -568,6 +570,11 @@ class ControlServer:
             return {"ok": False, "error": f"Failed to compute next_run: {e}"}
         job.status = JobStatus.ACTIVE
         job.next_run = next_run
+        # Resume is also the restore for a job the gateway cancelled: the
+        # record was kept for exactly this. The cancellation's own fields go
+        # with the status, so a restored job does not read as both.
+        job.cancelled_at = None
+        job.cancel_reason = ""
         try:
             self._job_store.update(job)
         except Exception as e:

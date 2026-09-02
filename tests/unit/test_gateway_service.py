@@ -216,7 +216,7 @@ class TestTheCancellationClaimRule(unittest.TestCase):
                          status=JobStatus.ACTIVE)
             for spec in jobs
         ])
-        service._job_store.remove = MagicMock(return_value=True)
+        service._job_store.cancel = MagicMock(return_value=True)
         return service
 
     def test_a_job_on_this_connector_is_cancelled(self):
@@ -224,7 +224,9 @@ class TestTheCancellationClaimRule(unittest.TestCase):
 
         service._cancel_jobs_for("rc", "room-1", legacy_handle="rc:general")
 
-        service._job_store.remove.assert_called_once_with("acg-1")
+        service._job_store.cancel.assert_called_once()
+
+        self.assertEqual(service._job_store.cancel.call_args.args[0], "acg-1")
 
     def test_a_job_with_no_connector_is_cancelled_too(self):
         """The fallback claim: the scheduler would deliver it here, so a reclaim
@@ -233,14 +235,18 @@ class TestTheCancellationClaimRule(unittest.TestCase):
 
         service._cancel_jobs_for("rc", "room-1", legacy_handle="rc:general")
 
-        service._job_store.remove.assert_called_once_with("acg-1")
+        service._job_store.cancel.assert_called_once()
+
+        self.assertEqual(service._job_store.cancel.call_args.args[0], "acg-1")
 
     def test_a_job_naming_a_connector_that_no_longer_exists_is_cancelled(self):
         service = self._service_with_jobs([("acg-1", "rc:general", "retired")])
 
         service._cancel_jobs_for("rc", "room-1", legacy_handle="rc:general")
 
-        service._job_store.remove.assert_called_once_with("acg-1")
+        service._job_store.cancel.assert_called_once()
+
+        self.assertEqual(service._job_store.cancel.call_args.args[0], "acg-1")
 
     def test_another_configured_connectors_job_is_left_alone(self):
         """The one case the fallback must NOT swallow: `mm` is configured, so its
@@ -252,14 +258,14 @@ class TestTheCancellationClaimRule(unittest.TestCase):
 
         service._cancel_jobs_for("rc", "room-1", legacy_handle="rc:general")
 
-        service._job_store.remove.assert_not_called()
+        service._job_store.cancel.assert_not_called()
 
     def test_another_watchers_job_is_left_alone(self):
         service = self._service_with_jobs([("acg-1", "rc:dev", "rc")])
 
         service._cancel_jobs_for("rc", "room-1", legacy_handle="rc:general")
 
-        service._job_store.remove.assert_not_called()
+        service._job_store.cancel.assert_not_called()
 class TestIdentityBarrier(unittest.IsolatedAsyncioTestCase):
     """The barrier's value is its *position*, so these assert ordering, not just refusal.
 
@@ -823,11 +829,11 @@ class TestCancellationRequiresOwnershipNotJustTheRoom(unittest.TestCase):
                          status=JobStatus.ACTIVE)
             for spec in jobs
         ])
-        service._job_store.remove = MagicMock(return_value=True)
+        service._job_store.cancel = MagicMock(return_value=True)
         return service
 
     def _removed(self, service):
-        return [c.args[0] for c in service._job_store.remove.call_args_list]
+        return [c.args[0] for c in service._job_store.cancel.call_args_list]
 
     def test_another_connectors_job_in_the_same_room_is_left_alone(self):
         service = self._service_with_jobs([
@@ -902,7 +908,7 @@ class TestCancellationMatchesByRoomNotByHandle(unittest.TestCase):
                          status=JobStatus.ACTIVE)
             for jid, w, r in jobs
         ])
-        service._job_store.remove = MagicMock(return_value=True)
+        service._job_store.cancel = MagicMock(return_value=True)
         return service
 
     def test_another_rooms_job_under_the_same_handle_survives(self):
@@ -911,7 +917,7 @@ class TestCancellationMatchesByRoomNotByHandle(unittest.TestCase):
 
         service._cancel_jobs_for("rc", "room-A", legacy_handle="rc:general")
 
-        service._job_store.remove.assert_not_called()
+        service._job_store.cancel.assert_not_called()
 
     def test_this_rooms_job_is_cancelled_even_under_a_moved_handle(self):
         """A's job was created when A held `rc:general`; A has since been
@@ -920,7 +926,9 @@ class TestCancellationMatchesByRoomNotByHandle(unittest.TestCase):
 
         service._cancel_jobs_for("rc", "room-A", legacy_handle="rc:daily-standup")
 
-        service._job_store.remove.assert_called_once_with("acg-a")
+        service._job_store.cancel.assert_called_once()
+
+        self.assertEqual(service._job_store.cancel.call_args.args[0], "acg-a")
 
     def test_a_pre_schema_2_job_still_matches_by_handle(self):
         """It has no id, so the handle is the only key it has."""
@@ -928,7 +936,9 @@ class TestCancellationMatchesByRoomNotByHandle(unittest.TestCase):
 
         service._cancel_jobs_for("rc", "room-A", legacy_handle="rc:general")
 
-        service._job_store.remove.assert_called_once_with("acg-old")
+        service._job_store.cancel.assert_called_once()
+
+        self.assertEqual(service._job_store.cancel.call_args.args[0], "acg-old")
 
 
 

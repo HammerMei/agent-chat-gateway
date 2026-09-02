@@ -299,12 +299,16 @@ agent-chat-gateway schedule delete acg-bb47e7f4
 ```
 
 If the bot is **removed from a room**, that room's pending jobs are cancelled —
-removed from the store, with an audit log line each — because a job pointing at
-a room the bot cannot reach would fire at nothing forever.
+marked `cancelled`, with an audit log line each — because a job pointing at a
+room the bot cannot reach would fire at nothing forever. **A cancelled job is
+kept, not deleted**: `schedule list --all` shows it with `cancelled <time>`, and
+`data/jobs.json` carries `cancelled_at` and `cancel_reason`, so a job the
+gateway cancelled by mistake can be seen and undone — `schedule resume <id>`
+restores it. Cancelled jobs age out after `completed_job_ttl_days`, like
+completed ones. Only `schedule delete` removes a record outright.
 
 If a job's **connector is removed from `config.yaml`** (or renamed), the job is
-cancelled the same way at its next slot — removed from the store with an audit
-line. It is never handed to another connector that happens to serve the same
+cancelled the same way at its next slot — marked, kept, with an audit line. It is never handed to another connector that happens to serve the same
 room: under one account per agent that would run the job as a different agent,
 with that agent's tools and account. Restore the connector under its old name
 before the next slot and the job fires as before.
@@ -377,7 +381,8 @@ Each job record contains:
 | `timezone` | IANA timezone string |
 | `times` | Max runs (`0` = forever) |
 | `run_count` | How many times the job has fired so far |
-| `status` | `active`, `paused`, or `completed` |
+| `status` | `active`, `paused`, `completed`, or `cancelled` |
+| `cancelled_at` / `cancel_reason` | Set when the gateway cancelled the job (bot removed from the room, connector gone from the config); cleared by `schedule resume` |
 
 You can inspect or back up `data/jobs.json` directly. Do not edit it while ACG is running — restart ACG after any manual edits.
 

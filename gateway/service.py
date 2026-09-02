@@ -413,12 +413,13 @@ class GatewayService:
             doomed = [j for j in self._job_store.list_jobs()
                       if _claims_this_room(j)]
             for job in doomed:
-                self._job_store.remove(job.id)
+                reason = "the bot was removed from the room, so the job could never deliver"
+                self._job_store.cancel(job.id, reason=reason)
                 logger.warning(
                     "AUDIT: cancelled scheduled job %s (watcher '%s', room %s, "
-                    "connector '%s') — the bot was removed from the room, so "
-                    "the job could never deliver", job.id, job.watcher, room_id,
-                    connector_name,
+                    "connector '%s') — %s. The record is kept; "
+                    "'agent-chat-gateway schedule resume %s' restores it.",
+                    job.id, job.watcher, room_id, job.connector, reason, job.id,
                 )
         except Exception as e:
             logger.warning(

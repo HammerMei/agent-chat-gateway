@@ -69,6 +69,11 @@ def _coerce_version(raw: object) -> int:
     return raw if raw > 0 else 1
 
 
+# The statuses a job does not leave on its own; hidden from `list` by default
+# and purged by `remove_expired_completed` after the TTL.
+_TERMINAL = frozenset({JobStatus.COMPLETED, JobStatus.CANCELLED})
+
+
 class JobStore:
     """CRUD store for ScheduledJob objects, persisted to jobs.json.
 
@@ -337,6 +342,11 @@ class JobStore:
             stored = self._jobs.get(job.id)
             if stored is None:
                 return False
+            if stored.status == JobStatus.CANCELLED:
+                # A cancellation landed while this fire was in flight. Its copy
+                # says ACTIVE; writing that back would resurrect the job under
+                # the cancellation's own timestamp and reason (see `cancel`).
+                return False
             for name in fields:
                 setattr(stored, name, getattr(job, name))
         self.save()
@@ -372,6 +382,32 @@ class JobStore:
         self.save()
         return True
 
+    def cancel(self, job_id: str, *, reason: str) -> bool:
+        """Mark a job CANCELLED and keep it. Returns False if it is gone.
+
+        The gateway's own cancellations — the bot removed from the room, the
+        job's connector gone from the config — used to `remove`, leaving one
+        AUDIT log line as the only trace. A job cancelled by mistake was then
+        unrecoverable and, once the log rotated, unexplainable. The record now
+        stays, with when and why, for `completed_job_ttl_days` like a completed
+        job; `schedule resume` restores it. Only the operator's `schedule
+        delete` removes (owner, 2026-09-02).
+
+        Written on the live object under the lock, like `set_room_id`, so a fire
+        holding its own copy across an await cannot revert it — `write_fields`
+        refuses a write-back on a CANCELLED job.
+        """
+        self._assert_loaded()
+        with self._lock:
+            job = self._jobs.get(job_id)
+            if job is None:
+                return False
+            job.status = JobStatus.CANCELLED
+            job.cancelled_at = datetime.now(UTC).isoformat()
+            job.cancel_reason = reason
+        self.save()
+        return True
+
     def remove(self, job_id: str) -> bool:
         """Remove a job by ID. Returns True if found and removed."""
         self._assert_loaded()
@@ -384,9 +420,10 @@ class JobStore:
         return True
 
     def remove_expired_completed(self, ttl_days: int) -> int:
-        """Remove completed jobs whose completed_at is older than ttl_days.
+        """Remove terminal jobs — COMPLETED or CANCELLED — older than ttl_days.
 
-        If ttl_days == 0, removes all completed jobs immediately.
+        A completed job ages from `completed_at`, a cancelled one from
+        `cancelled_at`. If ttl_days == 0, removes all of them immediately.
         Returns the number of jobs removed.
         """
         self._assert_loaded()
@@ -399,23 +436,25 @@ class JobStore:
         # the dict size mid-iteration (which would raise RuntimeError in CPython).
         with self._lock:
             for job in self._jobs.values():
-                if job.status != JobStatus.COMPLETED:
+                if job.status not in _TERMINAL:
                     continue
+                ended_at = (job.cancelled_at if job.status == JobStatus.CANCELLED
+                            else job.completed_at)
                 if ttl_days == 0:
                     to_remove.append(job.id)
-                elif job.completed_at:
+                elif ended_at:
                     try:
-                        completed = datetime.fromisoformat(job.completed_at)
-                        if completed < cutoff:
+                        ended = datetime.fromisoformat(ended_at)
+                        if ended < cutoff:
                             to_remove.append(job.id)
                     except ValueError:
-                        # Malformed completed_at — remove it
+                        # Malformed timestamp — remove it
                         to_remove.append(job.id)
             for jid in to_remove:
                 del self._jobs[jid]
         if to_remove:
             self.save()
-            logger.info("Purged %d expired completed job(s)", len(to_remove))
+            logger.info("Purged %d expired completed/cancelled job(s)", len(to_remove))
         return len(to_remove)
 
     # ── Queries ───────────────────────────────────────────────────────────────
@@ -435,13 +474,14 @@ class JobStore:
         """Return jobs, optionally filtered by connector.
 
         By default only ACTIVE and PAUSED jobs are returned. Pass
-        ``include_completed=True`` to also include COMPLETED jobs.
+        ``include_completed=True`` to also include the terminal ones — COMPLETED
+        and CANCELLED — which stay in the file for the TTL.
         """
         self._assert_loaded()
         with self._lock:
             jobs = list(self._jobs.values())
         if not include_completed:
-            jobs = [j for j in jobs if j.status != JobStatus.COMPLETED]
+            jobs = [j for j in jobs if j.status not in _TERMINAL]
         if connector:
             jobs = [j for j in jobs if j.connector == connector]
         return jobs

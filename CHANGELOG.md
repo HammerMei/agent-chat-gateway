@@ -149,6 +149,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Runtime session continuity across restarts is unaffected.
 
 ### Fixed
+- **A job the gateway cancels is kept, not deleted.** Cancellation (the bot
+  removed from the room; the job's connector gone from the config) now marks
+  the job `cancelled` with `cancelled_at` and `cancel_reason` instead of
+  removing it, so an accidental cancellation is visible in `schedule list
+  --all` and in `jobs.json`, and `schedule resume` restores it. Cancelled jobs
+  age out after `completed_job_ttl_days` like completed ones; only `schedule
+  delete` removes a record.
 - **`expire` is refused on connectors without unsolicited inbound** (voice,
   script). Its contract is "reclaimed now, recreated by the room's next
   message", and those connectors have no next message: an expired watcher

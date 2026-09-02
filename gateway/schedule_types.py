@@ -21,10 +21,16 @@ class JobStatus(str, Enum):
     PAUSED    — user explicitly paused via ``agent-chat-gateway schedule pause``; scheduler skips it.
     COMPLETED — all runs exhausted (``run_count >= times > 0``); pending TTL purge.
                 Forever jobs (``times == 0``) never transition to COMPLETED automatically.
+    CANCELLED — the gateway stopped it (the bot was removed from the room, or the
+                job's connector left the config). The record stays in jobs.json
+                with ``cancelled_at`` and ``cancel_reason`` for the same TTL as a
+                completed job, so an accidental cancellation can be seen and undone:
+                ``schedule resume`` restores it. Only ``schedule delete`` removes.
     """
     ACTIVE    = "active"
     PAUSED    = "paused"
     COMPLETED = "completed"
+    CANCELLED = "cancelled"
 
 
 def _new_job_id() -> str:
@@ -80,6 +86,8 @@ class ScheduledJob:
                        of fire slots where injection already failed.
                        None when the job has never been attempted.
     completed_at     : ISO 8601 UTC timestamp when status transitioned to COMPLETED.
+    cancelled_at     : ISO 8601 UTC timestamp when status transitioned to CANCELLED.
+    cancel_reason    : Why the gateway cancelled it — the same text as the AUDIT log line.
                        None until the job completes.
     """
 
@@ -98,6 +106,8 @@ class ScheduledJob:
     last_run: str | None = None             # ISO 8601 UTC; only set on successful injection
     last_attempted_at: str | None = None    # ISO 8601 UTC; set on every fire attempt (success or failure)
     completed_at: str | None = None         # ISO 8601 UTC; set when → COMPLETED
+    cancelled_at: str | None = None         # ISO 8601 UTC; set when → CANCELLED
+    cancel_reason: str = ""                 # set with cancelled_at; cleared by resume
 
     def is_active(self) -> bool:
         """True if the scheduler should fire this job."""
@@ -127,6 +137,8 @@ class ScheduledJob:
             "last_run": self.last_run,
             "last_attempted_at": self.last_attempted_at,
             "completed_at": self.completed_at,
+            "cancelled_at": self.cancelled_at,
+            "cancel_reason": self.cancel_reason,
         }
 
     @staticmethod
@@ -159,6 +171,8 @@ class ScheduledJob:
             last_run=data.get("last_run"),
             last_attempted_at=data.get("last_attempted_at"),
             completed_at=data.get("completed_at"),
+            cancelled_at=data.get("cancelled_at"),
+            cancel_reason=data.get("cancel_reason") or "",
         )
 
 
@@ -216,4 +230,14 @@ CREATION_OWNED_FIELDS = frozenset({
     "timezone",
     "times",
     "created_at",
+})
+
+# Written by `JobStore.cancel` alone, on the live object under the store's lock,
+# and cleared by `schedule resume`. `status` stays fire-owned: a cancellation
+# writes it through `cancel`, and `write_fields` refuses a fire's write-back on a
+# job that is CANCELLED, so a fire in flight across the cancellation cannot
+# resurrect it (the same seam that protects a deleted job).
+CANCELLATION_OWNED_FIELDS = frozenset({
+    "cancelled_at",
+    "cancel_reason",
 })
