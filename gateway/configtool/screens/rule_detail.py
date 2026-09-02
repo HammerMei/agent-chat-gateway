@@ -291,22 +291,34 @@ class RuleDetailScreen(FormScreen):
             # The jobs are not deleted — they just stop working, while still
             # listing as active, which is the part worth saying out loud.
             # And "once no rule claims those rooms" is NOT when the rule is
-            # deleted. A room that still has a record is recreated from that
-            # record's own persisted config — `WatcherManager._recreate`: "the
-            # current rules are never consulted" (sticky binding, §2.4). So the
-            # jobs keep waking the agent, and it keeps replying in those rooms,
-            # until each room's record expires: `session_expire_days`, 15 by
-            # default. Only after that does a fire find no rule and deliver
-            # nothing. Saying "they stop delivering" to an operator who deleted
-            # the rule IN ORDER to stop the bot is the wrong half of the truth.
+            # deleted. Two facts compose, and the second is the one that makes
+            # this indefinite rather than merely delayed:
+            #
+            # * a room that still has a record is recreated from THAT RECORD's
+            #   own persisted config — `WatcherManager._recreate`: "the current
+            #   rules are never consulted" (sticky binding, §2.4);
+            # * a job fire is ACTIVITY. Inbound and scheduled injection funnel
+            #   through the same `MessageProcessor.enqueue`, which advances
+            #   `last_activity_at` — and the idle leg measures from there.
+            #
+            # So a job firing more often than `session_idle_days` (15) keeps its
+            # own watcher's record alive, which keeps the recreation source
+            # alive, which keeps the job working. A daily job on a deleted rule
+            # runs FOREVER. Only a job whose interval exceeds the idle TTL lets
+            # the room go idle and then expire (15 more days from `dropped_at`,
+            # so ~30 from last activity) and stop.
+            #
+            # An operator who deleted the rule in order to stop the bot must not
+            # be told it has stopped, and must not be given a date either.
             message += (
-                " Its scheduled jobs are NOT deleted, and they keep delivering "
-                "while each room's record lasts — a room with a record is "
-                "recreated from that record, not from the rules, so the agent "
-                "keeps replying there for up to session_expire_days (default "
-                "15). After that each run fails and is logged, while the job "
-                "still shows as active. To stop them now, delete the jobs with "
-                "'acg schedule delete <job_id>', or expire the watchers."
+                " Its scheduled jobs are NOT deleted, and deleting the rule "
+                "does not stop them: a room that still has a record is "
+                "recreated from that record, not from the rules, and each fire "
+                "counts as activity that keeps the record alive. A job firing "
+                "more often than session_idle_days (15) therefore keeps running "
+                "indefinitely, while still showing as active. To stop it, delete "
+                "the jobs with 'acg schedule delete <job_id>', or expire the "
+                "watchers."
             )
         return message
 

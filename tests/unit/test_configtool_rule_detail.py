@@ -518,12 +518,18 @@ class TestRuleDelete:
             # recreated FROM THAT RECORD, not from the rules
             # (`WatcherManager._recreate`, sticky binding §2.4; pinned by
             # `test_watcher_manager_runtime.py::TestStickyBinding`). So the agent
-            # keeps replying in those rooms for up to `session_expire_days` —
-            # 15 by default — after the rule is gone. An operator who deleted the
-            # rule IN ORDER to stop the bot must not be told it has stopped.
+            # keeps replying in those rooms. And a job fire is ACTIVITY —
+            # scheduled injection funnels through the same
+            # `MessageProcessor.enqueue` that advances `last_activity_at` — so a
+            # job firing more often than `session_idle_days` keeps its OWN
+            # record alive and runs forever. An operator who deleted the rule IN
+            # ORDER to stop the bot must not be told it has stopped, and must not
+            # be given a date either: an earlier version of this test asserted
+            # "up to 15 days", which was wrong in the reassuring direction.
             assert "NOT deleted" in message
-            assert "keep delivering" in message
-            assert "session_expire_days" in message
+            assert "does not stop them" in message
+            assert "session_idle_days" in message
+            assert "indefinitely" in message
             assert "stop delivering" not in message, (
                 "the old, false claim — deleting a rule does not stop the jobs"
             )

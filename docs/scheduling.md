@@ -231,11 +231,17 @@ it fails at every slot instead, logging each time:
 - **it has to have a room id.** Jobs created before that field existed do not,
   and `schedule migrate` is what records it. Until then such a job resolves its
   watcher by name, which works only while a live record answers to that name —
-  so once the room's record is reclaimed, the job stops delivering for good.
-  **This is why migrating is not optional and not something to defer:** the same
-  release that made jobs carry a room id also stopped exempting job-bearing rooms
-  from expiry, so an un-migrated job is exposed to a timer that previously could
-  not touch it.
+  so if the room's record is reclaimed first, the job stops delivering for good.
+
+  In practice that needs an **infrequent** job: a fire counts as activity, so a
+  job running more often than `session_idle_days` (15 by default) keeps its own
+  watcher's record alive, and the record has to sit idle for the full idle leg
+  and then the expiry leg — about a month from last activity — before anything
+  reclaims it. So the exposure is a job whose interval exceeds that, in a room
+  with no other traffic, during the window before you migrate. That is the
+  once-a-quarter or once-a-year job, which is the same case that makes
+  `schedule migrate` a command you run rather than something done lazily at fire
+  time. Run it after upgrading and the window never opens.
 - **its connector has to be able to look a room up by id.** Rocket.Chat and
   Mattermost can. The voice and script connectors cannot, so a job cannot
   recreate one of their watchers after an `expire` — it needs the record to still
