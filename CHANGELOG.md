@@ -153,7 +153,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   WebSocket was down produced no `user_removed` event, and the bot's token can
   still read a public channel it has left, so a reconnect replay delivered a
   kicked channel's backlog to the old watcher. The replay now checks membership
-  by channel id before dispatching anything; a lookup failure is treated as
+  by channel id before dispatching anything, and a confirmed removal is
+  reclaimed through the same hook a live `user_removed` runs; a lookup failure is treated as
   unknown and the replay proceeds, so a network blip cannot be mistaken for a
   removal.
 - **OpenCode watchers reclaim their durable instructions on expiry.** The

@@ -1618,8 +1618,11 @@ it is written here because stating it once is what stops the seventh occurrence:
 
 > A job is addressed by its `room_id`. The handle is consulted **only** when
 > `room_id` is empty — a job written before schema 2 — and **never** once an id
-> exists. A room id that resolves to more than one connector is ambiguous, not a
-> tie to break: refuse and log.
+> exists. The manager is `job.connector` and nothing else: a job whose connector
+> is not configured is refused however many connectors hold its room. Occupancy
+> is not ownership — under one-account-per-agent the sole remaining holder is by
+> construction a different agent, and running the job there would execute it with
+> that agent's backend, tools and account while the fire logged success.
 
 The seam, so a reader can check it rather than rediscover it: a fire resolves
 its job **once** in `JobScheduler._resolve_target`, which answers

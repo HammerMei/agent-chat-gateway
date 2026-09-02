@@ -348,17 +348,17 @@ class MattermostConnector(Connector):
         except Exception as exc:
             logger.warning(
                 "Channel %s: could not confirm membership before replay (%s) — "
-                "proceeding; a confirmed removal is reconciliation's to act on",
+                "proceeding; only a confirmed removal reclaims the room",
                 channel_id, exc,
             )
             still_member = True
         if not still_member:
-            state.membership_lost = True
             logger.warning(
                 "Channel %s: this account is no longer a member — skipping the "
-                "replay; the membership reconciliation reclaims the watcher",
+                "replay and reclaiming the room as a removal",
                 channel_id,
             )
+            self._note_removed(channel_id)
             return
         # An explicitly named window (startup, post-park) is not this channel's
         # boundary to spend — same rule, same reason, as Rocket.Chat's.
@@ -1079,25 +1079,8 @@ class MattermostConnector(Connector):
         if not channel_id:
             return
         if evt.get("event") == "user_removed":
-            # Mark the channel's CURRENT state before anything reclaims it —
-            # synchronously, before the task below is even created — so a
-            # delivery in flight that holds this object can tell a membership
-            # replacement from a benign watcher restart (see the commit
-            # fence in `_on_posted_event`).
-            state = self._channels.get(channel_id)
-            if state is not None:
-                state.membership_lost = True
-            self._membership_gen[channel_id] = (
-                self._membership_gen.get(channel_id, 0) + 1
-            )
-            # A FACTORY, not a coroutine (internal review of the
-            # serialization close): the task's first await is the serial
-            # lock, and a task cancelled while parked there would leave an
-            # eagerly-created coroutine never awaited — a RuntimeWarning per
-            # disconnect and a silently skipped hook. Created inside the
-            # lock instead, so a cancelled park abandons only a factory.
-            def make_coro(cid=channel_id):
-                return self._membership_hook.removed(cid)
+            self._note_removed(channel_id)   # stamps synchronously, then the hook
+            return
         else:
             # The generation, captured SYNCHRONOUSLY at dispatch (Codex round
             # 4): the add's REST classification awaits, and a removal that
@@ -1111,6 +1094,41 @@ class MattermostConnector(Connector):
         # Guarded like RC's `_run_membership_callback`, and for the same
         # reason: a hook that raises inside a spawned task is otherwise an
         # unobserved task exception — a GC-time warning, not a log line.
+        task = asyncio.create_task(self._run_membership(make_coro, channel_id))
+        self._routing_tasks.add(task)
+        task.add_done_callback(self._routing_tasks.discard)
+
+    def _note_removed(self, channel_id: str) -> None:
+        """This account is out of `channel_id`: stamp, fence, and run the hook.
+
+        The one path for a removal however it was learned — the live
+        `user_removed` event, or a replay's membership check finding the
+        channel gone after an offline interval. The second used to set the
+        flag only and leave the reclaim to "reconciliation", which examines
+        paused and dropped records and never this active one: the record,
+        processor and jobs persisted indefinitely, and a re-add kept dropping
+        every post because nothing cleared the flag (Codex, PR #140 round 4).
+
+        Stamps SYNCHRONOUSLY, before the task below exists, so a delivery in
+        flight that holds this state can tell a membership replacement from a
+        benign watcher restart (the commit fence in `_on_posted_event`).
+        """
+        state = self._channels.get(channel_id)
+        if state is not None:
+            state.membership_lost = True
+        self._membership_gen[channel_id] = self._membership_gen.get(channel_id, 0) + 1
+        if self._membership_hook is None:
+            return  # static deployment: nothing registered to reclaim
+
+        # A FACTORY, not a coroutine (internal review of the serialization
+        # close): the task's first await is the serial lock, and a task
+        # cancelled while parked there would leave an eagerly-created
+        # coroutine never awaited — a RuntimeWarning per disconnect and a
+        # silently skipped hook. Created inside the lock instead, so a
+        # cancelled park abandons only a factory.
+        def make_coro(cid=channel_id):
+            return self._membership_hook.removed(cid)
+
         task = asyncio.create_task(self._run_membership(make_coro, channel_id))
         self._routing_tasks.add(task)
         task.add_done_callback(self._routing_tasks.discard)

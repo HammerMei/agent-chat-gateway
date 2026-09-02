@@ -464,13 +464,17 @@ class JobScheduler:
         handle, and the handle-taking ones were where the defect kept
         reappearing (§2.8). One seam; one answer.
 
-        Manager first. `job.connector` when configured; otherwise, by room —
-        but only when exactly ONE manager holds the room. Room ids are
-        per-server, not per-connector, and the canonical multi-agent setup is
-        one account per agent in the same rooms, so several holders is the
-        normal case: taking the first meant `config.yaml` order decided which
-        agent ran the job, and another account posted the reply while the fire
-        logged success. Ambiguity is the operator's question, so: loud, None.
+        Manager first, and ONLY `job.connector`. A job whose connector is not
+        configured is not resolved by asking who else holds its room: room ids
+        are per-server, not per-connector, and the canonical multi-agent setup
+        is one account per agent in the same rooms — so when a connector is
+        removed, every other account in those rooms is a "holder", and the
+        sole survivor is by construction a DIFFERENT agent. Running the job
+        there would execute it with another agent's backend, tools and account
+        while the fire logged success (Codex, PR #140 round 4; an earlier
+        version inferred the owner when exactly one holder remained, which
+        refused only the two-holder case). Loud, None; the operator recreates
+        the job against a current watcher.
 
         Room second. `job.room_id` when the job has one. A job written before
         schema 2 has only its handle, which `resolve_handle` turns into whatever
@@ -479,20 +483,16 @@ class JobScheduler:
         """
         sm = self._session_managers.get(job.connector)
         if sm is None and job.room_id:
-            owners = [m for m in self._session_managers.values()
-                      if m.record_for_room(job.room_id) is not None]
-            if len(owners) == 1:
-                sm = owners[0]
-            elif owners:
-                logger.error(
-                    "Job %s targets room %s, which %d connectors have a record "
-                    "for, and its own connector %r is not configured. Refusing "
-                    "to guess which account should run it — set the job's "
-                    "connector, or delete and recreate the job against a "
-                    "current watcher.",
-                    job.id, job.room_id, len(owners), job.connector,
-                )
-                return None
+            holders = sum(1 for m in self._session_managers.values()
+                          if m.record_for_room(job.room_id) is not None)
+            logger.error(
+                "Job %s: its connector %r is not configured, and %d configured "
+                "connector(s) hold a record for its room %s. Refusing to run it "
+                "under another account — delete and recreate the job against a "
+                "current watcher (or restore the connector under its old name).",
+                job.id, job.connector, holders, job.room_id,
+            )
+            return None
         if sm is None and not job.room_id:
             # A handle embeds its connector's name, so at most one manager can
             # answer for it — this cannot cross accounts the way a room can.

@@ -17,6 +17,7 @@ for the other.
 from __future__ import annotations
 
 import ast
+import asyncio
 import inspect
 import textwrap
 import unittest
@@ -184,14 +185,37 @@ class TestAMattermostReplayRevalidatesMembership(unittest.IsolatedAsyncioTestCas
     `core/replay_window.py` recorded; closed with the by-id lookup the connector
     now has (Codex, PR #140 round 2)."""
 
-    async def test_a_channel_the_account_left_is_not_replayed(self):
+    async def test_a_channel_the_account_left_is_not_replayed_and_is_reclaimed(self):
+        """Not a flag alone: the removal hook runs, exactly as a live
+        `user_removed` would. The flag alone left the record, processor and
+        jobs alive indefinitely — reconciliation examines only paused and
+        dropped records — and a re-add kept dropping posts (Codex round 4)."""
         c, state = _mm_connector([{"id": "p1", "create_at": 450, "message": "x"}])
         c._resolved_channel = AsyncMock(return_value=None)   # the connector's final "not ours"
+        c._membership_hook = MagicMock(removed=AsyncMock())
+        c._membership_serial, c._routing_tasks = {}, set()
+
+        await c.replay_room_since("c1", after_ts="400")
+        for _ in range(3):
+            await asyncio.sleep(0)   # the hook runs on its own serialised task
+
+        c._on_posted_event.assert_not_awaited()
+        self.assertTrue(state.membership_lost)
+        self.assertEqual(c._membership_gen["c1"], 1, "the fence moved, as for a live removal")
+        c._membership_hook.removed.assert_awaited_once_with("c1")
+
+    async def test_without_a_hook_the_removal_is_still_stamped(self):
+        """A static deployment registers no hook; the replay is still skipped and
+        the state fenced, and nothing is called on None."""
+        c, state = _mm_connector([{"id": "p1", "create_at": 450, "message": "x"}])
+        c._resolved_channel = AsyncMock(return_value=None)
+        c._membership_hook = None
 
         await c.replay_room_since("c1", after_ts="400")
 
         c._on_posted_event.assert_not_awaited()
-        self.assertTrue(state.membership_lost, "marked for reconciliation to reclaim")
+        self.assertTrue(state.membership_lost)
+        self.assertEqual(c._membership_gen["c1"], 1)
 
     async def test_a_lookup_failure_is_unknown_not_a_removal(self):
         """A network blip must not invent a kick: the replay proceeds as before."""

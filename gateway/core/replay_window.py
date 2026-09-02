@@ -19,7 +19,8 @@ make the connectors behave alike. Everything platform-specific stays with the pl
   REST fetch the bot's token can still make against a public channel it has left.
   Mattermost therefore revalidates membership by id (`_resolved_channel`) at the top of
   `replay_room_since`, before a single replayed post is dispatched; a channel that is no
-  longer the account's is skipped and marked for the membership reconciliation to reclaim.
+  longer the account's is skipped and reclaimed through the same removal hook a live
+  `user_removed` event runs.
 * **Why an outage window is captured at all.** Rocket.Chat resubscribes rooms one at a
   time, so a room that is live again while others are still confirming moves its watermark
   past the whole gap — that is what `_snapshot_replay_boundaries` exists for. Mattermost

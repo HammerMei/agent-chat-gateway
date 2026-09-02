@@ -1468,14 +1468,12 @@ class TestInjectionResolvesOnceAndReportsFailure(unittest.IsolatedAsyncioTestCas
         stranger.inject_message.assert_not_awaited()
 
 class TestTheManagerIsFoundByRoomBeforeByHandle(unittest.TestCase):
-    """`_get_sh_for_watcher`'s room-first fallback had zero tests: every fixture
-    job has an empty `room_id`, so the branch was dead across the whole suite —
-    and `_make_sm_mock`'s bare `record_for_room` would have made any new test
-    pass whatever manager it picked (review).
-
-    It matters because the handle is the weaker signal: a job whose `connector`
-    is stale must still reach the manager that owns its ROOM, or `inject_message`
-    asks the wrong platform for the room id.
+    """The manager is `job.connector`, and the room id is what the job fires
+    into — never the handle once a room id exists (§2.8). This class also pins
+    what a stale connector does NOT do: it does not reach whichever manager
+    holds the room. `_make_sm_mock`'s `record_for_room` answers only for the
+    rooms a mock owns, so a test here cannot pass on a bare-mock accident
+    (review).
     """
 
     def _scheduler(self, managers):
@@ -1483,14 +1481,17 @@ class TestTheManagerIsFoundByRoomBeforeByHandle(unittest.TestCase):
         scheduler._session_managers = managers
         return scheduler
 
-    def test_a_stale_connector_still_finds_the_room_owner(self):
+    def test_a_stale_connector_is_refused_even_when_one_manager_holds_the_room(self):
+        """Occupancy is not ownership: `mm` holding `room-mm` does not make
+        `retired`'s job `mm`'s to run (Codex, PR #140 round 4)."""
         rc = _make_sm_mock(room_id="room-rc")
         mm = _make_sm_mock(room_id="room-mm")
         scheduler = self._scheduler({"rc": rc, "mm": mm})
         job = ScheduledJob(
             watcher="gone:general", connector="retired", room_id="room-mm")
 
-        self.assertIs(_manager_of(scheduler._resolve_target(job)), mm)
+        with self.assertLogs("agent-chat-gateway.core.scheduler", "ERROR"):
+            self.assertIsNone(_manager_of(scheduler._resolve_target(job)))
 
     def test_the_named_connector_still_wins_when_it_is_configured(self):
         rc = _make_sm_mock(room_id="room-rc")
@@ -1546,17 +1547,27 @@ class TestAnAmbiguousRoomIsRefusedRatherThanGuessed(unittest.TestCase):
 
         logged = "\n".join(cm.output)
         self.assertIn("room-shared", logged)
-        self.assertIn("Refusing to guess", logged)
+        self.assertIn("Refusing to run it under another account", logged)
         self.assertIn("delete and recreate", logged)
 
-    def test_one_owner_is_still_resolved(self):
-        """The fence must not cost the fix it guards: a single owner is exactly
-        the case the by-room fallback was added for."""
-        owner = _make_sm_mock(room_id="room-shared")
+    def test_one_remaining_holder_is_not_inferred_to_be_the_owner(self):
+        """Occupancy is not ownership. Under one-account-per-agent, removing a
+        connector leaves every OTHER account in its rooms as the holder — the
+        sole survivor is by construction a different agent, and an earlier
+        version ran the job there, with that agent's backend and tools, while
+        the fire logged success (Codex, PR #140 round 4). Refused, loudly."""
+        survivor = _make_sm_mock(room_id="room-shared")
         other = _make_sm_mock(room_id="room-elsewhere")
-        scheduler = self._scheduler({"bob": other, "alice-bot": owner})
+        scheduler = self._scheduler({"bob": other, "alice-bot": survivor})
 
-        self.assertIs(_manager_of(scheduler._resolve_target(self._job())), owner)
+        with self.assertLogs("agent-chat-gateway.core.scheduler", "ERROR") as cm:
+            target = scheduler._resolve_target(self._job())
+
+        self.assertIsNone(_manager_of(target))
+        logged = "\n".join(cm.output)
+        self.assertIn("'alice' is not configured", logged)
+        self.assertIn("another account", logged)
+        survivor.inject_message.assert_not_awaited()
 
     def test_ambiguity_does_not_fall_through_to_the_handle(self):
         """Falling back to the handle after refusing the room would reinstate the
