@@ -882,12 +882,32 @@ class SessionManager:
         A job whose room has not spoken yet fails audibly instead: the scheduler
         logs the failed injection, advances `next_run`, and — deliberately —
         does not consume a finite job's `run_count`.
+
+        **Refused on a connector without unsolicited inbound** (owner, PR #140):
+        the recreation this verb promises needs a message that can arrive on
+        its own, and voice/script have none — see the check below.
         """
         state = self._lifecycle.get_watcher_state(name)
         if state is None or not state.config or not state.room_id:
             raise RuntimeError(
                 f"No expirable record for watcher '{name}' — expire acts on a "
                 f"rule-derived record, and this name has none."
+            )
+        if not self._connector.supports_unsolicited_inbound():
+            # Owner's decision (PR #140, Codex round 1): expire's contract is
+            # "reclaimed now, recreated by the room's next message". An eager
+            # connector (§2.6 — voice, script) has no next message: nothing is
+            # pushed to it, so nothing routes an unclaimed room into watcher
+            # creation, and its injections/requests would meet no processor
+            # until the daemon restarts or a scheduled wake happens to fire.
+            # That is a silent outage, not an expiry. `reset` is the verb with
+            # the effect expire can honestly have here — a fresh session,
+            # record and processor kept.
+            raise RuntimeError(
+                f"Watcher '{name}' is on connector '{self._connector.name}', "
+                f"which receives no unsolicited messages — nothing could bring "
+                f"an expired watcher back until the daemon restarts. Use "
+                f"'agent-chat-gateway reset {name}' to clear its session instead."
             )
         # The destructive verbs join the shutdown barrier (internal review of
         # the barrier close): expire was outside flag+counter, protected only

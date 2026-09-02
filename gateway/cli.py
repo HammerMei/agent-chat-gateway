@@ -106,7 +106,9 @@ def main():
         help="Expire a rule-derived watcher now: clear its session and reclaim "
              "its record and files (overrides pause, audibly). Scheduled jobs "
              "are KEPT — the room's next message, or the job itself, recreates "
-             "the watcher",
+             "the watcher. Refused on connectors that receive no unsolicited "
+             "messages (voice, script): nothing could bring the watcher back — "
+             "use 'reset' there",
     )
     expire_p.add_argument("watcher_name", help="Watcher name as shown by 'list'")
 

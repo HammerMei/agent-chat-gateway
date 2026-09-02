@@ -149,6 +149,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Runtime session continuity across restarts is unaffected.
 
 ### Fixed
+- **`expire` is refused on connectors without unsolicited inbound** (voice,
+  script). Its contract is "reclaimed now, recreated by the room's next
+  message", and those connectors have no next message: an expired watcher
+  stayed down, silently, until a restart. The error names `reset` as the verb
+  that has the effect expire can honestly have there.
 - **A scheduled job whose connector left the config is cancelled, not
   re-homed.** The fire used to hand such a job to whichever remaining connector
   held its room — under one account per agent, a different agent. It now

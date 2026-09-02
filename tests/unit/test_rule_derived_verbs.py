@@ -639,6 +639,24 @@ class TestTheExpireVerb(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(args.kwargs.get("require_dormant", False))
         self.assertEqual(cancelled, [], "expire must not touch the schedules")
 
+    async def test_expire_is_refused_on_a_connector_with_no_unsolicited_inbound(self):
+        """Owner's decision (PR #140, Codex round 1). Expire promises "the room's
+        next message recreates the watcher"; voice and script have no next
+        message — nothing is pushed to them, so nothing routes an unclaimed
+        room into creation — and the expired watcher stayed down until a
+        restart. Refused, naming `reset`; nothing is reclaimed."""
+        record = make_rule_derived_record(name="w1")
+        mgr = self._mgr(record)
+        mgr._connector.supports_unsolicited_inbound = MagicMock(return_value=False)
+        mgr._connector.name = "voice-1"
+
+        with self.assertRaises(RuntimeError) as ctx:
+            await mgr.expire_watcher("w1")
+
+        self.assertIn("reset w1", str(ctx.exception))
+        self.assertIn("voice-1", str(ctx.exception))
+        mgr._lifecycle.reclaim_room.assert_not_awaited()
+
     async def test_expire_raises_where_the_event_handlers_swallow(self):
         """An operator watching the command must see the failure."""
         mgr = self._mgr(None)

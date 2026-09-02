@@ -753,6 +753,11 @@ agent-chat-gateway resume <watcher-name> [--connector NAME]
 
 # Reset a watcher (clear state, create new session)
 agent-chat-gateway reset <watcher-name> [--connector NAME]
+
+# Expire a watcher now: reclaim its record and files; the room's next message
+# recreates it. Refused on voice/script connectors — nothing arrives on its
+# own there to bring the watcher back — use `reset` on those instead.
+agent-chat-gateway expire <watcher-name> [--connector NAME]
 ```
 
 `list` reports the watchers the gateway has **state records** for, not the
