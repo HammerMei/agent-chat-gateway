@@ -609,8 +609,10 @@ class TestWatcherLifecycleHardening(IsolatedTestCase):
         await manager.shutdown()
 
         self.assertEqual(manager._lifecycle._processors, {})
-        self.assertIn(("room-a", "default:room-a"), connector.unsubscribed_rooms)
-        self.assertIn(("room-b", "default:room-b"), connector.unsubscribed_rooms)
+        # The watcher is identified to the connector by its room id, not its handle
+        # (a handle follows a rename; the subscription must not).
+        self.assertIn(("room-a", "room-a"), connector.unsubscribed_rooms)
+        self.assertIn(("room-b", "room-b"), connector.unsubscribed_rooms)
 
     async def test_subscribe_failure_clears_deleted_fresh_session_from_state(self):
         connector = ScriptConnector()

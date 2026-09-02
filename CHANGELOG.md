@@ -149,6 +149,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Runtime session continuity across restarts is unaffected.
 
 ### Fixed
+- **The durable-instructions file is keyed by the room, and a rename reaches
+  the running watcher.** `watcher_prompt_key` no longer includes the handle
+  (a static-era deviation from §2.3), so a rename keeps the file the session
+  was started with; the resident processor takes the new handle and rewrites
+  the "ACG Session Identity" header the agent reads every turn, and connector
+  subscriptions are identified by room id so pause/expire after a rename
+  release them. Files written by earlier dynamic-watcher builds under the old
+  handle-keyed name are not migrated (one orphan per watcher, under
+  `system-prompts/`; delete them by hand).
 - **A watcher's name follows its room's rename.** The handle
   `<connector>:<room>` was derived at creation and kept: after a channel rename,
   `list` showed the old name until the watcher happened to be recreated, and the

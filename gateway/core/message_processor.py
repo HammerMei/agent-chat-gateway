@@ -17,6 +17,7 @@ Delegated to extracted collaborators:
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import logging
 from typing import TYPE_CHECKING
 
@@ -593,6 +594,44 @@ class MessageProcessor:
             is_scheduled=is_scheduled_message(anchor),
         )
 
+    async def rename(self, handle: str, *, room_name: str) -> None:
+        """The room was renamed; take the new handle and re-issue the identity header.
+
+        The handle is display data, but it is display data the AGENT reads: the
+        "ACG Session Identity" block names the watcher and the room, and it is
+        handed to the backend on every turn, so a stale one sends the agent's
+        own `schedule create` at a name that no longer resolves — or, once the
+        platform reuses it, at another room (Codex, PR #140). The durable file
+        is rewritten under the same room-keyed path (`watcher_prompt_key` no
+        longer includes the handle), so the path the session was started with
+        stays valid and the next turn reads the new content.
+
+        Raises whatever the backend raises; the lifecycle logs and moves on —
+        the processor's own context-injection retry re-issues the header later.
+        """
+        self._watcher_id = handle
+        self._room = Room(id=self._room.id, name=room_name, type=self._room.type)
+        if self._watcher_config is not None:
+            self._watcher_config = dataclasses.replace(
+                self._watcher_config, name=handle, room=room_name)
+        if self._context_injector is None or self._watcher_config is None:
+            return
+        content = await self._context_injector.build(
+            self._agent_name,
+            self._connector_name,
+            self._watcher_config,
+            agent_username=self._connector.agent_username,
+        )
+        to_repeat = await self._agent.ensure_durable_instructions(
+            self._session_id,
+            self._working_directory,
+            self._config.timeout_for(self._agent_name),
+            content,
+            path_key=watcher_prompt_key(self._connector_name, self._room.id),
+        )
+        if to_repeat is not None:
+            self._append_system_prompt_file = to_repeat
+
     async def _ensure_context_injected(self) -> None:
         """Retry durable-context delivery on message processing when appropriate.
 
@@ -648,11 +687,8 @@ class MessageProcessor:
             watcher_name=self._watcher_id,
             # Must be the SAME key the watcher start used, or the retry would write a
             # second file. Derived here rather than threaded down from the caller so the
-            # two sites cannot drift apart — the derivation is the single source. Scoped
-            # to the watcher, not just the room: see watcher_prompt_key.
-            path_key=watcher_prompt_key(
-                self._connector_name, self._room.id, self._watcher_id
-            ),
+            # two sites cannot drift apart — the derivation is the single source.
+            path_key=watcher_prompt_key(self._connector_name, self._room.id),
             content=content,
         )
         if to_repeat is not None:

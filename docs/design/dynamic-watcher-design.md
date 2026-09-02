@@ -1175,6 +1175,18 @@ Ordering, which is where the cost and the correctness both live:
    nothing on Mattermost and is the only correct order on Rocket.Chat.
    Deferring it does not spend the agent-chain budget either, since
    classification still precedes any model turn.
+
+   **Plan of record (owner, 2026-09-02): an unmentioned message from an
+   allowed sender still creates or wakes the room's watcher.** Under
+   `require_mention: true` the message is then rejected by the tracked-path
+   filter, but the processor has been started (and an idle record's
+   `dropped_at` cleared), so ordinary chatter in a room the bot was added to
+   keeps its watcher warm and defers its expiry. This is accepted, not an
+   oversight: dynamic watchers exist to remove per-room configuration, not to
+   save resources, and a warm watcher answers the first real mention without a
+   start-up delay. A room where the bot is never addressed is a room the bot
+   should not have been added to. Revisit only if a concrete deployment shows
+   the cost matters.
 2. **Membership and scope gate**: on RocketChat, the `roomParticipant` flag
    the server computes per message — required, since subscribe-all also
    delivers public channels the account can merely read. On Mattermost no

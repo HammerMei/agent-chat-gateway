@@ -10,7 +10,7 @@ collision repointed one room's attachment path at another room's files (design �
 
 * `room_path_key(connector, room_id)` — the attachment workspace. The cache it links to
   is per room and shared by definition, so a rename cannot orphan it.
-* `watcher_prompt_key(connector, room_id, watcher_name)` — the durable-instructions
+* `watcher_prompt_key(connector, room_id)` — the durable-instructions
   file. Its contents come from the agent and that watcher's own context files, and two
   watchers may bind different agents to one room, so a room-only key would let the
   second silently overwrite the first. A rename therefore *does* still orphan a prompt
@@ -60,32 +60,24 @@ def room_path_key(connector: str, room_id: str) -> str:
     return hashlib.sha256(canonical).hexdigest()[:_KEY_WIDTH]
 
 
-def watcher_prompt_key(connector: str, room_id: str, watcher_name: str) -> str:
+def watcher_prompt_key(connector: str, room_id: str) -> str:
     """Return the filesystem key for one watcher's durable-instructions file.
 
-    **Separate from `room_path_key` on purpose, and this is a deviation from §2.3's
-    single-key framing.** The design lists the prompt file and the attachment workspace
-    together under `hash(connector, room_id)`, which is right once a room has exactly
-    one watcher — the model the manager introduces. It is wrong while the static shape
-    still permits several.
+    Keyed by `(connector, room_id)` — the watcher's identity (§2.3) — and NOT by
+    the display handle. It used to take the handle as well, a deviation written
+    for the static era, when two watchers with different agents could share one
+    room and a room-only key let the later one overwrite the first one's
+    identity file. One room now has exactly one watcher (§4.1), and the handle
+    follows the room's name (`WatcherLifecycle.observe_room_name`): a key that
+    included it moved on every rename, orphaning the file the running session
+    was still being given and leaving `reclaim_durable_instructions` to delete a
+    file that was never written under that key (owner, 2026-09-02).
 
-    Two watchers may bind different agents to one connector+room today; the config loads,
-    and `MessageDispatcher` fans a message out to both processors. Their durable
-    instructions differ (the content is built from the agent and the watcher's own
-    context files, not from the room), so a room-only key makes the later watcher
-    overwrite the first one's identity and context, and both then use the overwritten
-    file on every turn. Silently.
-
-    The attachment workspace keys on the room correctly, because the cache it links to is
-    per room and shared by definition.
-
-    Residual cost, which is smaller than what it replaces: renaming a watcher orphans one
-    prompt file. It can no longer *collide* — the room is in the digest — and under the
-    dynamic model the name is derived from the room, so the key becomes
-    room-determined anyway.
+    Distinct from `room_path_key` only so the two artifacts cannot be confused
+    for one another; the input is the same pair, digested with a different tag.
     """
     canonical = json.dumps(
-        [connector, room_id, watcher_name], separators=(",", ":")
+        ["prompt", connector, room_id], separators=(",", ":")
     ).encode()
     return hashlib.sha256(canonical).hexdigest()[:_KEY_WIDTH]
 

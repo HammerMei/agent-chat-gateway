@@ -257,7 +257,7 @@ class TestTheSweepExpiresAStaleIdleRecord(unittest.IsolatedAsyncioTestCase):
         # The connector's room state is reclaimed — the room's next message
         # takes the untracked path and creates a FRESH watcher.
         connector.unsubscribe_room.assert_awaited_once_with(
-            "room-w1", watcher_id="w1")
+            "room-w1", watcher_id="room-w1")
         # Session maps and the attachment workspace went with it.
         lifecycle._maps.remove_session.assert_called_with("sess-1")
         lifecycle._attachment_workspace.reclaim.assert_called_once()

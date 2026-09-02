@@ -239,14 +239,12 @@ class AgentBackend(ABC):
         a name and derive nothing from it — not the room, not the watcher, nothing
         human-facing.
 
-        Callers pass `gateway.core.paths.watcher_prompt_key(connector, room_id,
-        watcher_name)`, which is scoped to the *watcher in a room* rather than to the room
-        alone. That matters for anyone implementing this method: the key is scoped to the
-        watcher in a room. Two watchers on one connector+room are refused now (§4.1), so
-        the overwrite it was written to prevent cannot occur — but the key still names a
-        file on disk, and deriving your own would orphan the ones already written. The room-scoped
-        `room_path_key` exists for the attachment workspace, whose cache genuinely is per
-        room — do not reach for it here.
+        Callers pass `gateway.core.paths.watcher_prompt_key(connector, room_id)`,
+        keyed by the watcher's identity — its room — and not by its display handle,
+        which follows the room's name and would move the file on every rename. The
+        room-scoped `room_path_key` exists for the attachment workspace; the two are
+        digested with different tags so they cannot be confused — do not reach for
+        one where the other is meant.
 
         It replaced a `watcher_name` parameter, and the rename is the point: a display
         name is free to change (a channel rename, a group DM's membership changing, a

@@ -31,13 +31,13 @@ def _lifecycle_with(name="mm:test-channel", room_id="R1", room_name="test-channe
     return lifecycle, record
 
 
-class TestTheHandleFollowsTheRoom(unittest.TestCase):
+class TestTheHandleFollowsTheRoom(unittest.IsolatedAsyncioTestCase):
 
-    def test_a_renamed_channel_gets_a_new_handle_and_the_old_one_stops_resolving(self):
+    async def test_a_renamed_channel_gets_a_new_handle_and_the_old_one_stops_resolving(self):
         lifecycle, record = _lifecycle_with()
 
         with self.assertLogs("agent-chat-gateway.core.watcher_lifecycle", "WARNING") as cm:
-            taken = lifecycle.observe_room_name("R1", "test-channel-new")
+            taken = await lifecycle.observe_room_name("R1", "test-channel-new")
 
         self.assertEqual(taken, "mm:test-channel-new")
         self.assertEqual(record.watcher_name, "mm:test-channel-new")
@@ -47,44 +47,44 @@ class TestTheHandleFollowsTheRoom(unittest.TestCase):
         self.assertIn("AUDIT", "\n".join(cm.output))
         _assert_consistent(self, lifecycle)
 
-    def test_the_old_name_is_pruned_from_the_file(self):
+    async def test_the_old_name_is_pruned_from_the_file(self):
         """`StateStore.save` merges by name. Without the prune the file kept a
         frozen row under the old handle beside the live one, and the next boot
         hydrated that row first — old handle, old session, old watermark
         (internal review, P1)."""
         lifecycle, _ = _lifecycle_with()
 
-        lifecycle.observe_room_name("R1", "test-channel-new")
+        await lifecycle.observe_room_name("R1", "test-channel-new")
 
         lifecycle._state_store.save.assert_called_once()
         self.assertEqual(lifecycle._state_store.save.call_args.kwargs.get("prune"), {"mm:test-channel"})
 
-    def test_the_same_name_is_a_no_op(self):
+    async def test_the_same_name_is_a_no_op(self):
         lifecycle, record = _lifecycle_with()
 
-        self.assertIsNone(lifecycle.observe_room_name("R1", "test-channel"))
+        self.assertIsNone(await lifecycle.observe_room_name("R1", "test-channel"))
         self.assertEqual(record.watcher_name, "mm:test-channel")
         lifecycle._state_store.save.assert_not_called()
 
-    def test_an_unknown_room_or_an_empty_name_changes_nothing(self):
+    async def test_an_unknown_room_or_an_empty_name_changes_nothing(self):
         lifecycle, record = _lifecycle_with()
 
-        self.assertIsNone(lifecycle.observe_room_name("R-nope", "x"))
-        self.assertIsNone(lifecycle.observe_room_name("R1", ""))
+        self.assertIsNone(await lifecycle.observe_room_name("R-nope", "x"))
+        self.assertIsNone(await lifecycle.observe_room_name("R1", ""))
         self.assertEqual(record.watcher_name, "mm:test-channel")
 
-    def test_the_lock_moves_with_the_name(self):
+    async def test_the_lock_moves_with_the_name(self):
         """The same mutex object under the new name: a holder keeps holding it
         and the next taker waits on it, not on a twin."""
         lifecycle, _ = _lifecycle_with()
         lock = lifecycle._get_watcher_lock("mm:test-channel")
 
-        lifecycle.observe_room_name("R1", "renamed")
+        await lifecycle.observe_room_name("R1", "renamed")
 
         self.assertIs(lifecycle._get_watcher_lock("mm:renamed"), lock)
         self.assertNotIn("mm:test-channel", lifecycle._watcher_locks)
 
-    def test_a_handle_held_by_another_room_is_not_taken(self):
+    async def test_a_handle_held_by_another_room_is_not_taken(self):
         """Platforms keep names unique per team, so the holder is a stale record
         of a room renamed away and not yet heard from. The description is
         refreshed; the handle is kept; nothing is re-pointed."""
@@ -93,7 +93,7 @@ class TestTheHandleFollowsTheRoom(unittest.TestCase):
         install_record(lifecycle, other)
 
         with self.assertLogs("agent-chat-gateway.core.watcher_lifecycle", "WARNING") as cm:
-            taken = lifecycle.observe_room_name("R1", "renamed")
+            taken = await lifecycle.observe_room_name("R1", "renamed")
 
         self.assertIsNone(taken)
         self.assertEqual(record.watcher_name, "mm:test-channel")
@@ -104,34 +104,61 @@ class TestTheHandleFollowsTheRoom(unittest.TestCase):
         lifecycle._state_store.save.assert_not_called()
         _assert_consistent(self, lifecycle)
 
-    def test_once_the_holder_is_gone_the_next_frame_takes_the_name(self):
+    async def test_once_the_holder_is_gone_the_next_frame_takes_the_name(self):
         """The 'until' in the warning has to be able to fire: the first version
         refreshed `room_name` in the collision case, and the same-name
         short-circuit then made every later frame a no-op (internal review)."""
         lifecycle, record = _lifecycle_with()
         other = make_rule_derived_record(name="mm:renamed", room_id="R2", connector="mm")
         install_record(lifecycle, other)
-        lifecycle.observe_room_name("R1", "renamed")          # refused, holder present
+        await lifecycle.observe_room_name("R1", "renamed")          # refused, holder present
         lifecycle._uninstall("mm:renamed")                    # the holder is reclaimed
 
-        self.assertEqual(lifecycle.observe_room_name("R1", "renamed"), "mm:renamed")
+        self.assertEqual(await lifecycle.observe_room_name("R1", "renamed"), "mm:renamed")
         self.assertIs(lifecycle.get_watcher_state("mm:renamed"), record)
 
-    def test_a_private_group_is_renamed_and_a_group_dm_is_not(self):
+    async def test_a_private_group_is_renamed_and_a_group_dm_is_not(self):
         lifecycle, record = _lifecycle_with(name="mm:ops", room_name="ops", room_kind="group")
-        self.assertEqual(lifecycle.observe_room_name("R1", "ops-new"), "mm:ops-new")
+        self.assertEqual(await lifecycle.observe_room_name("R1", "ops-new"), "mm:ops-new")
 
         lifecycle2, record2 = _lifecycle_with(name="mm:gdm:abc", room_name="a, b", room_kind="group_dm")
-        self.assertIsNone(lifecycle2.observe_room_name("R1", "a, b, c"))
+        self.assertIsNone(await lifecycle2.observe_room_name("R1", "a, b, c"))
         self.assertEqual(record2.watcher_name, "mm:gdm:abc")
 
-    def test_a_dm_is_not_renamed_by_a_frame(self):
+    async def test_a_dm_is_not_renamed_by_a_frame(self):
         """A DM's label derives from the participants, which no frame carries."""
         lifecycle, record = _lifecycle_with(name="mm:dm:alice", room_name="alice", room_kind="dm")
 
-        self.assertIsNone(lifecycle.observe_room_name("R1", "alice-renamed"))
+        self.assertIsNone(await lifecycle.observe_room_name("R1", "alice-renamed"))
         self.assertEqual(record.watcher_name, "mm:dm:alice")
 
+
+    async def test_the_resident_processor_takes_the_new_name(self):
+        """The processor carries the handle into the ACG Session Identity header
+        the agent reads every turn (Codex, PR #140): a stale one sends the
+        agent's own `schedule create` at a name that no longer resolves."""
+        from tests.helpers import register_processor
+
+        lifecycle, _ = _lifecycle_with()
+        processor = register_processor(lifecycle, "mm:test-channel", MagicMock(rename=AsyncMock()))
+
+        await lifecycle.observe_room_name("R1", "test-channel-new")
+
+        processor.rename.assert_awaited_once_with("mm:test-channel-new", room_name="test-channel-new")
+
+    async def test_a_processor_that_cannot_take_the_name_does_not_fail_the_rename(self):
+        from tests.helpers import register_processor
+
+        lifecycle, record = _lifecycle_with()
+        register_processor(lifecycle, "mm:test-channel",
+                           MagicMock(rename=AsyncMock(side_effect=OSError("disk"))))
+
+        with self.assertLogs("agent-chat-gateway.core.watcher_lifecycle", "WARNING") as cm:
+            taken = await lifecycle.observe_room_name("R1", "test-channel-new")
+
+        self.assertEqual(taken, "mm:test-channel-new")
+        self.assertEqual(record.watcher_name, "mm:test-channel-new")
+        self.assertIn("could not take its new name", "\n".join(cm.output))
 
 class TestEveryClaimedFramePassesTheObserver(unittest.IsolatedAsyncioTestCase):
 
@@ -139,7 +166,7 @@ class TestEveryClaimedFramePassesTheObserver(unittest.IsolatedAsyncioTestCase):
         mgr = make_bare_session_manager()
         mgr._connector.supports_unsolicited_inbound = MagicMock(return_value=unsolicited)
         mgr._dispatcher.dispatch = AsyncMock(return_value=True)
-        mgr._lifecycle.observe_room_name = MagicMock(return_value=None)
+        mgr._lifecycle.observe_room_name = AsyncMock(return_value=None)
         return mgr
 
     async def test_a_discovering_connector_observes_then_dispatches(self):
@@ -149,7 +176,7 @@ class TestEveryClaimedFramePassesTheObserver(unittest.IsolatedAsyncioTestCase):
 
         self.assertTrue(await mgr._on_inbound(msg))
 
-        mgr._lifecycle.observe_room_name.assert_called_once_with("R1", "renamed")
+        mgr._lifecycle.observe_room_name.assert_awaited_once_with("R1", "renamed")
         mgr._dispatcher.dispatch.assert_awaited_once_with(msg)
 
     async def test_an_eager_connectors_room_name_is_config_not_a_platform_fact(self):
@@ -235,4 +262,36 @@ class TestScheduleListNamesTheWatcherAsItIsNow(unittest.TestCase):
         store.list_jobs.assert_called_once_with(connector="rc", include_completed=False)
         entry.session_manager.record_for_room.assert_not_called()
         self.assertEqual(result["jobs"][0]["watcher"], "rc:legacy")
+
+
+class TestTheProcessorReissuesItsIdentityOnRename(unittest.IsolatedAsyncioTestCase):
+
+    async def test_the_header_names_the_new_handle_under_the_same_room_keyed_file(self):
+        from gateway.core.config import WatcherConfig
+        from gateway.core.paths import watcher_prompt_key
+        from tests.helpers import make_processor
+
+        injector = MagicMock()
+        injector.build = AsyncMock(side_effect=lambda agent, conn, wc, **kw: f"## ACG Session Identity\n- {wc.name} / {wc.room}")
+        agent = MagicMock()
+        agent.ensure_durable_instructions = AsyncMock(return_value="/runtime/system-prompts/k.md")
+        wc = WatcherConfig(name="mm:test-channel", connector="mm", room="test-channel", agent="default")
+        processor = make_processor(agent=agent, watcher_id="mm:test-channel", connector_name="mm",
+                                   context_injector=injector, watcher_config=wc)
+
+        await processor.rename("mm:test-channel-new", room_name="test-channel-new")
+
+        self.assertEqual(processor.watcher_id, "mm:test-channel-new")
+        call = agent.ensure_durable_instructions.await_args
+        self.assertIn("mm:test-channel-new / test-channel-new", call.args[3])
+        self.assertEqual(call.kwargs["path_key"], watcher_prompt_key("mm", "room_1"),
+                         "the same file the session was started with")
+        self.assertEqual(processor._append_system_prompt_file, "/runtime/system-prompts/k.md")
+
+    async def test_without_an_injector_only_the_name_moves(self):
+        from tests.helpers import make_processor
+
+        processor = make_processor(watcher_id="mm:a")
+        await processor.rename("mm:b", room_name="b")
+        self.assertEqual(processor.watcher_id, "mm:b")
 

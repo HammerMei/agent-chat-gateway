@@ -608,7 +608,7 @@ class SessionManager:
         configured literal, not a platform fact a frame could correct.
         """
         if self._connector.supports_unsolicited_inbound():
-            self._lifecycle.observe_room_name(msg.room.id, msg.room.name)
+            await self._lifecycle.observe_room_name(msg.room.id, msg.room.name)
         return await self._dispatcher.dispatch(msg)
 
     async def _route_unclaimed_room(self, room: RoomRef, trigger) -> None:

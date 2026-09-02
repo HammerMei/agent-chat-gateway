@@ -572,7 +572,7 @@ class WatcherLifecycle:
         if state.room_id:
             try:
                 await self._connector.unsubscribe_room(
-                    state.room_id, watcher_id=name)
+                    state.room_id, watcher_id=state.room_id)
             except Exception as e:
                 logger.warning(
                     "Watcher '%s': unsubscribe failed during reclamation "
@@ -663,7 +663,7 @@ class WatcherLifecycle:
         if agent is not None and state.room_id and state.connector:
             try:
                 await agent.reclaim_durable_instructions(
-                    watcher_prompt_key(state.connector, state.room_id, name))
+                    watcher_prompt_key(state.connector, state.room_id))
             except Exception as e:
                 logger.warning(
                     "Watcher '%s': could not reclaim the prompt file: %s",
@@ -1255,7 +1255,7 @@ class WatcherLifecycle:
     # start machinery; these three are the whole seam between them, so neither
     # reaches into the other's dicts.
 
-    def observe_room_name(self, room_id: str, name: str) -> str | None:
+    async def observe_room_name(self, room_id: str, name: str) -> str | None:
         """A frame carried the room's current platform name — follow a rename.
 
         The handle `<connector>:<room label>` is a function of the room's
@@ -1311,6 +1311,25 @@ class WatcherLifecycle:
             )
         ws.room_name = name
         self._state_store.save(self._by_name(), prune={old} if new != old else None)
+        if new != old:
+            # The resident processor carries the handle too — in its logs and,
+            # load-bearing, in the "ACG Session Identity" header the agent is
+            # given on every turn, which is where the agent learns the handle
+            # it types into `schedule create`. A stale one there fails, or —
+            # once the platform reuses the old name — targets another room
+            # (Codex, PR #140). Best-effort: a failed rewrite is retried by
+            # the processor's own context-injection cadence, and the rename
+            # of the record must not fail the message that revealed it.
+            processor = self._processors.get(room_id)
+            if processor is not None:
+                try:
+                    await processor.rename(new, room_name=name)
+                except Exception as exc:
+                    logger.warning(
+                        "Watcher '%s': the running processor could not take its new "
+                        "name yet (%s) — its identity header is refreshed on the next "
+                        "context-injection retry", new, exc,
+                    )
         return new if new != old else None
 
     def record_for_room(self, room_id: str) -> WatcherState | None:
@@ -1588,12 +1607,9 @@ class WatcherLifecycle:
             to_repeat = await self._injector.ensure(
                 ws, session_id, agent, agent_cfg.working_directory, agent_cfg.timeout,
                 watcher_name=wc.name,
-                # The prompt file is per WATCHER, not per room. The collision it was
-                # written for — two watchers with different agents in one room — is now
-                # refused (§4.1), but the key still names files on disk and re-keying
-                # them would orphan every existing one for no gain. See
-                # watcher_prompt_key for why this is not room_path_key.
-                path_key=watcher_prompt_key(wc.connector, room.id, wc.name),
+                # Keyed by the room, which is the watcher's identity (§2.3): the
+                # handle follows a rename and must not move this file with it.
+                path_key=watcher_prompt_key(wc.connector, room.id),
                 content=built_content,
             )
         except Exception:
@@ -1637,7 +1653,7 @@ class WatcherLifecycle:
             session_id=session_id,
             room=room,
             working_directory=agent_cfg.working_directory,
-            watcher_id=wc.name,
+            watcher_id=room.id,
             connector=self._connector,
             agent=agent,
             agent_name=agent_name,
@@ -1666,7 +1682,7 @@ class WatcherLifecycle:
         try:
             await self._connector.subscribe_room(
                 room,
-                watcher_id=wc.name,
+                watcher_id=room.id,
                 working_directory=agent_cfg.working_directory,
             )
             subscribed = True
@@ -1674,7 +1690,7 @@ class WatcherLifecycle:
         except Exception:
             if subscribed:
                 try:
-                    await self._connector.unsubscribe_room(room.id, watcher_id=wc.name)
+                    await self._connector.unsubscribe_room(room.id, watcher_id=room.id)
                 except Exception as unsub_error:  # best effort; the raise below is what matters
                     logger.warning(
                         "Watcher '%s': could not unsubscribe room '%s' while rolling "
@@ -1924,7 +1940,7 @@ class WatcherLifecycle:
         # Step 3: Unsubscribe from the connector (stop delivery for this room).
         if state and state.room_id:
             try:
-                await self._connector.unsubscribe_room(state.room_id, watcher_id=name)
+                await self._connector.unsubscribe_room(state.room_id, watcher_id=state.room_id)
             except Exception as e:
                 errors.append(f"unsubscribe failed: {e}")
                 logger.error(

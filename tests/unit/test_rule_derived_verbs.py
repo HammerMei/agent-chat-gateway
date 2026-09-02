@@ -708,7 +708,7 @@ class TestAReclaimSurvivesARenameInItsAwaitWindow(unittest.IsolatedAsyncioTestCa
             agent = lifecycle._agents["default"]
 
             async def rename_mid_reclaim(*args, **kwargs):
-                self.assertEqual(lifecycle.observe_room_name(ROOM_ID, "eng-renamed"),
+                self.assertEqual(await lifecycle.observe_room_name(ROOM_ID, "eng-renamed"),
                                  "rc:eng-renamed")
             agent.reclaim_durable_instructions = rename_mid_reclaim
 

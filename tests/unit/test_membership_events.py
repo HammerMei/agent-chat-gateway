@@ -63,7 +63,7 @@ class TestARemovalReclaimsTheRecord(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(name, "w1")
         self.assertIsNone(lifecycle.get_watcher_state("w1"), "the record is gone")
-        connector.unsubscribe_room.assert_awaited_once_with("room-w1", watcher_id="w1")
+        connector.unsubscribe_room.assert_awaited_once_with("room-w1", watcher_id="room-w1")
         lifecycle._maps.remove_session.assert_called_with("sess-1")
         lifecycle._attachment_workspace.reclaim.assert_called_once()
         # `save` MERGES the on-disk records, so the pop alone is not a
