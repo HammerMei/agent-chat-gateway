@@ -899,6 +899,71 @@ class TestRoutingUntrackedChannels(unittest.IsolatedAsyncioTestCase):
 
         connector._ws.deliver_to_channel.assert_called_once_with(event)
 
+    async def test_a_handed_back_frame_is_promised_not_claimed_and_a_rejection_claims(self):
+        """Same contract as Rocket.Chat's creation path. The episode used to claim
+        a boundary below the frames it handed back; the claim was never
+        discharged when they were accepted, so shutdown persisted a boundary at
+        the channel's creation and every restart replayed — and re-answered —
+        everything since (measured: three rooms). Now: promised on hand-back,
+        claimed only when the filter rejects one as already processed."""
+        from gateway.connectors.mattermost.connector import _ChannelState
+
+        connector = await self._connector()
+        connector._ws.deliver_to_channel = MagicMock()
+        # Mentioning the bot: the mention gate runs BEFORE the timestamp dedup,
+        # and a frame it would refuse anyway is no loss and claims nothing.
+        event = self._event(mentions=["bot-id-1"])
+
+        async def creating_router(room, trigger):
+            state = _ChannelState(room=Room(id="chan-new", name="incident-42", type="channel"))
+            state.last_processed_ts = "9999"   # a live message got in first
+            connector._channels["chan-new"] = state
+
+        connector.register_router(creating_router)
+        await connector._on_posted_event(event)
+        await self._drain(connector)
+        state = connector._channels["chan-new"]
+
+        self.assertIn("m1", state.promised_ids)
+        self.assertIsNone(state.replay_boundary)
+        self.assertEqual(state.boundary_claims, 0)
+
+        # The queue worker delivers the handed-back frame; it falls below the
+        # watermark and is rejected — the window opens now.
+        handed_back = connector._ws.deliver_to_channel.call_args.args[0]
+        await connector._on_posted_event(handed_back)
+
+        self.assertEqual(state.replay_boundary, "0", "just below the frame's create_at=1")
+        self.assertEqual(state.boundary_claims, 1)
+        self.assertNotIn("m1", state.promised_ids)
+
+    async def test_an_accepted_hand_back_leaves_the_live_watermark_for_shutdown(self):
+        """The regression: creation, frames accepted, no replay — and
+        `get_last_processed_ts` (what shutdown persists) must be the live mark,
+        not a boundary at the channel's creation."""
+        from gateway.connectors.mattermost.connector import _ChannelState
+
+        connector = await self._connector()
+        connector._ws.deliver_to_channel = MagicMock()
+
+        async def creating_router(room, trigger):
+            connector._channels["chan-new"] = _ChannelState(
+                room=Room(id="chan-new", name="incident-42", type="channel"))
+
+        connector.register_router(creating_router)
+        await connector._on_posted_event(self._event(mentions=["bot-id-1"]))
+        await self._drain(connector)
+        state = connector._channels["chan-new"]
+        self.assertIn("m1", state.promised_ids)
+
+        handed_back = connector._ws.deliver_to_channel.call_args.args[0]
+        await connector._on_posted_event(handed_back)   # no watermark to fall below: accepted
+
+        self.assertEqual(state.promised_ids, set())
+        self.assertEqual(state.boundary_claims, 0)
+        self.assertTrue(state.last_processed_ts, "the accepted frame advanced the mark")
+        self.assertEqual(connector.get_last_processed_ts("chan-new"), state.last_processed_ts)
+
     async def test_no_hand_back_when_the_router_declines(self):
         """A router that creates nothing (no rule matched) leaves the frame dropped —
         delivering it would mean delivering to nobody."""

@@ -220,15 +220,19 @@ class TestTheSweepIdlesAndTheNextMessageWakes(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(await sweep.run_once(), [name])
 
             self.assertTrue(created.dropped_at, "the idle clock was stamped")
-            # The drop captures the oldest OWED mark (round 26): the creation
-            # drain claimed just-below-m1 (delivery is attempted, a filtered
-            # frame is a deferral not a loss), and that claim is open until a
-            # replay discharges it — so the durable record carries 1499, and
-            # the wake re-reads one page the dedup window absorbs. Older is
-            # the safe direction; 1500 here would spend a window nothing read.
-            self.assertEqual(created.last_processed_ts, "1499",
-                             "the drop captured the owed mark, not merely "
-                             "the processed one")
+            # The drop captures what the room actually reached. This used to
+            # assert 1499 — "the oldest OWED mark" — because the creation drain
+            # CLAIMED a boundary just below m1 and nothing ever discharged it,
+            # so the durable record carried the creation point forever and
+            # every restart replayed from there, re-answering messages the
+            # agent had already answered (measured on a live deployment: three
+            # rooms, 21 messages). m1 here was delivered and accepted — the
+            # test says so itself, two lines up — so nothing is owed below it.
+            # The creation drain now PROMISES its frames, and a boundary is
+            # claimed only if the filter rejects one as already processed.
+            self.assertEqual(created.last_processed_ts, "1500",
+                             "the drop captured the processed mark; nothing "
+                             "below it was left unread")
             self.assertIsNone(lifecycle.processor_named(name))
             self.assertIs(dispatcher.capacity(ROOM_ID), RoomCapacity.UNROUTED)
             # §2.2, pinned: the drop does NOT unsubscribe — the room entry,
@@ -250,8 +254,11 @@ class TestTheSweepIdlesAndTheNextMessageWakes(unittest.IsolatedAsyncioTestCase):
         # The wake replayed the interval the room owes, from the very
         # watermark the drop captured — the OWED mark (round 26).
         connector.replay_room_since.assert_awaited_once()
+        # …and from the PROCESSED mark: 1500, not a boundary at the room's
+        # creation — replaying from 1499 here is exactly what re-delivered every
+        # already-answered message on the live deployment after each restart.
         self.assertEqual(
-            connector.replay_room_since.await_args.kwargs.get("after_ts"), "1499")
+            connector.replay_room_since.await_args.kwargs.get("after_ts"), "1500")
         # And however many idle/wake cycles, the bookkeeping does not grow.
         self.assertEqual(connector._room_refcount[ROOM_ID], 1)
         self.assertEqual(len(connector._watcher_contexts[ROOM_ID]), 1)

@@ -3600,11 +3600,17 @@ class TestTheRoutingTransaction(unittest.IsolatedAsyncioTestCase):
         not the earlier", so the filter then rejects everything below it,
         including the trigger.
 
-        The episode claims the window before handing its frames over, which is
-        the same promise the queue-full hand-back makes with the same
-        mechanism: a message below this mark was not read, so a recovery must
-        come back for it.
+        The episode used to CLAIM the window before handing its frames over.
+        That claim was never discharged in the ordinary case — the frames were
+        accepted and no replay ever ran — so shutdown persisted a boundary at
+        the room's creation and every restart replayed everything since,
+        re-answering messages the agent had already answered (measured on a
+        live deployment, three rooms). Now the episode PROMISES the frames, and
+        the boundary is claimed at the moment the filter actually rejects one:
+        the same deferral, made only when it is needed.
         """
+        from gateway.connectors.rocketchat.connector import _RoomSubscription
+
         connector = self._connector()
         entered = asyncio.Event()
         release = asyncio.Event()
@@ -3612,8 +3618,6 @@ class TestTheRoutingTransaction(unittest.IsolatedAsyncioTestCase):
         async def creating_router(room, trigger):
             entered.set()
             await release.wait()
-            from gateway.connectors.rocketchat.connector import _RoomSubscription
-
             sub = _RoomSubscription(room=Room(id="new-room", name="general"))
             # What a live message accepted during the episode leaves behind.
             sub.last_processed_ts = "9999"
@@ -3625,53 +3629,65 @@ class TestTheRoutingTransaction(unittest.IsolatedAsyncioTestCase):
         await entered.wait()
         release.set()
         await first
-
         sub = connector._rooms["new-room"]
+
+        # Handed over: promised, and nothing claimed yet — nothing is owed until
+        # the filter says so.
+        self.assertIn("m1", sub.promised_ids)
+        self.assertIsNone(sub.replay_boundary)
+        self.assertEqual(sub.boundary_claims, 0)
+
+        # The handed-back frame reaches the handler below the advanced watermark
+        # and is rejected as already processed. THAT is when the window opens.
+        # (Mentioning the bot: the mention gate runs BEFORE the timestamp dedup,
+        # and a frame it would refuse anyway is no loss and claims nothing. A
+        # handler must be registered, or the connector answers before judging.)
+        connector._handler = AsyncMock(return_value=True)
+        doc = {**self._doc("m1"), "mentions": [{"username": "bot"}]}
+        await connector._on_raw_ddp_message("new-room", doc, access=self._ACCESS)
+
         self.assertTrue(
             sub.replay_boundary,
-            "the window below the drained frames is claimed, so a recovery "
-            "returns for anything the advanced watermark filtered out",
+            "the window below the rejected frame is claimed, so a recovery "
+            "returns for what the advanced watermark filtered out",
         )
-        self.assertTrue(
-            _ts_gt("1", sub.replay_boundary or "1"),
-            "the claimed mark sits strictly below the buffered frame",
-        )
+        self.assertTrue(_ts_gt("1", sub.replay_boundary or "1"), "strictly below the frame")
+        self.assertEqual(sub.boundary_claims, 1)
+        self.assertNotIn("m1", sub.promised_ids, "the promise was converted, not kept open")
 
-    async def test_the_claim_holds_for_a_brand_new_room_with_no_watermark(self):
-        """The common episode, and the one the first version of the test above
-        did not cover: it seeded a watermark, so both claim candidates were
-        non-empty.
+    async def test_a_brand_new_room_promises_its_trigger_and_claims_nothing(self):
+        """The common episode: a first-ever room, no watermark, the trigger is
+        handed back and ACCEPTED. Under the pre-emptive claim this left a
+        boundary at the trigger that nothing discharged, and shutdown persisted
+        it — the measured defect. Now nothing is claimed, the promise is kept
+        on acceptance, and what shutdown persists is the live watermark."""
+        from gateway.connectors.rocketchat.connector import _RoomSubscription
 
-        A first-ever room offers `("", just_before(trigger))`. If the empty
-        string won and were stored, the read site — `after_ts or
-        replay_boundary or last_processed_ts` — would treat it as falsy and
-        skip the room entirely, leaving the claim inert exactly where it
-        matters most. `claim_boundary` filters falsy candidates rather than
-        sorting them oldest, which is what makes this work; pinned here because
-        the docstring's "an unparseable candidate sorts as the oldest" reads
-        like it would not.
-        """
         connector = self._connector()
 
         async def creating_router(room, trigger):
-            from gateway.connectors.rocketchat.connector import _RoomSubscription
-
-            # A brand-new room: no watermark yet, by definition.
             connector._rooms["new-room"] = _RoomSubscription(
                 room=Room(id="new-room", name="general"))
 
         connector.register_router(creating_router)
         await connector._on_unrouted_message(self._doc("m1"), self._ACCESS)
-
         sub = connector._rooms["new-room"]
-        self.assertTrue(
-            sub.replay_boundary,
-            "an empty watermark must not become the claimed mark — a falsy "
-            "boundary is skipped by every reader, so the claim would be inert",
-        )
-        # And a recovery reading its own window actually uses it.
-        self.assertEqual(
-            sub.replay_boundary or sub.last_processed_ts, sub.replay_boundary)
+        self.assertIn("m1", sub.promised_ids)
+        self.assertIsNone(sub.replay_boundary)
+
+        # The handed-back trigger arrives at the handler with no watermark to
+        # fall below: accepted, dispatched, watermark advanced.
+        connector._handler = AsyncMock(return_value=True)
+        doc = {**self._doc("m1"), "mentions": [{"username": "bot"}]}
+        await connector._on_raw_ddp_message("new-room", doc, access=self._ACCESS)
+
+        self.assertEqual(sub.promised_ids, set(), "accepted: the promise is kept")
+        self.assertEqual(sub.boundary_claims, 0, "nothing was ever owed")
+        self.assertIsNone(sub.replay_boundary)
+        # The regression itself: what shutdown persists is the live mark, not
+        # a boundary at the room's creation.
+        self.assertEqual(connector.get_last_processed_ts("new-room"), sub.last_processed_ts)
+        self.assertTrue(sub.last_processed_ts, "the accepted trigger advanced it")
 
     async def test_a_parked_room_commits_nothing(self):
         """Outcomes 4-exhausted and 7 share one observable: nothing was

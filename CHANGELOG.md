@@ -149,6 +149,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Runtime session continuity across restarts is unaffected.
 
 ### Fixed
+- **A restart no longer re-delivers messages the agent already answered** in
+  rooms whose watcher was created since the previous start. The creation path
+  claimed a replay boundary below the frames it handed back — a promise to
+  replay them if the watermark had already moved past them — and nothing
+  discharged that claim when the frames were simply accepted, which is the
+  ordinary outcome. Shutdown then persisted a boundary at the room's creation,
+  and the next start replayed everything since it, on both connectors. The
+  frames are now *promised* rather than claimed: the boundary is claimed only
+  at the moment the filter actually rejects one as already processed.
 - **The bot's Rocket.Chat identity is the account the server knows, not the
   configured spelling** (#112). Login is not spelling-exact — a lowercase or
   email login resolves to the account's canonical username, which is what

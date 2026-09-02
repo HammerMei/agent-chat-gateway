@@ -9,7 +9,7 @@ so this file tests the rule and the connector suites test the wiring.
 from __future__ import annotations
 
 import unittest
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from gateway.core.replay_window import ReplayWindow, just_before
 
@@ -18,6 +18,7 @@ from gateway.core.replay_window import ReplayWindow, just_before
 class _Window(ReplayWindow):
     replay_boundary: str | None = None
     boundary_claims: int = 0
+    promised_ids: set = field(default_factory=set)
 
 
 class TestTheOldestCandidateWins(unittest.TestCase):
@@ -120,3 +121,38 @@ class TestJustBefore(unittest.TestCase):
         """Better an unusable bound than a fabricated one."""
         self.assertEqual(just_before("not-a-time"), "not-a-time")
         self.assertEqual(just_before(""), "")
+
+
+class TestClosingTheWindowSettlesThePromises(unittest.TestCase):
+    """`promised_ids` is the third piece of the bookkeeping (see the class
+    docstring): frames a creation episode handed back, whose boundary is
+    claimed only if the filter rejects one. Once a replay has read the window
+    — or a removal has voided it — nothing is owed for them either."""
+
+    def test_discharge_clears_the_promises(self):
+        w = _Window()
+        w.promised_ids.update({"m1", "m2"})
+        n = w.claim_boundary("100")
+
+        self.assertTrue(w.discharge_boundary(n))
+        self.assertEqual(w.promised_ids, set())
+
+    def test_a_refused_discharge_keeps_them(self):
+        """Claimed again since the snapshot: the window stays open, and so do
+        the promises — a later replay still has to judge them."""
+        w = _Window()
+        w.promised_ids.add("m1")
+        n = w.claim_boundary("100")
+        w.claim_boundary("50")
+
+        self.assertFalse(w.discharge_boundary(n))
+        self.assertEqual(w.promised_ids, {"m1"})
+
+    def test_discard_clears_them_too(self):
+        w = _Window()
+        w.promised_ids.add("m1")
+        w.claim_boundary("100")
+
+        w.discard_boundary()
+        self.assertEqual(w.promised_ids, set())
+

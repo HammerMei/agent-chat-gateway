@@ -66,10 +66,19 @@ class ReplayWindow:
 
         replay_boundary: str | None = None
         boundary_claims: int = 0
+        promised_ids: set = field(default_factory=set)
+
+    `promised_ids` is the third piece of the same bookkeeping: the ids of frames a
+    creation episode handed back through the queue while a live message may already
+    have moved the watermark past them. A boundary is claimed for one of them only
+    when the filter actually rejects it as already processed (see each connector's
+    handler) — not pre-emptively at creation, which left a claim nothing discharged
+    and had shutdown persist a boundary at the room's creation.
     """
 
     replay_boundary: str | None
     boundary_claims: int
+    promised_ids: set
 
     def claim_boundary(self, *fallbacks: str | None) -> int:
         """Record that someone still needs this window read. Returns the claim count.
@@ -121,6 +130,10 @@ class ReplayWindow:
             return False
         self.replay_boundary = None
         self.boundary_claims = 0
+        # A replay that read the window covers anything still promised at or
+        # below it; a frame still promised ABOVE it is either in the queue (and
+        # will be judged on arrival) or was accepted live. Nothing is owed.
+        self.promised_ids.clear()
         return True
 
     def discard_boundary(self) -> None:
@@ -134,3 +147,4 @@ class ReplayWindow:
         """
         self.replay_boundary = None
         self.boundary_claims = 0
+        self.promised_ids.clear()   # nobody is entitled to those either

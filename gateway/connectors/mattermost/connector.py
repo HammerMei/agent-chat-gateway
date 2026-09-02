@@ -118,6 +118,14 @@ class _ChannelState(ReplayWindow):
     seen_ids: collections.deque = field(default_factory=lambda: collections.deque())
     seen_ids_set: set = field(default_factory=set)
     watcher_ids: set = field(default_factory=set)
+    # Ids of the frames a creation episode handed back through the queue while a
+    # live message may already have advanced the watermark past them. If such a
+    # frame is then rejected as "already processed", it needs a replay and gets
+    # a boundary claimed for it AT THAT MOMENT — not pre-emptively at creation.
+    # The pre-emptive claim was never discharged when the frames were accepted
+    # (the ordinary case), so shutdown persisted a boundary at the room's
+    # creation and every restart replayed, and re-answered, everything since.
+    promised_ids: set = field(default_factory=set)
 
 
 # Mattermost channel type → the gateway's room kind. `room_type_for` in rest.py maps the
@@ -1547,13 +1555,17 @@ class MattermostConnector(Connector):
                 # filter would reject them as already processed. The claim is a
                 # promise that a recovery comes back for them (§2.2), which is
                 # what makes a filtered delivery a deferral and not a loss.
-                oldest = min(
-                    (str(f["post"].get("create_at", "")) for f in frames
-                     if f["post"].get("create_at")),
-                    default="",
-                )
-                if oldest:
-                    state.claim_boundary(state.last_processed_ts, just_before(oldest))
+                # PROMISED, not claimed. A boundary claimed here for frames that
+                # were then delivered and accepted — the ordinary outcome — was
+                # never discharged: only a replay discharges, and none ran. So
+                # shutdown persisted a boundary at the channel's creation and
+                # the next boot replayed everything since, re-answering messages
+                # the agent had already answered (measured on three rooms). The
+                # frames' ids are remembered instead, and the boundary is claimed
+                # only if the filter rejects one of them as already processed —
+                # the exact case the promise exists for (`_on_posted_event`).
+                state.promised_ids.update(
+                    f["post"].get("id", "") for f in frames if f["post"].get("id"))
                 for frame in frames:
                     self._ws.deliver_to_channel(frame)
             elif frames:
@@ -1661,6 +1673,7 @@ class MattermostConnector(Connector):
 
         msg_id = post.get("id", "")
         if msg_id and msg_id in state.seen_ids_set:
+            state.promised_ids.discard(msg_id)   # its live copy was processed
             logger.debug("Skipping already-seen message id=%s in channel %s", msg_id, channel_id)
             return
 
@@ -1712,8 +1725,22 @@ class MattermostConnector(Connector):
             else 0
         )
         if not result.accepted:
+            if msg_id in state.promised_ids:
+                state.promised_ids.discard(msg_id)
+                if result.reason.startswith("already processed"):
+                    # The race the promise exists for: a live message accepted
+                    # during the creation episode advanced the watermark past
+                    # this handed-back frame, and the filter now reads it as
+                    # old. It was never processed. Keep it reachable.
+                    self._keep_replayable(state, msg_id, str(post.get("create_at", "")))
+                    logger.info(
+                        "Channel %s: handed-back frame %s fell below the watermark — "
+                        "boundary claimed so the next replay recovers it",
+                        channel_id, msg_id,
+                    )
             logger.debug("Message filtered: %s (sender=%s)", result.reason, result.sender)
             return
+        state.promised_ids.discard(msg_id)   # accepted: the promise is kept
 
         logger.info(
             "Filter passed for message from %s in channel '%s' — dispatching: %s",

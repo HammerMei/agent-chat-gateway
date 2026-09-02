@@ -127,6 +127,14 @@ class _RoomSubscription(ReplayWindow):
     # stay in sync; the deque is used only for eviction ordering.
     seen_ids: collections.deque = field(default_factory=lambda: collections.deque())
     seen_ids_set: set = field(default_factory=set)
+    # Ids of the frames a creation episode handed back through the queue while a
+    # live message may already have advanced the watermark past them. If such a
+    # frame is then rejected as "already processed", it needs a replay and gets
+    # a boundary claimed for it AT THAT MOMENT — not pre-emptively at creation.
+    # The pre-emptive claim was never discharged when the frames were accepted
+    # (the ordinary case), so shutdown persisted a boundary at the room's
+    # creation and every restart replayed, and re-answered, everything since.
+    promised_ids: set = field(default_factory=set)
 
     def left_the_room(self) -> None:
         """Record that this account is no longer a member. Three things, one call.
@@ -1354,12 +1362,15 @@ class RocketChatConnector(Connector):
                 # recovery must come back for it. Delivery below is still
                 # attempted first — the claim is what makes the case where it
                 # is filtered a *deferral* rather than a loss.
-                oldest = min(
-                    (extract_ts(d) for d, _ in frames if extract_ts(d)),
-                    default="",
-                )
-                if oldest:
-                    sub.claim_boundary(sub.last_processed_ts, _just_before(oldest))
+                # PROMISED, not claimed — same reasoning and the same measured
+                # defect as Mattermost's creation path: a boundary claimed here
+                # was never discharged when the frames were accepted, so shutdown
+                # persisted a boundary at the room's creation and every restart
+                # replayed, and re-answered, everything since. The ids are
+                # remembered; the boundary is claimed only if the filter later
+                # rejects one of them as already processed (`_on_raw_ddp_message`).
+                sub.promised_ids.update(
+                    d.get("_id", "") for d, _ in frames if d.get("_id"))
                 for pending_doc, pending_access in frames:
                     self._ws.deliver_to_room(room_id, pending_doc, pending_access)
             elif frames:
@@ -2213,6 +2224,7 @@ class RocketChatConnector(Connector):
 
         msg_id = doc.get("_id", "")
         if msg_id and msg_id in sub.seen_ids_set:
+            sub.promised_ids.discard(msg_id)   # its live copy was processed
             logger.debug("Skipping already-seen message _id=%s in room %s", msg_id, room_id)
             return True
 
@@ -2247,10 +2259,25 @@ class RocketChatConnector(Connector):
             else 0
         )
         if not result.accepted:
+            if msg_id in sub.promised_ids:
+                sub.promised_ids.discard(msg_id)
+                if result.reason.startswith("already processed"):
+                    # A handed-back frame that a live message overtook during
+                    # the creation episode: never processed, now read as old.
+                    # Forget its id and claim a boundary below it, as a
+                    # hand-back does, so the next replay recovers it.
+                    sub.forget(msg_id)
+                    sub.claim_boundary(sub.last_processed_ts, _just_before(extract_ts(doc)))
+                    logger.info(
+                        "Room %s: handed-back frame %s fell below the watermark — "
+                        "boundary claimed so the next replay recovers it",
+                        room_id[:8], msg_id,
+                    )
             logger.debug(
                 "Message filtered: %s (sender=%s)", result.reason, result.sender
             )
             return True
+        sub.promised_ids.discard(msg_id)   # accepted: the promise is kept
 
         logger.info(
             "Filter passed for message from %s in room '%s' — dispatching: %s",
