@@ -1775,7 +1775,7 @@ on-disk records persist, and boot then eagerly starts every room ever seen.
   `expire`, at the cost of that room's conversational continuity.
 - **`list` output becomes dynamic.** There is no longer a static set of
   watchers derivable from `config.yaml`; the answer to "what is being
-  watched" is runtime state, so tooling must query the daemon. `acg list`
+  watched" is runtime state, so tooling must query the daemon. `agent-chat-gateway list`
   defaults to **active + paused + failed** — what an operator is about to act
   on — with `--all`, `--active`, `--idle`, `--paused` and `--failed` for the
   rest. Idle is excluded by default because with membership-event registration
@@ -2218,8 +2218,8 @@ one upgrade.
 **The procedure**, which belongs in the migration guide:
 
 ```
-1. acg list                      # record what exists, and what is paused
-2. acg schedule list             # record scheduled jobs
+1. agent-chat-gateway list                      # record what exists, and what is paused
+2. agent-chat-gateway schedule list             # record scheduled jobs
 3. stop the gateway
 4. rewrite config.yaml as rules (§5.4) — see "not a 1:1 rewrite" below
       – drop any `session_id:`; it no longer exists (§2.4)
@@ -2323,7 +2323,7 @@ path that would need maintaining and testing indefinitely.
 > **Amended at implementation (`impl/config-tooling`, 2026-08-18):** the
 > Rules tab shipped as specified below. The **Sessions tab is deferred** by
 > owner decision — the config tool operates on `config.yaml` only and never
-> talks to the control socket; runtime observability stays in `acg list`,
+> talks to the control socket; runtime observability stays in `agent-chat-gateway list`,
 > and the session verbs (`pause`/`resume`/`reset`/`expire`) stay CLI-only
 > permanently. Of the four display states, only the two that concern the
 > config side remain applicable (valid config → Rules; unparseable → the

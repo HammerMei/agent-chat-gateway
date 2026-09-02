@@ -339,7 +339,7 @@ class GatewayConfig:
         # every FALSY non-list through: a bare `watchers:` (explicit null,
         # the natural way to empty the block) then reached `enumerate(None)`
         # and raised a raw TypeError, so the daemon failed to start and
-        # `acg config validate` crashed instead of reporting — on a config an
+        # `agent-chat-gateway config validate` crashed instead of reporting — on a config an
         # operator writes by deleting their rules. `0`/`""` took the same
         # path and now get the clean message.
         if watchers_raw is None:
@@ -1332,7 +1332,7 @@ def _parse_rule_ttl(wc: Mapping, where: str, field_name: str) -> int | None:
 
 # Every key a rule entry may carry. Kept in step with $defs/watcherRule in
 # gateway/schema/config.schema.json by tests/unit/test_watcher_rule.py, because
-# `acg config validate` never runs the schema and would otherwise accept typos the
+# `agent-chat-gateway config validate` never runs the schema and would otherwise accept typos the
 # schema rejects.
 WATCHER_RULE_KEYS: frozenset[str] = frozenset({
     "description",
@@ -1404,7 +1404,7 @@ def _parse_one_watcher_rule(
     # also callable directly (the config tool calls
     # the static parser that way), so it is checked rather than asserted — an
     # assert would vanish under -O and leave a TypeError instead.
-    # The schema sets additionalProperties: false on a rule, but `acg config
+    # The schema sets additionalProperties: false on a rule, but `agent-chat-gateway config
     # validate` runs collect_config() rather than the JSON Schema, so a typo like
     # `session_expire_day: 30` would otherwise be silently ignored and the rule
     # would quietly have no expiry. Checked here so both paths agree; a test pins
@@ -1794,7 +1794,7 @@ def collect_config(path: str | Path) -> tuple["GatewayConfig | None", list[Confi
     config_dir = path.parent
     issues: list[ConfigIssue] = []
 
-    # Same check as from_file(), reported rather than raised: `acg config validate`
+    # Same check as from_file(), reported rather than raised: `agent-chat-gateway config validate`
     # and the config TUI both come through here, so an old `watchers:` block has
     # to be named on THIS path or it reads as a clean config with no rules.
     unknown_top = unknown_top_level_keys(raw)

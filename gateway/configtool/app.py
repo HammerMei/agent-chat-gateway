@@ -109,7 +109,7 @@ class ConfigToolApp(App):
     # ── Shared, non-action helpers (called from OverviewScreen's actions) ───
 
     def run_validate(self) -> ValidationResult:
-        """Run the exact same check `acg config validate` uses — single
+        """Run the exact same check `agent-chat-gateway config validate` uses — single
         source of truth for what "valid" means, per docs/design/config-tool.md."""
         return validate_config(self.config_path, lint=self.lint)
 

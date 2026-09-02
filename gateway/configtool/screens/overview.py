@@ -22,7 +22,7 @@ which is why this is the one tab NOT sorted by name, and why '['/']' move
 the rule under the cursor up/down (persisted immediately, like every other
 direct list mutation here). The runtime side — which sessions each rule has
 actually materialized — is deliberately NOT shown here: the config tool
-operates on config.yaml only (owner decision 2026-08-18); `acg list` is the
+operates on config.yaml only (owner decision 2026-08-18); `agent-chat-gateway list` is the
 runtime view.
 
 The Templates tab (v0.3 redesign) replaced the old Defaults tab (a fixed,

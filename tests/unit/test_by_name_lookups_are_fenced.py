@@ -58,7 +58,7 @@ ALLOWED = {
     ("core/session_manager.py", "SessionManager.get_processor"):
         "thin delegator for the operator boundary (control.py)",
     ("core/session_manager.py", "SessionManager.expire_watcher"):
-        "an operator verb: `acg expire <name>` — the human typed the name",
+        "an operator verb: `agent-chat-gateway expire <name>` — the human typed the name",
     ("core/scheduler.py", "JobScheduler._resolve_target"):
         "the scheduler's single resolution seam; calls resolve_handle once per fire",
 }

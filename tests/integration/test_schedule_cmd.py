@@ -1609,7 +1609,7 @@ class TestScheduleSubcommandRouting(unittest.TestCase):
     """Verify that 'schedule' with no subcommand exits 1 and shows usage."""
 
     def test_schedule_no_subcommand_exits_1(self):
-        """acg schedule with no subcommand → usage message + exit 1."""
+        """agent-chat-gateway schedule with no subcommand → usage message + exit 1."""
         main = _import_main()
         stdout_buf = io.StringIO()
         stderr_buf = io.StringIO()

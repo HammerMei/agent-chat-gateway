@@ -13,7 +13,7 @@ auto-migration for any config still using `.env` — see decision 6's
 tool-list/preset editor is not yet built. Phase 3 is designed below but not
 yet started. The
 v0.2 format simplification (`connector_defaults`/`agent_defaults`/
-`watcher_defaults`, `tool_presets`, watcher `rooms:`) plus `acg config
+`watcher_defaults`, `tool_presets`, watcher `rooms:`) plus `agent-chat-gateway config
 validate` and the JSON Schema (see `docs/migration-0.2.md`) are prerequisites
 and have landed. A `description:` field (free-text, informational-only,
 ignored at runtime) was added to connectors/agents/watchers/`*_defaults`
@@ -46,7 +46,7 @@ below).
 > - The **Sessions tab** of dynamic-watcher-design §5.5 is deferred (owner
 >   decision 2026-08-18): the config tool operates on `config.yaml` only —
 >   it never talks to the control socket; runtime observability and the
->   pause/resume/reset/expire verbs stay in the CLI (`acg list` etc.).
+>   pause/resume/reset/expire verbs stay in the CLI (`agent-chat-gateway list` etc.).
 >
 > The Phase 3 sections below are kept as the design record of the static-era
 > tool; where they contradict this block, this block wins.
@@ -92,7 +92,7 @@ usable when ACG runs on a remote server reached over SSH, which is the
 common deployment shape for this project.
 
 **Rejected as the primary interface: plain CLI subcommands**
-(`acg config add-connector`, etc.). These don't give an overview of what's
+(`agent-chat-gateway config add-connector`, etc.). These don't give an overview of what's
 already configured, and a growing flag surface per subcommand doesn't
 converge into "one tool."
 

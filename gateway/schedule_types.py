@@ -18,7 +18,7 @@ class JobStatus(str, Enum):
     """Lifecycle status of a scheduled job.
 
     ACTIVE    — scheduler fires this job on schedule.
-    PAUSED    — user explicitly paused via ``acg schedule pause``; scheduler skips it.
+    PAUSED    — user explicitly paused via ``agent-chat-gateway schedule pause``; scheduler skips it.
     COMPLETED — all runs exhausted (``run_count >= times > 0``); pending TTL purge.
                 Forever jobs (``times == 0``) never transition to COMPLETED automatically.
     """

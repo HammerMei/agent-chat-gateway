@@ -19,7 +19,7 @@ keys are: ... 'watcher_rules', 'watcher_templates'.
 
 Renaming the key is not the whole job, though — the entries under it changed
 shape as well, and a leftover `room:` inside one is reported the same way
-(`unknown key(s) 'room'`, with `rooms` in the list of valid keys). `acg config
+(`unknown key(s) 'room'`, with `rooms` in the list of valid keys). `agent-chat-gateway config
 validate` reports every entry that needs rewriting in one pass.
 
 **This is not a 1:1 rename.** Read *What changes underneath* before editing —
@@ -86,7 +86,7 @@ Field notes:
   a DM has no room name for a pattern to match. `direct: true` claims 1:1
   DMs (the connector's `owners`/`guests` lists still gate who can talk);
   `group_direct: true` claims multi-party DMs, where mentions are required.
-- Rules match top-down; the first rule that claims a room wins. `acg config
+- Rules match top-down; the first rule that claims a room wins. `agent-chat-gateway config
   validate` warns about rules an earlier rule shadows completely.
 - `session_id:` was removed separately and stays removed. To carry context
   into a new session, have the agent summarise the session to a file and list
@@ -109,7 +109,7 @@ Field notes:
    gateway was down across the upgrade boundary are not replayed.
 3. **Scheduled jobs name watchers.** Jobs targeting old static watcher names
    point at nothing after the prune — recreate them against the new derived
-   names (`acg list` shows them once the rooms have spoken).
+   names (`agent-chat-gateway list` shows them once the rooms have spoken).
 4. **A paused room becomes active** unless re-expressed. Pause acts on a
    record, and the static record is pruned. To keep the bot out of a room
    durably, put the room in the rule's `rooms.except_for:` — declarative, and
@@ -130,7 +130,7 @@ Field notes:
    and connector came first in the file, which is a binding nobody wrote down,
    and reordering those blocks silently re-pointed rules that relied on it.
 3. Rewrite each entry under it as a rule (above).
-4. `acg config validate` — fix every error; read the shadowing warnings.
+4. `agent-chat-gateway config validate` — fix every error; read the shadowing warnings.
 5. If any old session's content matters, export it via a summary file first.
 6. Restart the gateway. Expect one `Pruning static-era watcher record`
    log line per old record — that is the clean break, not a fault.
@@ -155,7 +155,7 @@ not exist there — each watcher reads `failed`, loudly, until it expires.
 When you migrate servers, do one of:
 
 - **rename the connector** — the old `state.<name>.json` is then reported by
-  `acg config validate` as belonging to no configured connector, and you can
+  `agent-chat-gateway config validate` as belonging to no configured connector, and you can
   delete it deliberately; or
 - **delete the state file** for that connector before the first start against
   the new server.

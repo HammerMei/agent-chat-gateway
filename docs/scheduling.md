@@ -309,7 +309,7 @@ room: under one account per agent that would run the job as a different agent,
 with that agent's tools and account. Restore the connector under its old name
 before the next slot and the job fires as before.
 
-`acg expire` does **not** cancel them. It clears a session and reclaims a
+`agent-chat-gateway expire` does **not** cancel them. It clears a session and reclaims a
 record; it does not stop a rule watching the room (that is a rules edit, or
 removing the bot). So the room is still there, the job still records its id, and
 the job brings the watcher back on its next run.

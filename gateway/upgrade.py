@@ -635,7 +635,7 @@ def _restart_daemon_in_fresh_interpreter() -> int:
     inherits every module this process has already imported — which is the
     PRE-upgrade release, because the CLI imports `.daemon` → `.service` → the
     whole runtime before `run_upgrade` ever runs. `git pull` changed the files
-    on disk; nothing re-imported them. So `acg upgrade` used to report success
+    on disk; nothing re-imported them. So `agent-chat-gateway upgrade` used to report success
     and restart a daemon running the old code, and it stayed old until someone
     happened to `stop`/`start` by hand. Measured on a live deployment: two
     consecutive upgrades, both restarted daemons whose command line still read

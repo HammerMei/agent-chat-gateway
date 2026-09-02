@@ -505,7 +505,7 @@ watcher_rules:
 
 Each created watcher is named `<connector>:<room>` — that derived name is
 what `list` shows and what `pause`/`resume`/`reset`/`expire` act on. Rules
-match top-down; the first rule that claims a room wins, and `acg config
+match top-down; the first rule that claims a room wins, and `agent-chat-gateway config
 validate` warns when an earlier rule shadows a later one completely.
 
 A quiet room is dropped after `session_idle_days` (default 15 — the session

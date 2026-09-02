@@ -191,7 +191,7 @@ class WatcherLifecycle:
           has no owner left: config.yaml cannot name it and no rule will
           recreate it. Pruned, with a log line each — per the clean-break
           migration ruling, and warned about ahead of time by
-          `acg config validate`'s orphan check. Both fields, not one (Codex
+          `agent-chat-gateway config validate`'s orphan check. Both fields, not one (Codex
           round 22): the static path never wrote a materialized config, so a
           record whose `rule_name` alone was hand-damaged still carries
           everything sticky recreation needs — one corrupted attribution

@@ -150,7 +150,7 @@ message — see [docs/user-guide.md](user-guide.md) for how matching works.
   sticky-bound to the settings it was created with — keep running with the
   *old* rule's settings; edits to the renamed rule never reach them. Idle
   ones age out through their (frozen) TTLs; to move a busy room onto the
-  new rule now, `acg expire` it — the next message in that room then
+  new rule now, `agent-chat-gateway expire` it — the next message in that room then
   rematches against the current rules and builds a fresh watcher. (`acg
   reset` is *not* the lever here: it clears the session but rebuilds the
   watcher from the same persisted record, so the room stays on the old
@@ -165,10 +165,10 @@ message — see [docs/user-guide.md](user-guide.md) for how matching works.
   alive — so a job firing more often than `session_idle_days` (15) runs
   indefinitely, while still listing as active. Only a job whose interval exceeds
   that lets the room go idle and then expire, and stop. To stop one now, remove
-  the job with `acg schedule delete <job_id>`, or expire the watcher. See
+  the job with `agent-chat-gateway schedule delete <job_id>`, or expire the watcher. See
   `docs/scheduling.md` for the full rules.
 - This tab edits `config.yaml` only. To see or act on the *live* sessions a
-  rule has created, use the CLI: `acg list`, `acg pause/resume/reset/expire`.
+  rule has created, use the CLI: `agent-chat-gateway list`, `agent-chat-gateway pause/resume/reset/expire`.
 - Known limitation: while some rule in the file is broken (its row shows
   ERROR), moving or deleting any row *above* it is refused, quoting that
   broken rule's own error — a broken rule's error message is
