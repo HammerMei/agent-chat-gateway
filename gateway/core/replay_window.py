@@ -16,9 +16,10 @@ make the connectors behave alike. Everything platform-specific stays with the pl
   removal, because under subscribe-all the stream keeps delivering a channel the account
   has been removed from. Mattermost's *live* delivery tracks membership at the server
   (§6.2), so it needs no live gate — but that says nothing about its replay, which is a
-  REST fetch and is not membership-gated on either platform. Mattermost has no equivalent
-  guard today; that is a gap, not a property, and it is recorded as such rather than
-  excused here.
+  REST fetch the bot's token can still make against a public channel it has left.
+  Mattermost therefore revalidates membership by id (`_resolved_channel`) at the top of
+  `replay_room_since`, before a single replayed post is dispatched; a channel that is no
+  longer the account's is skipped and marked for the membership reconciliation to reclaim.
 * **Why an outage window is captured at all.** Rocket.Chat resubscribes rooms one at a
   time, so a room that is live again while others are still confirming moves its watermark
   past the whole gap — that is what `_snapshot_replay_boundaries` exists for. Mattermost
@@ -142,8 +143,8 @@ class ReplayWindow:
         Distinct from `discharge_boundary`: that one reports a window as *read*, this one
         says it should never be read. Rocket.Chat's membership removal is the only caller —
         a window that spans a removal would replay the interval the account was not a member
-        for. Mattermost has no caller because it has no membership signal to act on, not
-        because it cannot need one.
+        for. Mattermost has no caller: its removal check runs at the top of the replay
+        itself and returns before the window is read, so there is no window to discard.
         """
         self.replay_boundary = None
         self.boundary_claims = 0

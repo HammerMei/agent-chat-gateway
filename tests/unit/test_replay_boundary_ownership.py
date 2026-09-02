@@ -175,3 +175,39 @@ class TestEveryDischargeSiteIsGuarded(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestAMattermostReplayRevalidatesMembership(unittest.IsolatedAsyncioTestCase):
+    """A removal while the WebSocket was down produces no `user_removed` event, and
+    the bot's token can still read a public channel it has left — so a reconnect
+    replay dispatched a kicked channel's backlog into the old watcher. The gap
+    `core/replay_window.py` recorded; closed with the by-id lookup the connector
+    now has (Codex, PR #140 round 2)."""
+
+    async def test_a_channel_the_account_left_is_not_replayed(self):
+        c, state = _mm_connector([{"id": "p1", "create_at": 450, "message": "x"}])
+        c._resolved_channel = AsyncMock(return_value=None)   # the connector's final "not ours"
+
+        await c.replay_room_since("c1", after_ts="400")
+
+        c._on_posted_event.assert_not_awaited()
+        self.assertTrue(state.membership_lost, "marked for reconciliation to reclaim")
+
+    async def test_a_lookup_failure_is_unknown_not_a_removal(self):
+        """A network blip must not invent a kick: the replay proceeds as before."""
+        c, state = _mm_connector([{"id": "p1", "create_at": 450, "message": "x"}])
+        c._resolved_channel = AsyncMock(side_effect=OSError("network"))
+
+        await c.replay_room_since("c1", after_ts="400")
+
+        self.assertFalse(state.membership_lost)
+        c._on_posted_event.assert_awaited()
+
+    async def test_a_member_channel_replays_as_before(self):
+        c, state = _mm_connector([{"id": "p1", "create_at": 450, "message": "x"}])
+        c._resolved_channel = AsyncMock(return_value=("O", "eng", ()))
+
+        await c.replay_room_since("c1", after_ts="400")
+
+        c._on_posted_event.assert_awaited()
+

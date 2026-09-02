@@ -1080,6 +1080,23 @@ class TestCLIScheduleMigrateReporting(_CLITestBase):
         self.assertNotIn("STILL", stdout)
         self.assertNotIn("need attention", stdout)
 
+    def test_a_current_version_that_still_owed_work_shows_the_work(self):
+        """`needs_migration` also looks at the jobs, so a version-2 file with a
+        live job lacking a room id re-runs the 1→2 step at version 2. The CLI
+        keyed "nothing to do" on the versions matching and hid that run — steps,
+        outcomes, jobs needing attention — while the startup warning kept
+        firing (Codex, PR #140 round 2)."""
+        stdout, _, code = self._migrate(
+            from_version=2, to_version=2, stamped=False, changed=0,
+            steps=["1 → 2: record each job's room id"],
+            outcomes=[self._OUTCOME_STUCK])
+
+        self.assertEqual(code, 0)
+        self.assertNotIn("nothing to do", stdout)
+        self.assertIn("1 → 2", stdout)
+        self.assertIn("1 job(s) need attention", stdout)
+        self.assertIn("STILL at schema version 2", stdout)
+
     def test_an_already_current_file_says_so_without_a_job_list(self):
         stdout, _, code = self._migrate(
             from_version=2, to_version=2, stamped=True, changed=0, outcomes=[])

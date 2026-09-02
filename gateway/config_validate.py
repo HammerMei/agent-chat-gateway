@@ -609,7 +609,13 @@ def _lint_config(raw: dict, result: ValidationResult) -> None:
                     _AGENT_LINT_DEFAULTS, result,
                 )
 
-    for i, wc in enumerate(raw.get("watcher_rules") or []):
+    # The collector reports a non-list `watcher_rules:` as a structural error
+    # and returns a partial config; lint then still runs, and iterating the
+    # raw value here raised TypeError on `watcher_rules: 5` — a traceback in
+    # place of the error already collected (Codex, PR #140 round 2). Same
+    # list-type guard as `entry_count`.
+    raw_rules = raw.get("watcher_rules")
+    for i, wc in enumerate(raw_rules if isinstance(raw_rules, list) else []):
         if isinstance(wc, dict):
             name_hint = wc.get("name")
             label = name_hint if isinstance(name_hint, str) and name_hint else f"watchers[{i}]"

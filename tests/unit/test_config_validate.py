@@ -550,6 +550,30 @@ class TestValidateConfigStateOrphans(_ValidateConfigTestBase):
 
 
 class TestValidateConfigLint(_ValidateConfigTestBase):
+    def test_lint_survives_a_non_list_watcher_rules(self):
+        """`watcher_rules: 5` is a structural error the collector reports while
+        returning a partial config; lint then ran `enumerate()` over the raw
+        value and raised TypeError — a traceback in place of the collected
+        message, for both `config validate --lint` and the TUI (Codex, PR #140
+        round 2)."""
+        cfg = self._write("""\
+            connectors:
+              - name: rc
+                type: script
+            agents:
+              a:
+                type: claude
+                working_directory: /tmp
+            watcher_rules: 5
+            """)
+
+        result = self._validate(cfg, lint=True)   # must not raise
+
+        self.assertTrue(
+            any("watcher_rules" in e for e in result.errors),
+            f"the structural error must still be reported: {result.errors}",
+        )
+
     def test_lint_off_by_default(self):
         cfg = self._write(f"""\
             connectors:

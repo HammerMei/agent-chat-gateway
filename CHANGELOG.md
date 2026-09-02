@@ -149,6 +149,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Runtime session continuity across restarts is unaffected.
 
 ### Fixed
+- **Mattermost replay revalidates membership first.** A removal while the
+  WebSocket was down produced no `user_removed` event, and the bot's token can
+  still read a public channel it has left, so a reconnect replay delivered a
+  kicked channel's backlog to the old watcher. The replay now checks membership
+  by channel id before dispatching anything; a lookup failure is treated as
+  unknown and the replay proceeds, so a network blip cannot be mistaken for a
+  removal.
+- **OpenCode watchers reclaim their durable instructions on expiry.** The
+  adapter had no `reclaim_durable_instructions`, so every expired OpenCode
+  watcher left its `system-prompts/<key>.md` behind. The file is now removed,
+  as `ClaudeBackend` already did.
+- **`acg schedule migrate` no longer hides work done at an unchanged version.**
+  A version-2 jobs file with a live job lacking a room id re-runs the 1→2 step;
+  the CLI keyed "nothing to do" on the versions matching and hid the steps,
+  outcomes and jobs needing attention. It now says "nothing to do" only when
+  the run recorded nothing.
+- **`config validate --lint` on a non-list `watcher_rules:`** raised a
+  TypeError in place of the collected structural error.
+- **The config TUI's delete-rule warning counts jobs by room, not only by
+  handle**, so a job whose watcher was renamed is still counted.
 - **A restart no longer re-delivers messages the agent already answered** in
   rooms whose watcher was created since the previous start. The creation path
   claimed a replay boundary below the frames it handed back — a promise to

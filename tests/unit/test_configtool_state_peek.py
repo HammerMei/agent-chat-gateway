@@ -134,3 +134,48 @@ class TestStrandedByRule(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestJobsAreCountedByRoomAsWellAsByHandle(unittest.TestCase):
+    """A job created against a room keeps that room's id; the watcher's HANDLE
+    can change (rename, then expire and recreate) while the job's `watcher`
+    field keeps the old spelling. Counting by handle alone then reported zero
+    jobs for a rule whose rooms still had jobs firing — and the delete warning
+    said so to the operator (Codex, PR #140 round 2)."""
+
+    def _files(self, tmp: Path, *, record_name: str, job_watcher: str):
+        state = tmp / "state.rc.json"
+        state.write_text(json.dumps({"watchers": [{
+            "watcher_name": record_name, "rule_name": "eng", "connector": "rc",
+            "room_id": "R-1", "session_id": "s",
+        }]}))
+        jobs = tmp / "jobs.json"
+        jobs.write_text(json.dumps({"version": 2, "jobs": [{
+            "id": "acg-1", "watcher": job_watcher, "connector": "rc", "room_id": "R-1",
+            "status": "active", "message": "m", "cron": "* * * * *",
+        }]}))
+        return [state], jobs
+
+    def test_a_stale_handle_still_counts_when_the_room_matches(self):
+        from gateway.configtool.state_peek import stranded_by_rule
+
+        tmp = Path(tempfile.mkdtemp())
+        paths, jobs = self._files(tmp, record_name="rc:eng-renamed", job_watcher="rc:eng")
+
+        records, counted = stranded_by_rule("eng", state_paths=paths, jobs_file=jobs)
+
+        self.assertEqual((records, counted), (1, 1))
+
+    def test_a_job_for_another_room_on_the_same_connector_is_not_counted(self):
+        from gateway.configtool.state_peek import stranded_by_rule
+
+        tmp = Path(tempfile.mkdtemp())
+        paths, jobs = self._files(tmp, record_name="rc:eng", job_watcher="rc:ops")
+        data = json.loads(jobs.read_text())
+        data["jobs"][0]["room_id"] = "R-other"
+        jobs.write_text(json.dumps(data))
+
+        _, counted = stranded_by_rule("eng", state_paths=paths, jobs_file=jobs)
+
+        self.assertEqual(counted, 0)
+

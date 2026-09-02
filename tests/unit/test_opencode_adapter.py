@@ -3101,3 +3101,42 @@ class TestOpenCodeBackendTypicalSessionRetentionDays(unittest.TestCase):
     def test_returns_none(self):
         backend = _make_backend()
         self.assertIsNone(backend.typical_session_retention_days())
+
+
+class TestDurableInstructionsAreReclaimedOnExpiry(unittest.IsolatedAsyncioTestCase):
+    """`ensure_durable_instructions` writes `RUNTIME_DIR/system-prompts/<key>.md`;
+    expiry calls `reclaim_durable_instructions` to remove it. OpenCode had no
+    override, so the base no-op ran and every expired OpenCode watcher left its
+    prompt file — identity and context included — behind for good (Codex, PR
+    #140 round 2). Mirrors `ClaudeBackend`: same directory, same containment
+    check, idempotent."""
+
+    async def test_the_file_is_removed_and_a_second_call_is_fine(self):
+        import tempfile
+        from pathlib import Path
+        from unittest.mock import patch
+
+        import gateway.agents.opencode.adapter as mod
+
+        runtime = Path(tempfile.mkdtemp())
+        (runtime / "system-prompts").mkdir()
+        (runtime / "system-prompts" / "abc123.md").write_text("durable")
+
+        with patch.object(mod, "RUNTIME_DIR", runtime):
+            await _make_backend().reclaim_durable_instructions("abc123")
+            self.assertFalse((runtime / "system-prompts" / "abc123.md").exists())
+            await _make_backend().reclaim_durable_instructions("abc123")   # idempotent
+
+    async def test_a_key_that_escapes_the_directory_is_refused(self):
+        import tempfile
+        from pathlib import Path
+        from unittest.mock import patch
+
+        import gateway.agents.opencode.adapter as mod
+
+        runtime = Path(tempfile.mkdtemp())
+        (runtime / "system-prompts").mkdir()
+        with patch.object(mod, "RUNTIME_DIR", runtime):
+            with self.assertRaises(Exception):
+                await _make_backend().reclaim_durable_instructions("../escape")
+

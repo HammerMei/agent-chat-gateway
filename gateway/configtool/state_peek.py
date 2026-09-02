@@ -42,6 +42,11 @@ def stranded_by_rule(
     developer's actual runtime directory.
     """
     watcher_names: set[str] = set()
+    # The stable identity beside the handle: a job created against a room keeps
+    # that room's id even after a rename + expire + recreate has given the
+    # watcher a new handle, so counting by handle alone read zero jobs for a
+    # rule whose rooms still had jobs firing (Codex, PR #140 round 2).
+    room_keys: set[tuple[str, str]] = set()
     records = 0
     if state_paths is None:
         # The enumeration itself can raise (state_files() ->
@@ -60,9 +65,12 @@ def stranded_by_rule(
                 name = record.get("watcher_name")
                 if isinstance(name, str) and name:
                     watcher_names.add(name)
+                connector, room_id = record.get("connector"), record.get("room_id")
+                if isinstance(connector, str) and isinstance(room_id, str) and room_id:
+                    room_keys.add((connector, room_id))
 
     jobs = 0
-    if watcher_names:
+    if watcher_names or room_keys:
         for job in _read_list(jobs_file, "jobs"):
             # A COMPLETED job no longer fires — it sits in jobs.json only
             # until the TTL purge (JobStore.list_jobs excludes them by
@@ -80,7 +88,11 @@ def stranded_by_rule(
             # best-effort contract stated above (Codex review of #129,
             # round 10).
             watcher = job.get("watcher")
-            if isinstance(watcher, str) and watcher in watcher_names:
+            by_handle = isinstance(watcher, str) and watcher in watcher_names
+            connector, room_id = job.get("connector"), job.get("room_id")
+            by_room = (isinstance(connector, str) and isinstance(room_id, str)
+                       and (connector, room_id) in room_keys)
+            if by_handle or by_room:
                 jobs += 1
     return records, jobs
 

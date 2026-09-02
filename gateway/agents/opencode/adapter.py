@@ -795,6 +795,20 @@ class OpenCodeBackend(AgentBackend):
         logger.info("Created opencode session: %s", session_id[:16])
         return session_id
 
+    async def reclaim_durable_instructions(self, path_key: str) -> None:
+        """Remove the per-watcher file `ensure_durable_instructions` wrote.
+
+        Expiry's half of that contract (§2.5), mirroring `ClaudeBackend`: same
+        directory, same `resolve_under` containment check — the key is built
+        from connector data and is validated on the way out as on the way in.
+        Idempotent: a missing file is success. Without this override the base
+        no-op ran, and every expired OpenCode watcher left its prompt file —
+        identity and context included — under `system-prompts` for good
+        (Codex, PR #140 round 2).
+        """
+        path = resolve_under(RUNTIME_DIR / "system-prompts", f"{path_key}.md")
+        await asyncio.to_thread(path.unlink, missing_ok=True)
+
     async def ensure_durable_instructions(
         self,
         session_id: str,

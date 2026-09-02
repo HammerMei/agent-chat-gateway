@@ -970,7 +970,13 @@ def _run_schedule_migrate(args) -> None:
         print(f"Error: {result.get('error')}", file=sys.stderr)
         sys.exit(1)
 
-    if result["from_version"] == result["to_version"]:
+    # "Nothing to do" means no STEP ran — not that the versions match. A file
+    # already at the current version can still owe work: `needs_migration`
+    # also looks at the jobs, and a live job with no room id re-runs the 1→2
+    # step at version 2. Keying this on the version alone hid that run's
+    # outcomes — including jobs needing attention — behind "nothing to do",
+    # while the startup warning kept firing (Codex, PR #140 round 2).
+    if not result.get("steps") and not result.get("outcomes"):
         print(f"jobs.json is already at schema version {result['to_version']} "
               f"— nothing to do.")
         return

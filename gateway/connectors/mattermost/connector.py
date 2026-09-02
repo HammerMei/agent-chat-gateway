@@ -333,6 +333,33 @@ class MattermostConnector(Connector):
         # dispatch the OLD era's fetched posts into the re-added room. The
         # loop below re-checks this value before every dispatch.
         entry_gen = self._membership_gen.get(channel_id, 0)
+        # Membership, revalidated before a single replayed post is dispatched.
+        # A removal that happened while the WebSocket was down produced no
+        # `user_removed` event, so `_membership_gen` never moved — and the
+        # bot's token can still READ a public channel it has left (probed).
+        # Without this, an old tracked watcher processed a kicked channel's
+        # backlog on reconnect. `None` is the connector's own final answer
+        # ("not ours any more"); a transport failure raises out of
+        # `_resolved_channel` and is treated as UNKNOWN — the replay proceeds
+        # as before, rather than inventing a removal from a network blip
+        # (Codex, PR #140 round 2; the gap `core/replay_window.py` records).
+        try:
+            still_member = await self._resolved_channel(channel_id) is not None
+        except Exception as exc:
+            logger.warning(
+                "Channel %s: could not confirm membership before replay (%s) — "
+                "proceeding; a confirmed removal is reconciliation's to act on",
+                channel_id, exc,
+            )
+            still_member = True
+        if not still_member:
+            state.membership_lost = True
+            logger.warning(
+                "Channel %s: this account is no longer a member — skipping the "
+                "replay; the membership reconciliation reclaims the watcher",
+                channel_id,
+            )
+            return
         # An explicitly named window (startup, post-park) is not this channel's
         # boundary to spend — same rule, same reason, as Rocket.Chat's.
         external_window = after_ts is not None
