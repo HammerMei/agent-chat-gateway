@@ -1661,3 +1661,48 @@ class TestNoFirePathWriteRevertsAMigration(unittest.IsolatedAsyncioTestCase):
                          "the failure branch wrote the pre-await copy back whole")
         self.assertEqual(store.get(job.id).run_count, 0, "a failed finite fire consumes no run")
 
+
+class TestAJobWhoseConnectorIsGoneIsCancelled(unittest.IsolatedAsyncioTestCase):
+    """Owner's rule (PR #140 round 4 follow-up): a job is never re-homed to
+    another account, and it is not left to fail at every slot either — when the
+    connector it names has left the config, the fire cancels it with the same
+    audit line a room removal writes."""
+
+    def _store_and_scheduler(self, managers, **job_kwargs):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        store = JobStore(jobs_file=Path(tmp.name) / "jobs.json")
+        store.load()
+        job = _make_job(next_run=(datetime.now(UTC) - timedelta(minutes=1)).isoformat(),
+                        **job_kwargs)
+        store.add(job)
+        return store, JobScheduler(store=store, session_managers=managers,
+                                   completed_job_ttl_days=7), job
+
+    async def test_a_named_but_unconfigured_connector_cancels_the_job(self):
+        survivor = _make_sm_mock(room_id="R-shared")
+        store, scheduler, job = self._store_and_scheduler(
+            {"bob": survivor}, connector="retired", room_id="R-shared")
+
+        with self.assertLogs("agent-chat-gateway.core.scheduler", "WARNING") as cm:
+            await scheduler._fire_due_jobs()
+
+        self.assertIsNone(store.get(job.id), "the job is removed, not left to fail")
+        survivor.inject_message.assert_not_awaited()
+        logged = "\n".join(cm.output)
+        self.assertIn("AUDIT: cancelled scheduled job", logged)
+        self.assertIn("connector 'retired'", logged)
+
+    async def test_a_job_that_names_no_connector_is_not_cancelled_on_that_evidence(self):
+        """Pre-schema-2: unknown is not gone. Resolved by handle; here nobody
+        answers for it, so it is refused — and it is still in the store."""
+        sm = _make_sm_mock(room_id="R-1")
+        sm.resolve_handle = MagicMock(return_value="")
+        store, scheduler, job = self._store_and_scheduler(
+            {"rc-home": sm}, connector="", room_id="")
+
+        await scheduler._fire_due_jobs()
+
+        self.assertIsNotNone(store.get(job.id))
+        sm.inject_message.assert_not_awaited()
+

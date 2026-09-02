@@ -302,6 +302,13 @@ If the bot is **removed from a room**, that room's pending jobs are cancelled �
 removed from the store, with an audit log line each — because a job pointing at
 a room the bot cannot reach would fire at nothing forever.
 
+If a job's **connector is removed from `config.yaml`** (or renamed), the job is
+cancelled the same way at its next slot — removed from the store with an audit
+line. It is never handed to another connector that happens to serve the same
+room: under one account per agent that would run the job as a different agent,
+with that agent's tools and account. Restore the connector under its old name
+before the next slot and the job fires as before.
+
 `acg expire` does **not** cancel them. It clears a session and reclaims a
 record; it does not stop a rule watching the room (that is a rules edit, or
 removing the bot). So the room is still there, the job still records its id, and

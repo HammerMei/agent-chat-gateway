@@ -149,6 +149,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Runtime session continuity across restarts is unaffected.
 
 ### Fixed
+- **A scheduled job whose connector left the config is cancelled, not
+  re-homed.** The fire used to hand such a job to whichever remaining connector
+  held its room — under one account per agent, a different agent. It now
+  removes the job at its next slot with an audit line, the same way a room
+  removal does.
 - **Mattermost replay revalidates membership first.** A removal while the
   WebSocket was down produced no `user_removed` event, and the bot's token can
   still read a public channel it has left, so a reconnect replay delivered a

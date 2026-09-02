@@ -360,6 +360,21 @@ class JobScheduler:
             str(job.times) if job.times > 0 else "∞",
         )
 
+        if self._connector_is_gone(job):
+            # Owner's rule (PR #140): a job whose connector has left the config
+            # is not re-homed and not left to fail at every slot — it is
+            # cancelled, with the same audit line a room removal writes. The
+            # scheduler owns this because the fire is the moment the job is
+            # known to be undeliverable; nothing else touches it until then.
+            await asyncio.to_thread(self._store.remove, job.id)
+            logger.warning(
+                "AUDIT: cancelled scheduled job %s (watcher '%s', room %s, "
+                "connector '%s') — its connector is no longer configured, so "
+                "the job has no account to run under", job.id, job.watcher,
+                job.room_id, job.connector,
+            )
+            return
+
         target = self._resolve_target(job)
         success = await self._inject(job, target)
         if not success:
@@ -455,6 +470,15 @@ class JobScheduler:
 
         return job
 
+    def _connector_is_gone(self, job: ScheduledJob) -> bool:
+        """The job names a connector, and no configured connector has that name.
+
+        A job that names NO connector (written before schema 2, never migrated)
+        is unknown, not gone — it is resolved by its handle, and refused if that
+        fails, but not cancelled on that evidence.
+        """
+        return bool(job.connector) and job.connector not in self._session_managers
+
     def _resolve_target(self, job: ScheduledJob) -> "tuple[SessionManager, str] | None":
         """The manager and the ROOM this job fires into, resolved once per fire.
 
@@ -473,8 +497,9 @@ class JobScheduler:
         there would execute it with another agent's backend, tools and account
         while the fire logged success (Codex, PR #140 round 4; an earlier
         version inferred the owner when exactly one holder remained, which
-        refused only the two-holder case). Loud, None; the operator recreates
-        the job against a current watcher.
+        refused only the two-holder case). Loud, None. `_fire_once` cancels
+        such a job before it gets here (`_connector_is_gone`); this branch is
+        the refusal for any other caller.
 
         Room second. `job.room_id` when the job has one. A job written before
         schema 2 has only its handle, which `resolve_handle` turns into whatever

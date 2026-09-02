@@ -1619,7 +1619,8 @@ it is written here because stating it once is what stops the seventh occurrence:
 > A job is addressed by its `room_id`. The handle is consulted **only** when
 > `room_id` is empty — a job written before schema 2 — and **never** once an id
 > exists. The manager is `job.connector` and nothing else: a job whose connector
-> is not configured is refused however many connectors hold its room. Occupancy
+> is not configured is cancelled at its next slot, with an audit line, however
+> many connectors hold its room. Occupancy
 > is not ownership — under one-account-per-agent the sole remaining holder is by
 > construction a different agent, and running the job there would execute it with
 > that agent's backend, tools and account while the fire logged success.
