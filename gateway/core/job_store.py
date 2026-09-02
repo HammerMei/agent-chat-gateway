@@ -86,6 +86,15 @@ class JobStore:
         # handlers).  The lock is held only during dict operations, never during
         # disk I/O, to avoid blocking the event loop longer than necessary.
         self._lock = threading.Lock()
+        # Serialises whole saves — snapshot, version, write — against each
+        # other. `_lock` alone made the snapshot consistent but not the save: a
+        # fire's `to_thread` save could snapshot the jobs, lose the CPU while
+        # the migration wrote every `room_id` and stamped the version, then
+        # read the NEW version and replace the file with the OLD snapshot. The
+        # file then claimed a migration it did not contain (Codex, PR #140
+        # round 3; loud — the startup warning and `needs_migration` both read
+        # the jobs, not the stamp — but a "success" that has to be re-run).
+        self._save_lock = threading.Lock()
         # Assume current until a file says otherwise: no file means
         # nothing to migrate.
         self._file_version = _SCHEMA_VERSION
@@ -243,40 +252,41 @@ class JobStore:
         socket handler mutates ``_jobs`` concurrently on the event loop thread
         while the scheduler calls ``save()`` via ``asyncio.to_thread()``.
         """
-        with self._lock:
-            snapshot = [j.to_dict() for j in self._jobs.values()]
-        self._file.parent.mkdir(parents=True, exist_ok=True)
-        # `self._file_version`, NOT `_SCHEMA_VERSION`. An ordinary save — one per
-        # fire, one per `schedule pause` — would otherwise stamp an unmigrated
-        # file as current, and the operator would lose both the startup warning
-        # and the migration: `schedule migrate` would answer "nothing to do"
-        # while every job still had an empty `room_id`. `stamp_version()` is the
-        # only thing that moves this, and only after a migration has run.
-        # `min(...)`, not either one alone — both directions are wrong on their
-        # own, and both were verified:
-        #
-        # * `_SCHEMA_VERSION` stamps an UNMIGRATED file as current. One ordinary
-        #   fire then silences the startup warning and makes `schedule migrate`
-        #   answer "nothing to do" while every job has an empty `room_id`.
-        # * `self._file_version` stamps a NEWER file with its own version while
-        #   writing content this code shaped — `to_dict` has already dropped the
-        #   fields it does not know, so the file would claim a version whose
-        #   fields it no longer contains, and a future ACG would skip the
-        #   migrations that restore them.
-        #
-        # The floor is honest in both: never claim more than this code wrote, and
-        # never claim more than the file already earned.
-        data = {"version": min(self._file_version, _SCHEMA_VERSION), "jobs": snapshot}
-        # Include thread ident so concurrent save() calls from different
-        # asyncio.to_thread() workers don't clobber each other's temp file.
-        tmp = self._file.with_name(f"{self._file.name}.{os.getpid()}.{_thread_ident()}.tmp")
-        try:
-            tmp.write_text(json.dumps(data, indent=2))
-            tmp.replace(self._file)
-        except Exception:
-            tmp.unlink(missing_ok=True)
-            raise
-        logger.debug("Saved %d scheduled job(s) to %s", len(snapshot), self._file)
+        with self._save_lock:
+            with self._lock:
+                snapshot = [j.to_dict() for j in self._jobs.values()]
+            self._file.parent.mkdir(parents=True, exist_ok=True)
+            # `self._file_version`, NOT `_SCHEMA_VERSION`. An ordinary save — one per
+            # fire, one per `schedule pause` — would otherwise stamp an unmigrated
+            # file as current, and the operator would lose both the startup warning
+            # and the migration: `schedule migrate` would answer "nothing to do"
+            # while every job still had an empty `room_id`. `stamp_version()` is the
+            # only thing that moves this, and only after a migration has run.
+            # `min(...)`, not either one alone — both directions are wrong on their
+            # own, and both were verified:
+            #
+            # * `_SCHEMA_VERSION` stamps an UNMIGRATED file as current. One ordinary
+            #   fire then silences the startup warning and makes `schedule migrate`
+            #   answer "nothing to do" while every job has an empty `room_id`.
+            # * `self._file_version` stamps a NEWER file with its own version while
+            #   writing content this code shaped — `to_dict` has already dropped the
+            #   fields it does not know, so the file would claim a version whose
+            #   fields it no longer contains, and a future ACG would skip the
+            #   migrations that restore them.
+            #
+            # The floor is honest in both: never claim more than this code wrote, and
+            # never claim more than the file already earned.
+            data = {"version": min(self._file_version, _SCHEMA_VERSION), "jobs": snapshot}
+            # Include thread ident so concurrent save() calls from different
+            # asyncio.to_thread() workers don't clobber each other's temp file.
+            tmp = self._file.with_name(f"{self._file.name}.{os.getpid()}.{_thread_ident()}.tmp")
+            try:
+                tmp.write_text(json.dumps(data, indent=2))
+                tmp.replace(self._file)
+            except Exception:
+                tmp.unlink(missing_ok=True)
+                raise
+            logger.debug("Saved %d scheduled job(s) to %s", len(snapshot), self._file)
 
     # ── CRUD ──────────────────────────────────────────────────────────────────
 

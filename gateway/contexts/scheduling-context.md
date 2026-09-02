@@ -44,31 +44,31 @@ agent-chat-gateway schedule create <watcher> "<message>" [OPTIONS]
 
 ```bash
 # Remind the user in 5 minutes (one-shot relative reminder)
-agent-chat-gateway schedule create general-watcher "提醒：去喝水！" --every 5m --times 1
+agent-chat-gateway schedule create rc:general "提醒：去喝水！" --every 5m --times 1
 
 # Remind the user in 1 hour (one-shot)
-agent-chat-gateway schedule create general-watcher "Time to take a break!" --every 1h --times 1
+agent-chat-gateway schedule create rc:general "Time to take a break!" --every 1h --times 1
 
 # Run a daily standup check at 09:00, starting today
-agent-chat-gateway schedule create general-watcher "Run the daily standup summary" --every 1d --starting "09:00" --times 0
+agent-chat-gateway schedule create rc:general "Run the daily standup summary" --every 1d --starting "09:00" --times 0
 
 # Check CI status every hour, 24 times (one day)
-agent-chat-gateway schedule create ops-watcher "Check CI pipeline status" --every 1h --times 24
+agent-chat-gateway schedule create rc:ops "Check CI pipeline status" --every 1h --times 24
 
 # Weekly report every Monday at 10:00 AM
-agent-chat-gateway schedule create general-watcher "Generate the weekly report" --every 1w --starting "Mon 10:00" --times 0
+agent-chat-gateway schedule create rc:general "Generate the weekly report" --every 1w --starting "Mon 10:00" --times 0
 
 # One-time reminder at a specific date/time
-agent-chat-gateway schedule create general-watcher "Reminder: feature freeze today" --starting "2026-04-10 15:30"
+agent-chat-gateway schedule create rc:general "Reminder: feature freeze today" --starting "2026-04-10 15:30"
 
 # Monitor every 30 minutes, forever (no --tz needed for sub-hourly jobs)
-agent-chat-gateway schedule create ops-watcher "Check server health" --every 30m --times 0
+agent-chat-gateway schedule create rc:ops "Check server health" --every 30m --times 0
 
 # Daily standup at 09:00 in a specific timezone — use --tz here
-agent-chat-gateway schedule create general-watcher "Run daily standup" --every 1d --starting "09:00" --tz "America/New_York"
+agent-chat-gateway schedule create rc:general "Run daily standup" --every 1d --starting "09:00" --tz "America/New_York"
 
 # Start firing every minute, 5 times, beginning at 14:00 today
-agent-chat-gateway schedule create general-watcher "Pulse check" --every 1m --times 5 --starting "14:00"
+agent-chat-gateway schedule create rc:general "Pulse check" --every 1m --times 5 --starting "14:00"
 ```
 
 ## List scheduled tasks

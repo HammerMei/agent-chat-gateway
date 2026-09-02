@@ -24,7 +24,7 @@ No configuration is required. ACG automatically injects scheduling context into 
 > **You:** Remind me to review the deployment logs in 15 minutes.
 >
 > **Agent:** Sure! I'll set a reminder for 15 minutes from now.
-> *(runs: `agent-chat-gateway schedule create general-watcher "Reminder: review the deployment logs" --every 15m --times 1`)*
+> *(runs: `agent-chat-gateway schedule create rc:general "Reminder: review the deployment logs" --every 15m --times 1`)*
 >
 > **Agent:** Done — you'll get a reminder in 15 minutes. Job ID: `acg-3a7f1c90`.
 
@@ -80,25 +80,25 @@ If the resolved time is already in the past, ACG prints a warning and automatica
 
 ```bash
 # One-shot reminder in 5 minutes
-agent-chat-gateway schedule create general-watcher "Reminder: check the oven" --every 5m --times 1
+agent-chat-gateway schedule create rc:general "Reminder: check the oven" --every 5m --times 1
 
 # Daily standup at 09:00 every day
-agent-chat-gateway schedule create general-watcher "Run the daily standup" --every 1d --starting "09:00" --tz "Asia/Taipei"
+agent-chat-gateway schedule create rc:general "Run the daily standup" --every 1d --starting "09:00" --tz "Asia/Taipei"
 
 # Weekly report every Friday — infer "this Friday" automatically
-agent-chat-gateway schedule create ops-watcher "Generate weekly ops summary" --every 1w --starting "Fri 17:00" --tz "America/New_York"
+agent-chat-gateway schedule create rc:ops "Generate weekly ops summary" --every 1w --starting "Fri 17:00" --tz "America/New_York"
 
 # One-shot at a specific datetime
-agent-chat-gateway schedule create general-watcher "Review Q2 roadmap" --starting "2026-04-10 15:30" --tz "Asia/Taipei"
+agent-chat-gateway schedule create rc:general "Review Q2 roadmap" --starting "2026-04-10 15:30" --tz "Asia/Taipei"
 
 # Health check every 30 minutes, forever
-agent-chat-gateway schedule create ops-watcher "Check server health and report status" --every 30m
+agent-chat-gateway schedule create rc:ops "Check server health and report status" --every 30m
 
 # Run exactly 3 times, every hour
-agent-chat-gateway schedule create general-watcher "Hourly check-in" --every 1h --times 3
+agent-chat-gateway schedule create rc:general "Hourly check-in" --every 1h --times 3
 
 # Start firing every minute, 5 times, beginning at 14:00
-agent-chat-gateway schedule create general-watcher "Pulse check" --every 1m --times 5 --starting "14:00"
+agent-chat-gateway schedule create rc:general "Pulse check" --every 1m --times 5 --starting "14:00"
 ```
 
 ---
@@ -110,7 +110,7 @@ agent-chat-gateway schedule create general-watcher "Pulse check" --every 1m --ti
 Use `--every` with `--times 1`. This fires once after the interval and then marks the job completed.
 
 ```bash
-agent-chat-gateway schedule create general-watcher "Reminder: stand up and stretch" --every 15m --times 1
+agent-chat-gateway schedule create rc:general "Reminder: stand up and stretch" --every 15m --times 1
 ```
 
 Or ask the agent directly:
@@ -119,21 +119,21 @@ Or ask the agent directly:
 ### Daily recurring task at a fixed time
 
 ```bash
-agent-chat-gateway schedule create general-watcher "Good morning! Summarize yesterday's GitHub activity." \
+agent-chat-gateway schedule create rc:general "Good morning! Summarize yesterday's GitHub activity." \
   --every 1d --starting "09:00" --tz "Asia/Taipei"
 ```
 
 ### Weekly report
 
 ```bash
-agent-chat-gateway schedule create ops-watcher "Generate weekly infrastructure cost report and post summary." \
+agent-chat-gateway schedule create rc:ops "Generate weekly infrastructure cost report and post summary." \
   --every 1w --starting "Fri 16:00" --tz "America/New_York"
 ```
 
 ### One-shot at a specific future datetime
 
 ```bash
-agent-chat-gateway schedule create general-watcher "It's launch day — post the release announcement." \
+agent-chat-gateway schedule create rc:general "It's launch day — post the release announcement." \
   --starting "2026-04-15 10:00" --tz "Europe/Berlin"
 ```
 
@@ -200,9 +200,9 @@ Output:
 
 ```
 ID              WATCHER               STATUS      CRON              RUNS          NEXT RUN (UTC)          MESSAGE
-acg-bb47e7f4    general-watcher       active      0 9 * * 1-5       3/∞           2026-04-10 09:00:00     Run daily standup
-acg-2f6cb289    ops-watcher           paused      */30 * * * *      12/∞          -                       Check server health
-acg-b8c2a409    general-watcher       completed   * * * * *         1/1           done 2026-04-09 07:23   提醒：去刷牙
+acg-bb47e7f4    rc:general            active      0 9 * * 1-5       3/∞           2026-04-10 09:00:00     Run daily standup
+acg-2f6cb289    rc:ops                paused      */30 * * * *      12/∞          -                       Check server health
+acg-b8c2a409    rc:general            completed   * * * * *         1/1           done 2026-04-09 07:23   提醒：去刷牙
 ```
 
 - **RUNS** shows `run_count / max_runs` (∞ means no limit).
@@ -394,10 +394,10 @@ connectors:
 
 ```bash
 # Fires at 09:00 Taipei time every day
-agent-chat-gateway schedule create general-watcher "Morning briefing" --every 1d --starting "09:00" --tz "Asia/Taipei"
+agent-chat-gateway schedule create rc:general "Morning briefing" --every 1d --starting "09:00" --tz "Asia/Taipei"
 
 # Fires at 09:00 UTC every day (same as no --tz)
-agent-chat-gateway schedule create general-watcher "Morning briefing" --every 1d --starting "09:00"
+agent-chat-gateway schedule create rc:general "Morning briefing" --every 1d --starting "09:00"
 ```
 
 `NEXT RUN` in `schedule list` is always displayed in UTC regardless of the job's configured timezone.

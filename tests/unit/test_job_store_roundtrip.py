@@ -366,3 +366,62 @@ class TestSetRoomId(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestASaveIsOneOperation(unittest.TestCase):
+    """A fire saves from a `to_thread` worker; the migration saves on the loop
+    thread. `_lock` made each snapshot consistent but not the save: a worker
+    that had snapshotted the jobs and then lost the CPU while the migration
+    wrote every `room_id` and stamped the version read the NEW version and
+    replaced the file with the OLD snapshot — a version-2 file whose job had
+    no room (Codex, PR #140 round 3). Whole saves now exclude each other."""
+
+    def test_a_save_that_started_first_finishes_before_the_migration_writes(self):
+        import json as _json
+        import threading
+        from unittest.mock import patch
+
+        path = Path(tempfile.mkdtemp()) / "jobs.json"
+        store = JobStore(path)
+        store.load()
+        store.add(ScheduledJob(**{**FULLY_POPULATED, "room_id": ""}))
+        store._file_version = 1
+
+        snapshotted, release = threading.Event(), threading.Event()
+        real_dumps = _json.dumps
+        first = [True]
+
+        def slow_dumps(data, **kw):
+            # The first save (the "fire") has taken its snapshot and now stalls
+            # between snapshot and write — the window the race lives in.
+            if first[0]:
+                first[0] = False
+                snapshotted.set()
+                assert release.wait(5), "test deadlocked"
+            return real_dumps(data, **kw)
+
+        migrated = threading.Event()
+
+        def migrate():
+            assert store.set_room_id(FULLY_POPULATED["id"], "R-1", connector="rc")
+            store.stamp_version(2)
+            migrated.set()
+
+        with patch("gateway.core.job_store.json.dumps", side_effect=slow_dumps):
+            fire = threading.Thread(target=store.save)
+            fire.start()
+            assert snapshotted.wait(5)
+            mig = threading.Thread(target=migrate)
+            mig.start()
+            try:
+                self.assertFalse(migrated.wait(0.3), "the migration wrote while a save was mid-flight")
+            finally:
+                release.set()   # never leave the stalled save hanging, pass or fail
+                fire.join(5)
+                mig.join(5)
+
+        on_disk = _json.loads(path.read_text())
+        self.assertEqual(on_disk["version"], 2)
+        self.assertEqual(on_disk["jobs"][0]["room_id"], "R-1",
+                         "a version-2 file must contain the migration it claims")
+

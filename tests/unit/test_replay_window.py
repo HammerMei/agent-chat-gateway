@@ -123,23 +123,36 @@ class TestJustBefore(unittest.TestCase):
         self.assertEqual(just_before(""), "")
 
 
-class TestClosingTheWindowSettlesThePromises(unittest.TestCase):
+class TestClosingTheWindowLeavesThePromisesAlone(unittest.TestCase):
     """`promised_ids` is the third piece of the bookkeeping (see the class
     docstring): frames a creation episode handed back, whose boundary is
-    claimed only if the filter rejects one. Once a replay has read the window
-    — or a removal has voided it — nothing is owed for them either."""
+    claimed only if the filter rejects one. A promise is settled by the frame
+    it names, at the filter — never by a replay closing its window. A replay
+    cannot tell which promised frames its page covered: one promised DURING
+    the replay is newer than the page, and one promised before it may sit
+    below the watermark the page started from. Clearing on discharge lost
+    both (Codex, PR #140 round 3). Only a removal voids them."""
 
-    def test_discharge_clears_the_promises(self):
+    def test_discharge_leaves_a_promise_made_before_the_replay(self):
         w = _Window()
-        w.promised_ids.update({"m1", "m2"})
+        w.promised_ids.add("below-the-watermark")
         n = w.claim_boundary("100")
 
         self.assertTrue(w.discharge_boundary(n))
-        self.assertEqual(w.promised_ids, set())
+        self.assertEqual(w.promised_ids, {"below-the-watermark"})
+
+    def test_discharge_leaves_a_promise_made_during_the_replay(self):
+        """The Codex scenario: a creation episode completes while the replay is
+        awaiting dispatch; its promise does not move the claim count, so the
+        discharge is accepted — and must not take the promise with it."""
+        w = _Window()
+        n = w.claim_boundary("100")
+        w.promised_ids.add("handed-back-mid-replay")
+
+        self.assertTrue(w.discharge_boundary(n))
+        self.assertEqual(w.promised_ids, {"handed-back-mid-replay"})
 
     def test_a_refused_discharge_keeps_them(self):
-        """Claimed again since the snapshot: the window stays open, and so do
-        the promises — a later replay still has to judge them."""
         w = _Window()
         w.promised_ids.add("m1")
         n = w.claim_boundary("100")
@@ -148,11 +161,11 @@ class TestClosingTheWindowSettlesThePromises(unittest.TestCase):
         self.assertFalse(w.discharge_boundary(n))
         self.assertEqual(w.promised_ids, {"m1"})
 
-    def test_discard_clears_them_too(self):
+    def test_discard_clears_them(self):
+        """Nobody is entitled to a removed room's frames — promises included."""
         w = _Window()
         w.promised_ids.add("m1")
         w.claim_boundary("100")
 
         w.discard_boundary()
         self.assertEqual(w.promised_ids, set())
-

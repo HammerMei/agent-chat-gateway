@@ -131,10 +131,18 @@ class ReplayWindow:
             return False
         self.replay_boundary = None
         self.boundary_claims = 0
-        # A replay that read the window covers anything still promised at or
-        # below it; a frame still promised ABOVE it is either in the queue (and
-        # will be judged on arrival) or was accepted live. Nothing is owed.
-        self.promised_ids.clear()
+        # Promises are NOT settled here. Each is settled by the frame it names,
+        # at the filter: accepted, or rejected and judged. A replay does not know
+        # which promised frames its page covered — a promise made during the
+        # replay names a frame newer than the page, and a promise made before it
+        # can name a frame BELOW the watermark the page started from (the
+        # creation path promises instead of claiming, so the window does not
+        # reach down to it). Clearing on discharge lost both kinds: the queued
+        # frame then arrived, read as already processed, and nobody kept it
+        # reachable (Codex, PR #140 round 3). The one thing a stale promise can
+        # cost is a redundant claim when a frame the replay DID dispatch arrives
+        # again from the queue — one extra fetch at the next recovery, not a
+        # lost message.
         return True
 
     def discard_boundary(self) -> None:
