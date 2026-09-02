@@ -42,10 +42,11 @@ module that removed the net:
   migrates. Narrow, but silent and permanent, which is why the startup warning
   also fires on "a job with no recorded room" and not only on the file's declared
   version (`JobStore.needs_migration`);
-* the voice and script connectors do not implement `Connector.room_ref_by_id`,
-  so a job cannot resurrect one of their watchers at all. Neither supports
-  unsolicited inbound, so neither is swept — this reaches them only through an
-  operator `expire`.
+* a connector that cannot look a room up by id (`Connector.room_ref_by_id`
+  answering `None`) cannot have its watchers resurrected at all. None of the
+  four shipped connectors is in that position any more — voice and script were,
+  for a release — and a test walking `SUPPORTED_CONNECTOR_TYPES` keeps it that
+  way for the next one.
 
 Stated here rather than only in `docs/scheduling.md` because the exemption was
 removed on the unqualified version of the sentence.

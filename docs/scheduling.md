@@ -242,11 +242,11 @@ it fails at every slot instead, logging each time:
   once-a-quarter or once-a-year job, which is the same case that makes
   `schedule migrate` a command you run rather than something done lazily at fire
   time. Run it after upgrading and the window never opens.
-- **its connector has to be able to look a room up by id.** Rocket.Chat and
-  Mattermost can. The voice and script connectors cannot, so a job cannot
-  recreate one of their watchers after an `expire` — it needs the record to still
-  be there. Neither has an idle sweep, so this only arises from an operator
-  `expire`.
+- **its connector has to be able to look a room up by id.** All four shipped
+  connectors can (`Connector.room_ref_by_id`); for voice and script a room's id
+  is its name, so the lookup is the identity. A connector that cannot would be
+  named here — `tests/unit/test_job_room_identity.py` walks every supported type
+  and fails unless it either overrides the lookup or is declared as unable.
 
 ### Resume a paused job
 

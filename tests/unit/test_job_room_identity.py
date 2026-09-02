@@ -289,6 +289,71 @@ class TestTheSchedulerPassesTheId(unittest.IsolatedAsyncioTestCase):
             "rc:general", "poke", room_id="room-1")
 
 
+class TestEveryConnectorTypeCanBeResurrectedOrSaysItCannot(unittest.TestCase):
+    """The net for the connector half of the resurrection promise.
+
+    `docs/scheduling.md` says a job brings its watcher back. That is true only of
+    a connector that overrides `Connector.room_ref_by_id`; the base answers
+    `None`, and a job on such a connector fails at every slot after an `expire`
+    while the log names three causes that are all false. Voice and script
+    inherited the base for a whole release and nothing noticed.
+
+    Walks `SUPPORTED_CONNECTOR_TYPES` — the canonical list — so a NEW connector
+    type cannot be forgotten by the person who forgot the override: it fails here
+    with the doc obligation in the message. A type that genuinely cannot look a
+    room up by id is declared in `CANNOT_RESURRECT`, and the qualifier goes into
+    `docs/scheduling.md` in the same commit.
+    """
+
+    # Declared, not inferred. Empty today — every shipped connector can answer
+    # by id — and a type added here must also be named in docs/scheduling.md.
+    CANNOT_RESURRECT: frozenset[str] = frozenset()
+
+    def _class_for(self, connector_type: str):
+        from gateway.connectors.mattermost.connector import MattermostConnector
+        from gateway.connectors.rocketchat.connector import RocketChatConnector
+        from gateway.connectors.script.connector import ScriptConnector
+        from gateway.connectors.voice.connector import VoiceConnector
+        classes = {
+            "rocketchat": RocketChatConnector,
+            "mattermost": MattermostConnector,
+            "voice": VoiceConnector,
+            "script": ScriptConnector,
+        }
+        self.assertIn(connector_type, classes,
+                      f"{connector_type!r} is in SUPPORTED_CONNECTOR_TYPES but "
+                      f"this test does not know its class — add it here")
+        return classes[connector_type]
+
+    def test_every_supported_type_overrides_room_ref_by_id_or_is_declared(self):
+        from gateway.core.connector import SUPPORTED_CONNECTOR_TYPES, Connector
+
+        for connector_type in SUPPORTED_CONNECTOR_TYPES:
+            with self.subTest(connector=connector_type):
+                cls = self._class_for(connector_type)
+                overrides = cls.room_ref_by_id is not Connector.room_ref_by_id
+                self.assertTrue(
+                    overrides or connector_type in self.CANNOT_RESURRECT,
+                    f"{connector_type} inherits the base room_ref_by_id, which "
+                    f"answers None — so a scheduled job can never bring one of "
+                    f"its watchers back after an expire. Override it, or add "
+                    f"{connector_type!r} to CANNOT_RESURRECT and carry the "
+                    f"qualifier into docs/scheduling.md.",
+                )
+
+    def test_a_declared_exception_is_not_secretly_overriding(self):
+        """The other direction: a type listed as unable that DOES override is a
+        stale declaration, and the docs would understate the connector."""
+        from gateway.core.connector import Connector
+
+        for connector_type in self.CANNOT_RESURRECT:
+            with self.subTest(connector=connector_type):
+                cls = self._class_for(connector_type)
+                self.assertIs(cls.room_ref_by_id, Connector.room_ref_by_id,
+                              f"{connector_type} overrides room_ref_by_id — "
+                              f"remove it from CANNOT_RESURRECT")
+
+
 class TestTheConnectorsResolveByIdThroughTheirOwnClassifier(
         unittest.IsolatedAsyncioTestCase):
     """One classifier per connector. On Rocket.Chat the letter `d` covers both DM
@@ -397,9 +462,48 @@ class TestTheConnectorsResolveByIdThroughTheirOwnClassifier(
         with self.assertRaises(OSError):
             await connector.room_ref_by_id("c1")
 
+    async def test_voice_answers_by_echoing_the_id_as_a_channel(self):
+        """A voice room's id IS its name — `resolve_room` builds it that way —
+        so the inverse is the same identity. Before this override the base's
+        `None` meant a job could not resurrect a voice watcher after an expire,
+        and the failure log blamed the room for being gone."""
+        from gateway.connectors.voice.connector import VoiceConnector
 
-if __name__ == "__main__":
-    unittest.main()
+        connector = VoiceConnector.__new__(VoiceConnector)
+
+        self.assertEqual(
+            await connector.room_ref_by_id("kitchen"),
+            RoomRef(id="kitchen", kind=RoomKind.CHANNEL, name="kitchen"),
+        )
+
+    async def test_script_answers_the_same_way(self):
+        from gateway.connectors.script.connector import ScriptConnector
+
+        connector = ScriptConnector.__new__(ScriptConnector)
+
+        self.assertEqual(
+            await connector.room_ref_by_id("nightly"),
+            RoomRef(id="nightly", kind=RoomKind.CHANNEL, name="nightly"),
+        )
+
+    async def test_voice_and_script_kind_matches_what_inbound_assigns(self):
+        """`kind_for.get(room.type, RoomKind.CHANNEL)` on the inbound path: voice
+        rooms are type 'channel' and script rooms are type 'script', which is not
+        a RoomKind, so both land on CHANNEL. A resurrected watcher must get the
+        same kind or `require_mention` and the label form would differ from the
+        original."""
+        from gateway.connectors.script.connector import ScriptConnector
+        from gateway.connectors.voice.connector import VoiceConnector
+        from gateway.core.watcher_rule import RoomKind as RK
+
+        kind_for = {k.value: k for k in RK}
+        for cls in (VoiceConnector, ScriptConnector):
+            with self.subTest(connector=cls.__name__):
+                c = cls.__new__(cls)
+                room = await c.resolve_room("r")
+                inbound_kind = kind_for.get(room.type, RK.CHANNEL)
+                ref = await c.room_ref_by_id("r")
+                self.assertEqual(ref.kind, inbound_kind)
 
 
 class TestTheHandleNeverPicksTheSession(unittest.IsolatedAsyncioTestCase):
@@ -503,3 +607,7 @@ class TestTheRoomGuardIsReachedOnItsOwn(unittest.IsolatedAsyncioTestCase):
 
         self.assertFalse(result, "an unaddressable message must not be injected")
         resident.enqueue.assert_not_awaited()
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -1629,9 +1629,10 @@ boot replay and every operator verb), and until it lands this rule plus
 
 **Two conditions on the resurrection promise**, because "a job brings its watcher
 back" is true of neither an un-migrated job nor a connector that cannot look a
-room up by id (voice and script do not implement `Connector.room_ref_by_id`).
-Both are stated for operators in `docs/scheduling.md`; do not repeat the promise
-anywhere without them.
+room up by id (`Connector.room_ref_by_id` answering `None` — every shipped
+connector now overrides it, and a test over `SUPPORTED_CONNECTOR_TYPES` holds
+that). Both are stated for operators in `docs/scheduling.md`; do not repeat the
+promise anywhere without them.
 
 Implemented (owner, 2026-09-01), after a first attempt was reverted for three
 defects worth naming, because each is a way this can be got wrong again:

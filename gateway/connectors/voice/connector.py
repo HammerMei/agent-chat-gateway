@@ -218,6 +218,26 @@ class VoiceConnector(Connector):
     async def resolve_room(self, room_name: str) -> Room:
         return Room(id=room_name, name=room_name, type="channel")
 
+    async def room_ref_by_id(self, room_id: str) -> "RoomRef | None":
+        """See `Connector.room_ref_by_id`.
+
+        Voice has no room directory to consult: `resolve_room` returns a
+        `Room` whose id IS its name, so the inverse is the same identity read the
+        other way. Any id names a valid room here — a room is the `/ask/<room>` path a caller chooses, created on first use — so this never
+        answers `None`. Kind is `CHANNEL`, which is what the inbound path assigns
+        (`kind_for.get('channel')`).
+
+        Without this, a scheduled job could not bring one of these watchers back
+        after an `expire`: the base class answers `None` for a connector that
+        cannot look a room up by id, and the fire then failed at every slot while
+        logging that the room was "gone, in another team, or this account is no
+        longer in it" — none of which can be true of a voice room.
+        """
+        from ...core.watcher_manager import RoomRef
+        from ...core.watcher_rule import RoomKind
+
+        return RoomRef(id=room_id, kind=RoomKind.CHANNEL, name=room_id)
+
     # ── Security: prompt prefix ───────────────────────────────────────────────
 
     def format_prompt_prefix(self, msg: IncomingMessage) -> str:

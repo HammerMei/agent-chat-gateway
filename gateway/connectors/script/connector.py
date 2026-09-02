@@ -151,6 +151,26 @@ class ScriptConnector(Connector):
         """Return an in-memory Room — no platform lookup needed."""
         return Room(id=room_name, name=room_name, type="script")
 
+    async def room_ref_by_id(self, room_id: str) -> "RoomRef | None":
+        """See `Connector.room_ref_by_id`.
+
+        Script has no room directory to consult: `resolve_room` returns a
+        `Room` whose id IS its name, so the inverse is the same identity read the
+        other way. Any id names a valid room here — rooms are in-memory names the driving script invents — so this never
+        answers `None`. Kind is `CHANNEL`, which is what the inbound path assigns
+        ('script' is not a `RoomKind` value, so `kind_for` falls back to CHANNEL).
+
+        Without this, a scheduled job could not bring one of these watchers back
+        after an `expire`: the base class answers `None` for a connector that
+        cannot look a room up by id, and the fire then failed at every slot while
+        logging that the room was "gone, in another team, or this account is no
+        longer in it" — none of which can be true of a script room.
+        """
+        from ...core.watcher_manager import RoomRef
+        from ...core.watcher_rule import RoomKind
+
+        return RoomRef(id=room_id, kind=RoomKind.CHANNEL, name=room_id)
+
     # ── Scripting API ─────────────────────────────────────────────────────────
 
     def pipe_to(self, target: "ScriptConnector") -> None:
