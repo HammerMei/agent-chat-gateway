@@ -711,6 +711,9 @@ class TestAReclaimSurvivesARenameInItsAwaitWindow(unittest.IsolatedAsyncioTestCa
                 self.assertEqual(await lifecycle.observe_room_name(ROOM_ID, "eng-renamed"),
                                  "rc:eng-renamed")
             agent.reclaim_durable_instructions = rename_mid_reclaim
+            saves = []
+            real_save = lifecycle._state_store.save
+            lifecycle._state_store.save = lambda states, **kw: (saves.append(kw), real_save(states, **kw))[1]
 
             reclaimed = await lifecycle.reclaim_room(ROOM_ID, reason="test")
 
@@ -718,6 +721,11 @@ class TestAReclaimSurvivesARenameInItsAwaitWindow(unittest.IsolatedAsyncioTestCa
         self.assertIsNone(lifecycle.record_for_room(ROOM_ID), "the record survived its own reclaim")
         self.assertIsNone(lifecycle.get_watcher_state("rc:eng-renamed"))
         self.assertIsNone(lifecycle.get_watcher_state(NAME))
+        # Both names pruned from the file: the old one is the row on disk, the
+        # new one is what a save between the rename and this point would have
+        # written. Pruning only the captured name left the renamed row behind
+        # (internal review found this half untested).
+        self.assertTrue(any(kw.get("prune") == {NAME, "rc:eng-renamed"} for kw in saves), saves)
 
 
 class TestControlResolvesRecordOnlyNames(unittest.TestCase):
