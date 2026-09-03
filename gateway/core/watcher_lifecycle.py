@@ -1339,6 +1339,12 @@ class WatcherLifecycle:
                     )
         return new if new != old else None
 
+    def room_holding(self, name: str) -> str | None:
+        """The room id a handle currently names, or None. A read of the name
+        index for the one runtime question that IS about a name: whether a
+        handle a creation is about to take already belongs to another room."""
+        return self._room_of.get(name)
+
     def record_for_room(self, room_id: str) -> WatcherState | None:
         """The in-memory record bound to a room, if any (§2.4 sticky binding).
 

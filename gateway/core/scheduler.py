@@ -181,7 +181,15 @@ class JobScheduler:
             return
         logger.info("Catching up %d missed job(s) on startup", len(jobs))
         for job in jobs:
-            await self._fire_catch_up(job, now)
+            try:
+                await self._fire_catch_up(job, now)
+            except Exception:
+                # Per-job isolation, as `_fire_due_jobs` has: a hand-edited
+                # cron, a write that fails on a full disk — one job's failure
+                # here used to propagate out of `run()` and stop every job on
+                # every connector until the next restart, silently (final
+                # pre-merge review). Logged with the job, then the next one.
+                logger.exception("Catch-up for job %s failed — skipping it this start", job.id)
 
     async def _fire_catch_up(self, job: ScheduledJob, now: datetime) -> None:
         """Fire a job that was missed during downtime.
@@ -295,7 +303,12 @@ class JobScheduler:
         """One scheduler tick: purge expired + fire due jobs."""
         # Offload the purge file-write to a thread so the event loop is not
         # blocked while jobs.json is being written.
-        await asyncio.to_thread(self._store.remove_expired_completed, self._ttl_days)
+        try:
+            await asyncio.to_thread(self._store.remove_expired_completed, self._ttl_days)
+        except Exception:
+            # A purge that cannot write must not cost this tick's fires, nor
+            # the scheduler task (final pre-merge review).
+            logger.exception("Purging expired jobs failed — firing anyway")
         await self._fire_due_jobs()
 
     async def _fire_due_jobs(self) -> None:
@@ -368,12 +381,19 @@ class JobScheduler:
             # known to be undeliverable; nothing else touches it until then.
             reason = (f"connector '{job.connector}' is no longer configured, so "
                       f"the job has no account to run under")
-            await asyncio.to_thread(self._store.cancel, job.id, reason=reason)
-            logger.warning(
-                "AUDIT: cancelled scheduled job %s (watcher '%s', room %s) — %s. "
-                "The record is kept; 'agent-chat-gateway schedule resume %s' restores it.",
-                job.id, job.watcher, job.room_id, reason, job.id,
-            )
+            try:
+                await asyncio.to_thread(self._store.cancel, job.id, reason=reason)
+            except Exception:
+                # The store could not be written; the job stays ACTIVE on disk
+                # and the next slot tries again. Like every other write on the
+                # fire path, a failure is logged, not raised (final review).
+                logger.exception("Job %s: could not persist the cancellation", job.id)
+            else:
+                logger.warning(
+                    "AUDIT: cancelled scheduled job %s (watcher '%s', room %s) — %s. "
+                    "The record is kept; 'agent-chat-gateway schedule resume %s' restores it.",
+                    job.id, job.watcher, job.room_id, reason, job.id,
+                )
             # The copy, marked, not None: `_fire_catch_up` re-assigns this
             # return and reads `.status` on its next missed slot (internal
             # review — a bare `return` here raised AttributeError out of the

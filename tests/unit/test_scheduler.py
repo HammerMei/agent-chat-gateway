@@ -1727,3 +1727,48 @@ class TestAJobWhoseConnectorIsGoneIsCancelled(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(store.get(job.id).status, JobStatus.CANCELLED)
 
+
+class TestOneBadJobCannotKillTheScheduler(unittest.IsolatedAsyncioTestCase):
+    """`_fire_due_jobs` isolated each job; catch-up and the cancel write did not
+    (final pre-merge review). A raise on either path propagated out of `run()`
+    and stopped every job on every connector until a restart, silently."""
+
+    def _store_and_scheduler(self, managers, **job_kwargs):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        store = JobStore(jobs_file=Path(tmp.name) / "jobs.json")
+        store.load()
+        job = _make_job(next_run=(datetime.now(UTC) - timedelta(minutes=1)).isoformat(), **job_kwargs)
+        store.add(job)
+        return store, JobScheduler(store=store, session_managers=managers, completed_job_ttl_days=7), job
+
+    async def test_catch_up_skips_a_job_whose_cancellation_cannot_be_written(self):
+        earlier = (datetime.now(UTC) - timedelta(minutes=3)).isoformat()
+        store, scheduler, job = self._store_and_scheduler(
+            {"bob": _make_sm_mock(room_id="R")}, connector="retired", room_id="R",
+            cron="* * * * *", last_run=earlier, last_attempted_at=earlier)
+        store.cancel = MagicMock(side_effect=OSError("disk full"))
+
+        with self.assertLogs("agent-chat-gateway.core.scheduler", "ERROR"):
+            await scheduler._catch_up_missed()   # must not raise
+
+        self.assertEqual(store.get(job.id).status, JobStatus.ACTIVE, "left for the next slot")
+
+    async def test_catch_up_isolates_a_job_whose_cron_cannot_be_enumerated(self):
+        store, scheduler, job = self._store_and_scheduler(
+            {"rc-home": _make_sm_mock(room_id="R")}, connector="rc-home", room_id="R",
+            cron="not a cron", last_run=(datetime.now(UTC) - timedelta(hours=1)).isoformat())
+
+        with self.assertLogs("agent-chat-gateway.core.scheduler", "ERROR"):
+            await scheduler._catch_up_missed()   # must not raise
+
+    async def test_a_failing_purge_does_not_cost_the_ticks_fires(self):
+        store, scheduler, job = self._store_and_scheduler(
+            {"rc-home": _make_sm_mock(room_id="R")}, connector="rc-home", room_id="R")
+        store.remove_expired_completed = MagicMock(side_effect=OSError("read-only"))
+
+        with self.assertLogs("agent-chat-gateway.core.scheduler", "ERROR"):
+            await scheduler._tick()
+
+        self.assertEqual(store.get(job.id).run_count, 1, "the job still fired")
+

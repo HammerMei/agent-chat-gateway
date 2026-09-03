@@ -931,6 +931,24 @@ class WatcherManager:
             agent_name=self._lifecycle.resolve_agent_name(wc.agent),
             now=now_iso(),
         )
+        # A handle another room still holds is, on a platform that keeps URL
+        # names unique, a room since renamed away and not yet heard from: the
+        # handle follows a rename only on the OLD room's next frame. Left
+        # alone, the start below refused this room until that frame came or
+        # the operator expired the holder — and every message here in the
+        # meantime was dropped (final pre-merge review). Ask the platform what
+        # the holder is called now; if it has moved, move its handle first.
+        held = self._lifecycle.room_holding(wc.name)
+        if held is not None and held != room.id:
+            try:
+                current = await self._connector.room_ref_by_id(held)
+            except Exception as exc:
+                current = None
+                logger.warning("Could not resolve room %s, which still holds handle '%s': %s",
+                               held, wc.name, exc)
+            if current is not None and current.name and not current.kind.is_direct:
+                await self._lifecycle.observe_room_name(held, current.name)
+
         self._creations_in_flight += 1
         try:
             # A raise propagates (§2.2): a creation that failed is an abort, and

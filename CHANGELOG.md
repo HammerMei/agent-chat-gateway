@@ -174,6 +174,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   after a rename (Mattermost `channel_name`, Rocket.Chat `roomName` — the URL
   name, not the display name), with an `AUDIT` log line; `schedule list` shows
   each job's watcher as it is named now.
+  A new room that takes a renamed-away room's URL name moves the old
+  handle out of the way at creation, after asking the platform what the
+  holder is called now.
   DM labels still carry the counterpart's name as of creation.
 - **A job the gateway cancels is kept, not deleted.** Cancellation (the bot
   removed from the room; the job's connector gone from the config) now marks

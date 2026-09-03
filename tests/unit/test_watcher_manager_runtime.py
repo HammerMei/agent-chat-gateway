@@ -153,6 +153,61 @@ class TestACreationShowsSomeoneIsAnswering(unittest.IsolatedAsyncioTestCase):
         lifecycle.start_watcher_in_room.assert_awaited_once()
 
 
+class TestANewRoomTakingARenamedAwayName(unittest.IsolatedAsyncioTestCase):
+    """`#general` renamed to `#general-old` (nobody posts there again), then a
+    fresh `#general` is created. The old record still holds `rc:general`, so the
+    start refused the new room — and dropped its messages — until the old room
+    spoke or was expired (final pre-merge review). The creation now asks the
+    platform what the holder is called and moves its handle first."""
+
+    def _setup(self, holder_now):
+        connector = MagicMock(send_text=AsyncMock(), notify_typing=AsyncMock())
+        connector.room_ref_by_id = AsyncMock(return_value=holder_now)
+        manager, lifecycle, _ = _manager(connector=connector)
+        lifecycle.room_holding = MagicMock(return_value="R-old")
+        lifecycle.observe_room_name = AsyncMock(return_value="rc:eng-backend-old")
+        lifecycle.start_watcher_in_room = AsyncMock()
+        return manager, lifecycle, connector
+
+    async def test_the_holders_handle_is_moved_before_the_start(self):
+        manager, lifecycle, connector = self._setup(
+            RoomRef(id="R-old", kind=RoomKind.CHANNEL, name="eng-backend-old"))
+
+        await manager.get_or_create("rc", _room())
+
+        connector.room_ref_by_id.assert_awaited_once_with("R-old")
+        lifecycle.observe_room_name.assert_awaited_once_with("R-old", "eng-backend-old")
+        lifecycle.start_watcher_in_room.assert_awaited_once()
+
+    async def test_a_holder_that_really_has_the_same_name_is_left_to_the_refusal(self):
+        """The observer is asked (it is a no-op for an unchanged name) and the
+        start proceeds to its own refusal — nothing here re-points a handle."""
+        manager, lifecycle, _ = self._setup(
+            RoomRef(id="R-old", kind=RoomKind.CHANNEL, name="eng-backend"))
+        lifecycle.observe_room_name = AsyncMock(return_value=None)
+
+        await manager.get_or_create("rc", _room())
+
+        lifecycle.observe_room_name.assert_awaited_once_with("R-old", "eng-backend")
+        lifecycle.start_watcher_in_room.assert_awaited_once()
+
+    async def test_a_holder_the_platform_cannot_describe_is_left_alone(self):
+        manager, lifecycle, connector = self._setup(None)
+        connector.room_ref_by_id = AsyncMock(side_effect=OSError("network"))
+
+        await manager.get_or_create("rc", _room())
+
+        lifecycle.observe_room_name.assert_not_awaited()
+
+    async def test_no_holder_means_no_lookup(self):
+        manager, lifecycle, connector = self._setup(None)
+        lifecycle.room_holding = MagicMock(return_value=None)
+
+        await manager.get_or_create("rc", _room())
+
+        connector.room_ref_by_id.assert_not_awaited()
+
+
 class TestCreation(unittest.IsolatedAsyncioTestCase):
     async def test_a_matching_rule_creates_a_watcher(self):
         manager, lifecycle, _ = _manager()
