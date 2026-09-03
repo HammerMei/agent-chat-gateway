@@ -507,10 +507,18 @@ Each created watcher is named `<connector>:<room>` — that derived name is
 what `list` shows and what `pause`/`resume`/`reset`/`expire` act on. It follows
 the room on Rocket.Chat and Mattermost: rename a channel or private group and,
 from the next message in it, `list` shows the new name and the old one no longer
-resolves (the log carries an `AUDIT` line). DM labels keep the counterpart's
-name as of creation, and a new name still held by another room's stale record
-is not taken until that record goes. Scripts should not store a watcher name;
-the room is the identity. Rules
+resolves (the log carries an `AUDIT` line).
+
+**"Name" here is the room's URL name, not its display name.** On Mattermost that
+is the channel `name` — the last segment of `…/channels/<name>`, editable in the
+channel's rename/settings dialog under *URL* — and on Rocket.Chat the room
+`name` (not `fname`). Changing only the Display Name does **not** rename the
+watcher, by design: display names admit any character and two rooms may share
+one, while the URL name is restricted and unique within a team, which is what
+makes a watcher handle unambiguous. DM labels keep the counterpart's name as of
+creation, and a new name still held by another room's stale record is not taken
+until that record goes. Scripts should not store a watcher name; the room is the
+identity. Rules
 match top-down; the first rule that claims a room wins, and `agent-chat-gateway config
 validate` warns when an earlier rule shadows a later one completely.
 

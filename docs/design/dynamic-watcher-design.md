@@ -536,7 +536,7 @@ gives up on readability:
 
 | Room kind | Label | Stable? |
 |---|---|---|
-| channel / private group | the channel name | until renamed |
+| channel / private group | the channel's URL name (Mattermost `name`, Rocket.Chat `name`) — never the display name, which admits any character and need not be unique (owner, 2026-09-03) | until its URL name is changed |
 | 1:1 DM | `dm:<counterpart>` | until the counterpart is renamed — and see below |
 | group DM | `gdm:<16 hex of a room_id hash>` | yes, by construction |
 
