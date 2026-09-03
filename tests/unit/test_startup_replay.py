@@ -540,19 +540,68 @@ class TestBootValidatesRoomScope(unittest.IsolatedAsyncioTestCase):
             "the full session id is what an operator searches for afterwards",
         )
 
-    async def test_the_replay_reclaims_a_dormant_room_with_a_gap(self):
-        """The replay's own recreation: an idle record with a gap is rebuilt
-        from its record — after the same check."""
+    async def test_the_replay_reclaims_a_dormant_room_before_probing_it(self):
+        """The replay's own recreation site. The room is resolved BEFORE the
+        history probe (Codex on #147): a room the bot was removed from, or that
+        was deleted, makes the probe itself raise — and a probe failure is
+        skipped as best-effort, so a check placed after it would never run and
+        the stale record (and its jobs) would survive the boot."""
         record = self._active(name="mm:old-team-idle", room_id="r-idle",
                               session_id="sess-idle-5678")
         record.dropped_at = record.last_activity_at  # idle: skipped by the evaluation
-        mgr = _boot_manager([record], connector_name="mm", missed=True)
+        mgr = _boot_manager([record], connector_name="mm")
         mgr._connector.room_ref_by_id = AsyncMock(return_value=None)
+        mgr._connector.probe_missed_since = AsyncMock(
+            side_effect=RuntimeError("403: not a channel member"))
 
         await mgr._replay_persisted_records(_window(mgr))
 
         mgr._watcher_manager.get_or_create.assert_not_awaited()
         self.assertEqual(mgr._lifecycle.reclaim_room.await_args.args[0], "r-idle")
+        # An unserved room is not worth a history read.
+        mgr._connector.probe_missed_since.assert_not_awaited()
+
+    async def test_a_resident_room_is_not_resolved_again_by_the_replay(self):
+        """The evaluation already resolved and recreated it; the replay's
+        check is for the dormant records the evaluation skipped."""
+        record = self._active(name="mm:kept", room_id="r-kept")
+        mgr = _boot_manager([record], connector_name="mm", missed=True)
+        mgr._lifecycle.processor_for_room = MagicMock(return_value="proc")
+
+        await mgr._replay_persisted_records(_window(mgr))
+
+        mgr._connector.room_ref_by_id.assert_not_awaited()
+
+    async def test_boot_reclamation_is_counted_in_the_shutdown_barrier(self):
+        """Like the membership-removal path (Codex on #147): a shutdown that
+        lands mid-boot must wait for a destructive reclamation to settle, or
+        the final save can persist an active-looking record whose session was
+        just deleted."""
+        record = self._active(name="mm:gone", room_id="r-gone")
+        mgr = _boot_manager([record], connector_name="mm")
+        mgr._connector.room_ref_by_id = AsyncMock(return_value=None)
+        order = []
+        mgr._lifecycle._enter_verb = MagicMock(side_effect=lambda *a: order.append("enter"))
+        mgr._lifecycle.reclaim_room = AsyncMock(
+            side_effect=lambda *a, **k: order.append("reclaim") or "mm:gone")
+        mgr._lifecycle._exit_verb = MagicMock(side_effect=lambda: order.append("exit"))
+
+        await mgr._evaluate_lifecycle_at_boot()
+
+        self.assertEqual(order, ["enter", "reclaim", "exit"])
+        self.assertEqual(mgr._lifecycle._enter_verb.call_args.args[0], "reclaim")
+
+    async def test_a_reclamation_refused_by_a_shutdown_in_progress_is_dropped(self):
+        record = self._active(name="mm:gone", room_id="r-gone")
+        mgr = _boot_manager([record], connector_name="mm")
+        mgr._connector.room_ref_by_id = AsyncMock(return_value=None)
+        mgr._lifecycle._enter_verb = MagicMock(
+            side_effect=RuntimeError("the gateway is shutting down"))
+
+        await mgr._evaluate_lifecycle_at_boot()
+
+        mgr._lifecycle.reclaim_room.assert_not_awaited()
+        mgr._watcher_manager.get_or_create.assert_not_awaited()
 
     async def test_a_room_still_served_is_recreated_as_before(self):
         record = self._active(name="mm:kept", room_id="r-kept")

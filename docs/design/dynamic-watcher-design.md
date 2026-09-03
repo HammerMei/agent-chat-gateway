@@ -395,11 +395,16 @@ Two consequences that are not obvious and were each got wrong once:
   support (Claude keeps it), so the logged id is a recovery path only where
   the backend keeps the session; a raise (could not ask) leaves the record
   alone for this boot, and its
-  next live message resolves the room again. The lookup adds one REST call
-  per recreated record to a boot that already makes one per record
-  (`probe_missed_since`). Dormant records — paused, or idle with no gap — are
-  not resolved here; nothing recreates them at boot, and a later `resume` or
-  wake resolves the room itself.
+  next live message resolves the room again. In the replay the lookup runs
+  *before* the history probe: a room the bot was removed from makes the probe
+  itself raise, and a probe failure is skipped as best-effort, so a check after
+  it would never reach exactly the rooms it exists for. Cost: the connector's
+  room lookup per record the boot would recreate — one subscription read on
+  Rocket.Chat; on Mattermost the channel read plus the account-wide membership
+  list, so roughly two serialized requests per record on top of the existing
+  history probe. Dormant records — paused, or idle with no gap — are not
+  resolved here; nothing recreates them at boot, and a later `resume` or wake
+  resolves the room itself.
 
 The claim the drain makes is the one piece that is deliberately *not* a replay:
 the frames are handed to the room's worker immediately, and the claim only

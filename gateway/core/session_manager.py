@@ -508,6 +508,12 @@ class SessionManager:
         already goes through it; the two boot recreation sites (the lifecycle
         evaluation and the startup replay) go through this.
 
+        Cost: the connector's room lookup per record the boot would recreate.
+        On Rocket.Chat that is one subscription read; on Mattermost it is the
+        channel read plus the account-wide membership list (see the connector's
+        `_resolved_channel`), so a large Mattermost install pays roughly two
+        serialized requests per record on top of the existing history probe.
+
         The connector contract's two failure shapes are kept apart, as in
         `_resolve_room_for_wake`: `None` is permanent (gone, another team, no
         longer a member) and reclaims the record through the removal path's
@@ -539,11 +545,22 @@ class SessionManager:
             "live event already replaced it",
             record.room_id, record.watcher_name, record.agent, record.session_id,
         )
-        await self._reclaim_removed_room(
-            record.room_id,
-            reason="the room is no longer available to this connector",
-            expected=record,
-        )
+        # Counted in the shutdown barrier, like the membership-removal path:
+        # a shutdown landing mid-boot must wait for this destructive
+        # reclamation to settle, or the final save can persist an
+        # active-looking record whose session was just deleted.
+        try:
+            self._lifecycle._enter_verb("reclaim", record.room_id)
+        except RuntimeError:
+            return False  # shutting down — the record is left as it is
+        try:
+            await self._reclaim_removed_room(
+                record.room_id,
+                reason="the room is no longer available to this connector",
+                expected=record,
+            )
+        finally:
+            self._lifecycle._exit_verb()
         return False
 
     async def _replay_persisted_records(self, down_window: dict[str, str]) -> None:
@@ -601,6 +618,14 @@ class SessionManager:
                 continue
             if ws.paused or not ws.config or not ws.room_id:
                 continue
+            # Before the probe, not after it: a room the bot was removed from,
+            # or that was deleted, makes the history read itself raise, and a
+            # failed probe is skipped as best-effort — a check placed after it
+            # would never run for exactly the rooms it exists for. Resident
+            # rooms were resolved by the evaluation that recreated them.
+            if (self._lifecycle.processor_for_room(ws.room_id) is None
+                    and not await self._room_still_served(ws)):
+                continue
             room = Room(
                 id=ws.room_id,
                 name=ws.room_name or ws.watcher_name,
@@ -637,8 +662,6 @@ class SessionManager:
                 # Tolerant like the boot and injection paths (Codex round 9 —
                 # the third raising site): a garbled kind must not strand the
                 # outage messages behind an idle record no live traffic wakes.
-                if not await self._room_still_served(ws):
-                    continue
                 kind = room_kind_or_channel(ws)
                 # Triggering the recreation is this loop's whole job. It owns no
                 # interval of its own; the recreation replays what the room owes.
