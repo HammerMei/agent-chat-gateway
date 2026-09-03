@@ -276,12 +276,16 @@ class TestTheProcessorReissuesItsIdentityOnRename(unittest.IsolatedAsyncioTestCa
         agent = MagicMock()
         agent.ensure_durable_instructions = AsyncMock(return_value="/runtime/system-prompts/k.md")
         wc = WatcherConfig(name="mm:test-channel", connector="mm", room="test-channel", agent="default")
-        processor = make_processor(agent=agent, watcher_id="mm:test-channel", connector_name="mm",
+        # `watcher_id` is the ROOM ID in production (`_start_watcher`), not the handle.
+        processor = make_processor(agent=agent, watcher_id="room_1", connector_name="mm",
                                    context_injector=injector, watcher_config=wc)
 
         await processor.rename("mm:test-channel-new", room_name="test-channel-new")
 
-        self.assertEqual(processor.watcher_id, "mm:test-channel-new")
+        self.assertEqual(processor._watcher_config.name, "mm:test-channel-new")
+        self.assertEqual(processor._watcher_config.room, "test-channel-new")
+        self.assertEqual(processor.watcher_id, "room_1",
+                         "the processor's identity is the room id and must not move")
         call = agent.ensure_durable_instructions.await_args
         self.assertIn("mm:test-channel-new / test-channel-new", call.args[3])
         self.assertEqual(call.kwargs["path_key"], watcher_prompt_key("mm", "room_1"),
@@ -319,12 +323,13 @@ class TestTheProcessorReissuesItsIdentityOnRename(unittest.IsolatedAsyncioTestCa
         self.assertEqual(processor._append_system_prompt_file, "/p.md")
         self.assertIs(seen["already_delivered"], False)
 
-    async def test_without_an_injector_only_the_name_moves(self):
+    async def test_without_an_injector_only_the_room_description_moves(self):
         from tests.helpers import make_processor
 
-        processor = make_processor(watcher_id="mm:a")
+        processor = make_processor(watcher_id="room_1")
         await processor.rename("mm:b", room_name="b")
-        self.assertEqual(processor.watcher_id, "mm:b")
+        self.assertEqual(processor.watcher_id, "room_1")
+        self.assertEqual(processor._room.name, "b")
 
     async def test_a_failed_rewrite_arms_the_next_messages_retry(self):
         """`_ensure_context_injected` returns at once while `context_injected`
@@ -349,7 +354,7 @@ class TestTheProcessorReissuesItsIdentityOnRename(unittest.IsolatedAsyncioTestCa
 
         self.assertFalse(ws.context_injected, "the next message must re-run the injection")
         injector.reset_session.assert_called_once_with("ses_001")
-        self.assertEqual(processor.watcher_id, "mm:b", "the name moved even though the rewrite did not")
+        self.assertEqual(processor._watcher_config.name, "mm:b", "the name moved even though the rewrite did not")
 
 
 class TestAStaleHandleIsRederivedEvenWhenTheRoomNameMatches(unittest.IsolatedAsyncioTestCase):

@@ -598,10 +598,12 @@ class MessageProcessor:
         """The room was renamed; take the new handle and re-issue the identity header.
 
         The handle is display data, but it is display data the AGENT reads: the
-        "ACG Session Identity" block names the watcher and the room, and it is
-        handed to the backend on every turn, so a stale one sends the agent's
-        own `schedule create` at a name that no longer resolves — or, once the
-        platform reuses it, at another room (Codex, PR #140). The durable file
+        "ACG Session Identity" block names the watcher and the room (from
+        `_watcher_config`), and it is handed to the backend on every turn, so a
+        stale one sends the agent's own `schedule create` at a name that no
+        longer resolves — or, once the platform reuses it, at another room
+        (Codex, PR #140). The processor's own `watcher_id` is the room id and
+        does not move. The durable file
         is rewritten under the same room-keyed path (`watcher_prompt_key` no
         longer includes the handle), so the path the session was started with
         stays valid and the next turn reads the new content.
@@ -609,7 +611,13 @@ class MessageProcessor:
         Raises whatever the backend raises; the lifecycle logs and moves on —
         the processor's own context-injection retry re-issues the header later.
         """
-        self._watcher_id = handle
+        # NOT `self._watcher_id`: that is the processor's identity, and it is the
+        # ROOM ID (`_start_watcher` passes `watcher_id=room.id`) — the dispatcher
+        # compares it to decide whether a replacement processor is the same
+        # watcher's. Overwriting it with the handle made the next restart of
+        # this room's processor look like another watcher's claim and be
+        # refused. The handle lives in `_watcher_config.name`, which is what the
+        # identity header reads.
         self._room = Room(id=self._room.id, name=room_name, type=self._room.type)
         if self._watcher_config is not None:
             self._watcher_config = dataclasses.replace(
