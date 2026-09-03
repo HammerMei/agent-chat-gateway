@@ -72,8 +72,11 @@ Non-DM rooms can become expensive when agent responses look like broadcasts and 
 If you need to send a file or attachment to the user, run:
 
 ```bash
-agent-chat-gateway send <room> --attach /path/to/file ["optional caption"]
+agent-chat-gateway send <room> --connector <connector> --attach /path/to/file ["optional caption"]
 ```
+
+Always pass `--connector`: its value is the **Connector** line of your `ACG Session Identity` header. Without it, a gateway that serves more than one connector refuses the command before it looks at the room.
+
 
 - `<room>` is the channel name from the message prefix — e.g. for `[Rocket.Chat #general | ...]` use `general` (without `#`).
 - `--attach` must point to an existing absolute file path.
