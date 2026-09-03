@@ -1891,6 +1891,10 @@ class RocketChatConnector(Connector):
         parts.extend(f"@{u}" for u in other_agents)
         return "to: " + "+".join(parts)
 
+    def supports_room_lookup(self) -> bool:
+        """See `Connector.supports_room_lookup` — `room_ref_by_id` is a real lookup here."""
+        return True
+
     def supports_unsolicited_inbound(self) -> bool:
         """Yes — `stream-room-messages` with the reserved id `__my_messages__`
         delivers messages for rooms this connector never per-room-subscribed to

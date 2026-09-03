@@ -612,6 +612,23 @@ class TestBootValidatesRoomScope(unittest.IsolatedAsyncioTestCase):
         mgr._lifecycle.reclaim_room.assert_not_awaited()
         self.assertEqual(mgr._watcher_manager.get_or_create.await_args.args[1].id, "r-kept")
 
+    async def test_a_connector_that_cannot_look_rooms_up_recreates_as_before(self):
+        """The base `room_ref_by_id` answers None for a connector with no id
+        lookup — "cannot resurrect, callers degrade" — which must not read as
+        answered-and-absent here, or such a connector would reclaim every record
+        at boot (Codex on #147). The capability is asked first; without it the
+        record is recreated from its stored fields as before this change."""
+        record = self._active(name="x:kept", room_id="r-kept")
+        mgr = _boot_manager([record], connector_name="x")
+        mgr._connector.supports_room_lookup = MagicMock(return_value=False)
+        mgr._connector.room_ref_by_id = AsyncMock(return_value=None)
+
+        await mgr._evaluate_lifecycle_at_boot()
+
+        mgr._lifecycle.reclaim_room.assert_not_awaited()
+        mgr._connector.room_ref_by_id.assert_not_awaited()
+        self.assertEqual(mgr._watcher_manager.get_or_create.await_args.args[1].id, "r-kept")
+
     async def test_a_transient_lookup_failure_leaves_the_record_for_this_boot(self):
         """A raise means "could not ask", not "not ours": nothing is reclaimed
         or recreated, and the room's next live message resolves it again."""

@@ -155,6 +155,10 @@ class ScriptConnector(Connector):
         """Return an in-memory Room — no platform lookup needed."""
         return Room(id=room_name, name=room_name, type="script")
 
+    def supports_room_lookup(self) -> bool:
+        """See `Connector.supports_room_lookup` — the identity lookup below is an answer, not a shrug."""
+        return True
+
     async def room_ref_by_id(self, room_id: str) -> "RoomRef | None":
         """See `Connector.room_ref_by_id`.
 

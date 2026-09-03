@@ -544,6 +544,23 @@ class Connector(ABC):
 
     # ── Transport capability ──────────────────────────────────────────────────
 
+    def supports_room_lookup(self) -> bool:
+        """Return True if `room_ref_by_id` is a real lookup on this connector.
+
+        The base `room_ref_by_id` answers `None` for a connector with no id
+        lookup — "cannot resurrect, callers degrade" — and that `None` is
+        indistinguishable from a real lookup's answered-and-absent. Callers that
+        would act *destructively* on absence (boot reclaiming a record whose
+        room the connector no longer serves, #141) ask this first and, without
+        the capability, keep the pre-lookup behaviour instead of treating
+        "cannot answer" as "gone". Non-destructive callers (a wake that simply
+        does not recreate) need not ask.
+
+        Default: False. Every shipped connector overrides `room_ref_by_id` and
+        declares True; a test over `SUPPORTED_CONNECTOR_TYPES` holds that.
+        """
+        return False
+
     def supports_unsolicited_inbound(self) -> bool:
         """Return True if this transport delivers messages for rooms not asked for.
 

@@ -521,6 +521,12 @@ class SessionManager:
         room, jobs included; a raise is transient, and the record is left as it
         is for this boot — its next live message resolves the room again.
         """
+        if not self._connector.supports_room_lookup():
+            # The base `room_ref_by_id` answers None for "cannot look rooms
+            # up", which here would read as "gone" and reclaim every record
+            # at boot. Without the capability, recreate from the record as
+            # before this check existed.
+            return True
         try:
             current = await self._connector.room_ref_by_id(record.room_id)
         except Exception as exc:

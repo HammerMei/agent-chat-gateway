@@ -927,6 +927,10 @@ class MattermostConnector(Connector):
 
     # ── History ──────────────────────────────────────────────────────────────
 
+    def supports_room_lookup(self) -> bool:
+        """See `Connector.supports_room_lookup` — `room_ref_by_id` is a real lookup here."""
+        return True
+
     def supports_unsolicited_inbound(self) -> bool:
         """Yes — one socket carries every channel the bot is a member of, and only
         those (design §2.6, verified in §6.2)."""

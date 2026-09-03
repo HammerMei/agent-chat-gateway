@@ -387,7 +387,10 @@ Two consequences that are not obvious and were each got wrong once:
   an account removed from a room, leaves those fields intact. `room_ref_by_id`
   is the connector's own scope check and the wake path already goes through
   it; both boot recreation sites — the lifecycle evaluation and the startup
-  replay — do the same. `None` (gone, another team, no longer a member)
+  replay — do the same, after asking `supports_room_lookup()`: the base
+  `room_ref_by_id` answers `None` for a connector with no id lookup, which must
+  not read as "gone" on a path that destroys the record, so such a connector
+  keeps the pre-lookup behaviour. `None` (gone, another team, no longer a member)
   reclaims the record through the removal path's shared tail (jobs cancelled,
   same end state as the bot being removed) with the full session id in the
   log — reclamation calls the backend's `delete_session`, which some
