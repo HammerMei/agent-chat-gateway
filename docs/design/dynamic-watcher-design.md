@@ -406,8 +406,9 @@ Two consequences that are not obvious and were each got wrong once:
   Rocket.Chat; on Mattermost the channel read plus the account-wide membership
   list, so roughly two serialized requests per record on top of the existing
   history probe. Dormant records — paused, or idle with no gap — are not
-  resolved here; nothing recreates them at boot, and a later `resume` or wake
-  resolves the room itself.
+  resolved here; nothing recreates them at boot. A later wake resolves the room
+  itself (`_resolve_room_for_wake`); `resume` does not yet — it still rebuilds
+  the room from the record's stored fields, tracked as a separate gap (#145).
 
 The claim the drain makes is the one piece that is deliberately *not* a replay:
 the frames are handed to the room's worker immediately, and the claim only
