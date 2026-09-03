@@ -249,6 +249,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   created on the message path (or eagerly at boot) could start without its
   permission broker and process messages with no tool-call enforcement,
   silently.
+## [0.5.2] - 2026-08-02
+
+The last stable release of the v0 line, and the version production runs.
+Two fixes over 0.5.1; no new features, no breaking changes. Roll back here if
+the dynamic-watcher release misbehaves.
+
+### Fixed
 - **File attachment uploads restored on Rocket.Chat 8.0+.** RC 8.0 removed the
   one-step `rooms.upload/{rid}` endpoint (closes #56); the client now detects
   the server's major version and dispatches to the two-step
