@@ -899,6 +899,20 @@ class WatcherManager:
                 logger.debug("Could not post the starting-up notice", exc_info=True)
             return None
 
+        # Someone is answering. A creation — session provisioning, history
+        # handoff — is the longest silence a sender ever sees after their
+        # message, and it happened with no sign that anything was listening
+        # (owner, 2026-09-03). Sent only once a rule has claimed the room, so a
+        # room the bot would decline gets no hint that it is here. A hint, never
+        # a step: a connector that cannot send one changes nothing. Mattermost
+        # clears the indicator on its own after a few seconds; Rocket.Chat's is
+        # a toggle, so a failed creation below switches it off — a successful
+        # one hands the trigger message to a turn, whose runner owns it.
+        try:
+            await self._connector.notify_typing(room.id, True)
+        except Exception:
+            logger.debug("Could not send the typing hint for room %s", room.id, exc_info=True)
+
         wc = materialize(rule, room)
         platform_room = Room(
             id=room.id,
@@ -933,6 +947,13 @@ class WatcherManager:
                     history_before_ts=history_before_ts, provenance=provenance,
                 )
                 self._lifecycle.save_state()
+        except BaseException:
+            # No turn will follow to switch the toggle-style indicator off.
+            try:
+                await self._connector.notify_typing(room.id, False)
+            except Exception:
+                logger.debug("Could not clear the typing hint for room %s", room.id, exc_info=True)
+            raise
         finally:
             self._creations_in_flight -= 1
         logger.info(

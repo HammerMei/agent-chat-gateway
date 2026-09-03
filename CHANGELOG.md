@@ -148,6 +148,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   file and list that file in `context_inject_files` (user guide, Use Case 3).
   Runtime session continuity across restarts is unaffected.
 
+### Added
+
+- **A typing indicator while a watcher is being created.** The first message in
+  a room used to be followed by the longest silence a sender ever sees — session
+  provisioning and the history handoff — with no sign anything was listening.
+  Once a rule has claimed the room, the connector shows the bot typing before
+  the start; a failed creation switches it off again. Rooms no rule claims get
+  no hint.
+
 ### Fixed
 - **The durable-instructions file is keyed by the room, and a rename reaches
   the running watcher.** `watcher_prompt_key` no longer includes the handle

@@ -101,6 +101,58 @@ def _manager(lifecycle=None, rules=None, connector=None, **kwargs):
     return manager, lifecycle, connector
 
 
+class TestACreationShowsSomeoneIsAnswering(unittest.IsolatedAsyncioTestCase):
+    """Owner, 2026-09-03: a creation is the longest silence a sender sees after
+    their message. A typing hint goes out once a rule has claimed the room —
+    before the start — and a failed creation switches it off again (Rocket.Chat's
+    indicator is a toggle; Mattermost clears its own)."""
+
+    def _connector(self):
+        return MagicMock(send_text=AsyncMock(), notify_typing=AsyncMock())
+
+    async def test_the_hint_is_sent_after_the_match_and_before_the_start(self):
+        order = []
+        connector = self._connector()
+        connector.notify_typing.side_effect = lambda rid, on: order.append(("typing", rid, on))
+        manager, lifecycle, _ = _manager(connector=connector)
+
+        async def record_start(wc, state, room, history_before_ts=None, provenance=None):
+            order.append(("start", room.id))
+        lifecycle.start_watcher_in_room = AsyncMock(side_effect=record_start)
+
+        await manager.get_or_create("rc", _room())
+
+        self.assertEqual(order[:2], [("typing", "r1", True), ("start", "r1")])
+
+    async def test_a_room_no_rule_claims_gets_no_hint(self):
+        connector = self._connector()
+        manager, _, _ = _manager(connector=connector)
+
+        self.assertIsNone(await manager.get_or_create("rc", _room(name="unrelated")))
+
+        connector.notify_typing.assert_not_awaited()
+
+    async def test_a_failed_start_switches_the_hint_off_and_still_raises(self):
+        connector = self._connector()
+        manager, lifecycle, _ = _manager(connector=connector)
+        lifecycle.start_watcher_in_room = AsyncMock(side_effect=RuntimeError("backend down"))
+
+        with self.assertRaises(RuntimeError):
+            await manager.get_or_create("rc", _room())
+
+        connector.notify_typing.assert_any_await("r1", False)
+
+    async def test_a_connector_that_cannot_hint_does_not_block_the_creation(self):
+        connector = self._connector()
+        connector.notify_typing = AsyncMock(side_effect=OSError("socket closed"))
+        manager, lifecycle, _ = _manager(connector=connector)
+        lifecycle.start_watcher_in_room = AsyncMock()
+
+        await manager.get_or_create("rc", _room())
+
+        lifecycle.start_watcher_in_room.assert_awaited_once()
+
+
 class TestCreation(unittest.IsolatedAsyncioTestCase):
     async def test_a_matching_rule_creates_a_watcher(self):
         manager, lifecycle, _ = _manager()
