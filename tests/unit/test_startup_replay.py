@@ -13,16 +13,50 @@ Three layers, tested in order:
 """
 
 import unittest
+from datetime import datetime, timedelta
 from unittest.mock import AsyncMock, MagicMock
 
 from gateway.core.state import WatcherState
-from tests.helpers import make_lifecycle
+from gateway.core.watcher_manager import RoomRef
+from gateway.core.watcher_rule import RoomKind
+from tests.helpers import make_bare_session_manager, make_lifecycle
 
 
 def _window(mgr):
     """The down-window as `sync_only` would have frozen it — before anything
     the tests then simulate arriving live."""
     return mgr._snapshot_watermarks()
+
+
+def _boot_manager(records, *, connector_name="rc", missed=False):
+    """A bare `SessionManager` wired for the two boot passes over persisted
+    records — the lifecycle evaluation and the startup replay.
+
+    One builder for every class in this file (CLAUDE.md, shared fixtures): the
+    connector still serves every room by default (#141), so a test that wants a
+    room gone overrides `room_ref_by_id` alone; `missed` is what the probe
+    answers for every room. Residency is asked, not remembered — a bare
+    MagicMock answers truthily and the residency re-check would then skip
+    every record.
+    """
+    mgr = make_bare_session_manager(_connector_name=connector_name)
+    mgr._connector.room_ref_by_id = AsyncMock(
+        side_effect=lambda room_id: RoomRef(id=room_id, kind=RoomKind.CHANNEL))
+    mgr._connector.probe_missed_since = AsyncMock(return_value=missed)
+    mgr._connector.replay_room_since = AsyncMock()
+    mgr._lifecycle.states = MagicMock(
+        return_value={r.watcher_name: r for r in records})
+    mgr._lifecycle.save_state = MagicMock()
+    mgr._lifecycle.processor_for_room = MagicMock(return_value=None)
+    # A reclamation answers the reclaimed watcher's name and leaves no record
+    # behind — what the removal path's tail reads to decide about its jobs.
+    names = {r.room_id: r.watcher_name for r in records}
+    mgr._lifecycle.reclaim_room = AsyncMock(
+        side_effect=lambda room_id, **kw: names.get(room_id))
+    mgr._lifecycle.record_for_room = MagicMock(return_value=None)
+    mgr._watcher_manager = MagicMock()
+    mgr._watcher_manager.get_or_create = AsyncMock(return_value="proc")
+    return mgr
 
 
 def _dynamic_record(name="rc:eng-backend", room_id="r1", **overrides):
@@ -114,17 +148,7 @@ class TestStartupReplay(unittest.IsolatedAsyncioTestCase):
     """The replay itself, against a mocked lifecycle and connector."""
 
     def _manager(self, records):
-        from tests.helpers import make_bare_session_manager
-
-        mgr = make_bare_session_manager(_connector_name="rc")
-        mgr._connector.probe_missed_since = AsyncMock(return_value=False)
-        mgr._connector.replay_room_since = AsyncMock()
-        mgr._lifecycle.states = MagicMock(
-            return_value={r.watcher_name: r for r in records})
-        mgr._lifecycle.processor_for_room = MagicMock(return_value=None)
-        mgr._watcher_manager = MagicMock()
-        mgr._watcher_manager.get_or_create = AsyncMock(return_value="proc")
-        return mgr
+        return _boot_manager(records)
 
     async def test_an_empty_gap_leaves_the_room_idle(self):
         """The lazy model working: no messages missed, nothing recreated.
@@ -306,21 +330,7 @@ class TestBootRunsTheSweepsEvaluation(unittest.IsolatedAsyncioTestCase):
     """
 
     def _manager(self, records):
-        from datetime import datetime, timedelta
-        from unittest.mock import AsyncMock, MagicMock
-
-        from tests.helpers import make_bare_session_manager
-
-        mgr = make_bare_session_manager(_connector_name="rc")
-        mgr._lifecycle.states = MagicMock(
-            return_value={r.watcher_name: r for r in records})
-        mgr._lifecycle.save_state = MagicMock()
-        # Asked, not remembered: a bare MagicMock answers truthily, and the
-        # boot evaluation's residency re-check (round 18) would then skip
-        # every record — the third instance of this exact trap.
-        mgr._lifecycle.processor_for_room = MagicMock(return_value=None)
-        mgr._watcher_manager = MagicMock()
-        mgr._watcher_manager.get_or_create = AsyncMock(return_value="proc")
+        mgr = _boot_manager(records)
         self._old = (datetime.now().astimezone()
                      - timedelta(days=16)).isoformat(timespec="seconds")
         self._recent = (datetime.now().astimezone()
@@ -488,3 +498,99 @@ class TestBootRunsTheSweepsEvaluation(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(
             order, ["sync", "snapshot", "inbound", "evaluate", "replay"])
+
+
+class TestBootValidatesRoomScope(unittest.IsolatedAsyncioTestCase):
+    """#141: before boot recreates a watcher from a persisted record — in the
+    lifecycle evaluation or in the startup replay — the room is resolved
+    through the connector. A connector reconfigured away from the room (another
+    Mattermost team, a room the bot left, a deleted room) answers None, and the
+    record is reclaimed the way a membership removal reclaims it, jobs
+    included, instead of being rebuilt from its stored fields."""
+
+    def _active(self, **overrides):
+        record = _dynamic_record(connector="mm", **overrides)
+        record.last_activity_at = (datetime.now().astimezone()
+                                   - timedelta(days=1)).isoformat(timespec="seconds")
+        return record
+
+    async def test_the_evaluation_reclaims_a_room_the_connector_no_longer_serves(self):
+        """The issue's own site: a was-active record with NO watermark is
+        never reached by the replay loop, so the evaluation is where an
+        old-team room would otherwise come back to life."""
+        record = self._active(name="mm:old-team-general", room_id="r-old",
+                              session_id="sess-old-team-1234", last_processed_ts="")
+        mgr = _boot_manager([record], connector_name="mm")
+        mgr._connector.room_ref_by_id = AsyncMock(return_value=None)
+        mgr._cancel_jobs = MagicMock()
+
+        with self.assertLogs("agent-chat-gateway.core.session_manager", level="WARNING") as logs:
+            await mgr._evaluate_lifecycle_at_boot()
+
+        mgr._watcher_manager.get_or_create.assert_not_awaited()
+        call = mgr._lifecycle.reclaim_room.await_args
+        self.assertEqual(call.args[0], "r-old")
+        self.assertIs(call.kwargs.get("expected"), record,
+                      "pinned to the snapshot the pass walked, like the recreation")
+        mgr._cancel_jobs.assert_called_once()
+        self.assertEqual(mgr._cancel_jobs.call_args.args[0], "r-old",
+                         "the removal path's tail: a room nobody serves keeps no jobs")
+        self.assertTrue(
+            any("sess-old-team-1234" in line for line in logs.output),
+            "the full session id is what an operator searches for afterwards",
+        )
+
+    async def test_the_replay_reclaims_a_dormant_room_with_a_gap(self):
+        """The replay's own recreation: an idle record with a gap is rebuilt
+        from its record — after the same check."""
+        record = self._active(name="mm:old-team-idle", room_id="r-idle",
+                              session_id="sess-idle-5678")
+        record.dropped_at = record.last_activity_at  # idle: skipped by the evaluation
+        mgr = _boot_manager([record], connector_name="mm", missed=True)
+        mgr._connector.room_ref_by_id = AsyncMock(return_value=None)
+
+        await mgr._replay_persisted_records(_window(mgr))
+
+        mgr._watcher_manager.get_or_create.assert_not_awaited()
+        self.assertEqual(mgr._lifecycle.reclaim_room.await_args.args[0], "r-idle")
+
+    async def test_a_room_still_served_is_recreated_as_before(self):
+        record = self._active(name="mm:kept", room_id="r-kept")
+        mgr = _boot_manager([record], connector_name="mm")
+
+        await mgr._evaluate_lifecycle_at_boot()
+
+        mgr._lifecycle.reclaim_room.assert_not_awaited()
+        self.assertEqual(mgr._watcher_manager.get_or_create.await_args.args[1].id, "r-kept")
+
+    async def test_a_transient_lookup_failure_leaves_the_record_for_this_boot(self):
+        """A raise means "could not ask", not "not ours": nothing is reclaimed
+        or recreated, and the room's next live message resolves it again."""
+        record = self._active(name="mm:flaky", room_id="r-flaky")
+        mgr = _boot_manager([record], connector_name="mm")
+        mgr._connector.room_ref_by_id = AsyncMock(side_effect=RuntimeError("rest down"))
+
+        await mgr._evaluate_lifecycle_at_boot()
+
+        mgr._lifecycle.reclaim_room.assert_not_awaited()
+        mgr._watcher_manager.get_or_create.assert_not_awaited()
+        self.assertEqual(record.dropped_at, "", "left as it was, not stamped idle")
+
+    async def test_an_unserved_room_does_not_stop_the_pass(self):
+        """Best-effort per record, like the recreation itself: one room the
+        connector no longer serves — even one whose reclamation raises — must
+        not keep the rooms after it from coming back."""
+        gone = self._active(name="mm:gone", room_id="r-gone")
+        kept = self._active(name="mm:kept", room_id="r-kept")
+        mgr = _boot_manager([gone, kept], connector_name="mm")
+        mgr._connector.room_ref_by_id = AsyncMock(
+            side_effect=lambda room_id: None if room_id == "r-gone"
+            else RoomRef(id=room_id, kind=RoomKind.CHANNEL))
+        mgr._lifecycle.reclaim_room = AsyncMock(side_effect=RuntimeError("lock hiccup"))
+
+        await mgr._evaluate_lifecycle_at_boot()
+
+        self.assertEqual(
+            [c.args[1].id for c in mgr._watcher_manager.get_or_create.await_args_list],
+            ["r-kept"],
+        )

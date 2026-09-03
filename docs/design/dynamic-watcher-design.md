@@ -380,6 +380,27 @@ Two consequences that are not obvious and were each got wrong once:
   the ts filter suppresses nothing and only the bounded id window separates the
   two passes.
 
+* **Boot resolves a room through the connector before recreating a watcher
+  from its record.** A record's stored room fields say what the room was when
+  the record was written, not whether this connector still serves it: a
+  Mattermost connector whose `server.team` changed under an unchanged name, or
+  an account removed from a room, leaves those fields intact. `room_ref_by_id`
+  is the connector's own scope check and the wake path already goes through
+  it; both boot recreation sites — the lifecycle evaluation and the startup
+  replay — do the same. `None` (gone, another team, no longer a member)
+  reclaims the record through the removal path's shared tail (jobs cancelled,
+  same end state as the bot being removed) with the full session id in the
+  log — reclamation calls the backend's `delete_session`, which some
+  implementations honour (OpenCode deletes the session) and others do not
+  support (Claude keeps it), so the logged id is a recovery path only where
+  the backend keeps the session; a raise (could not ask) leaves the record
+  alone for this boot, and its
+  next live message resolves the room again. The lookup adds one REST call
+  per recreated record to a boot that already makes one per record
+  (`probe_missed_since`). Dormant records — paused, or idle with no gap — are
+  not resolved here; nothing recreates them at boot, and a later `resume` or
+  wake resolves the room itself.
+
 The claim the drain makes is the one piece that is deliberately *not* a replay:
 the frames are handed to the room's worker immediately, and the claim only
 covers the case where the scalar watermark has already moved past them (above).
