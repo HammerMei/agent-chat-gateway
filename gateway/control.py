@@ -605,13 +605,51 @@ class ControlServer:
                     seen.add(name)
         return ", ".join(f"{n!r}" for n in sorted(names))
 
+    def _entries_serving_room(self, room: str) -> list:
+        """The connectors whose lifecycle has a record for `room`.
+
+        `room` is whatever the caller typed: a room id, the room's name, or a
+        watcher handle. Records are the deterministic answer — a room the
+        gateway serves has one — and the lookup is in memory; no connector is
+        asked anything. Issue #136: `send` with no `--connector` on a
+        multi-connector gateway was refused before the room was looked at, and
+        the agent (whose own room always has a record) had to recover by
+        guessing from its identity header.
+        """
+        from .core.state import StateFilter
+
+        serving = []
+        for entry in self._entries:
+            sm = entry.session_manager
+            if sm.record_for_room(room) is not None or sm.resolve_handle(room):
+                serving.append(entry)
+                continue
+            if any(row.get("room_name") == room
+                   for row in sm.list_watchers(StateFilter.ALL)):
+                serving.append(entry)
+        return serving
+
     async def _handle_send(self, request: dict, connector_name: str | None) -> dict:
-        """Handle the 'send' command: route to a connector's send_to_room method."""
+        """Handle the 'send' command: route to a connector's send_to_room method.
+
+        With no `--connector` on a multi-connector gateway, the room decides:
+        exactly one connector with a record for it is used; none or several fall
+        back to the explicit-connector error (#136).
+        """
+        room = request.get("room", "")
+        if not connector_name and len(self._entries) > 1 and room:
+            serving = self._entries_serving_room(room)
+            if len(serving) == 1:
+                connector_name = serving[0].name
+            elif len(serving) > 1:
+                names = ", ".join(f"'{e.name}'" for e in serving)
+                return {"ok": False, "error": (
+                    f"Room {room!r} is served by more than one connector ({names}). "
+                    f"Please specify --connector <name>.")}
         entry = self._resolve_entry(connector_name)
         if isinstance(entry, dict):
             return entry  # error response
 
-        room = request.get("room", "")
         text = request.get("text", "")
         attachment_path = request.get("attachment_path")
 

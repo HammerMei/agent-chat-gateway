@@ -157,6 +157,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   no hint.
 
 ### Fixed
+- **`send` without `--connector` works on a multi-connector gateway for any
+  room the gateway serves** (#136). The connector is found from the room —
+  by id, name or watcher handle — through the lifecycle records, in memory;
+  `--connector` is required only for a room no watcher has, or one served by
+  more than one connector. Agents no longer have to recover from the refusal
+  by reading their identity header.
 - **The durable-instructions file is keyed by the room, and a rename reaches
   the running watcher.** `watcher_prompt_key` no longer includes the handle
   (a static-era deviation from §2.3), so a rename keeps the file the session
