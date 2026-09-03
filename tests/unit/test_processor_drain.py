@@ -50,14 +50,11 @@ class _SlowAgent(AgentBackend):
 def _make_processor(agent: AgentBackend) -> MessageProcessor:
     config = CoreConfig(
         agents={"default": AgentConfig(timeout=10)},
-        default_agent="default",
     )
     connector = MagicMock()
     connector.send_text = AsyncMock()
     connector.format_prompt_prefix = MagicMock(return_value="")
     connector.notify_typing = AsyncMock()
-    connector.notify_online = AsyncMock()
-    connector.notify_offline = AsyncMock()
     return MessageProcessor(
         session_id="ses_001",
         room=Room(id="room_1", name="test-room"),
@@ -75,14 +72,11 @@ def _make_processor_with_prompt_file(
 ) -> MessageProcessor:
     config = CoreConfig(
         agents={"default": AgentConfig(timeout=10)},
-        default_agent="default",
     )
     connector = MagicMock()
     connector.send_text = AsyncMock()
     connector.format_prompt_prefix = MagicMock(return_value="")
     connector.notify_typing = AsyncMock()
-    connector.notify_online = AsyncMock()
-    connector.notify_offline = AsyncMock()
     connector.notify_agent_event = AsyncMock()
     return MessageProcessor(
         session_id="ses_001",
@@ -216,15 +210,12 @@ class TestGracefulDrain(unittest.IsolatedAsyncioTestCase):
         agent = _SlowAgent(delay=0.01)
         config = CoreConfig(
             agents={"default": AgentConfig(timeout=10)},
-            default_agent="default",
             max_queue_depth=2,  # small queue
         )
         connector = MagicMock()
         connector.send_text = AsyncMock()
         connector.format_prompt_prefix = MagicMock(return_value="")
         connector.notify_typing = AsyncMock()
-        connector.notify_online = AsyncMock()
-        connector.notify_offline = AsyncMock()
         proc = MessageProcessor(
             session_id="ses_001",
             room=Room(id="room_1", name="test-room"),
@@ -332,14 +323,11 @@ class TestEnsureContextInjectedRetryOnMessage(unittest.IsolatedAsyncioTestCase):
     def _make_processor_with_injector(self, agent, injector, ws, wc):
         config = CoreConfig(
             agents={"default": AgentConfig(timeout=10)},
-            default_agent="default",
         )
         connector = MagicMock()
         connector.send_text = AsyncMock()
         connector.format_prompt_prefix = MagicMock(return_value="")
         connector.notify_typing = AsyncMock()
-        connector.notify_online = AsyncMock()
-        connector.notify_offline = AsyncMock()
         connector.agent_username = "bot"
         return MessageProcessor(
             session_id="ses_retry",
@@ -362,7 +350,7 @@ class TestEnsureContextInjectedRetryOnMessage(unittest.IsolatedAsyncioTestCase):
         from gateway.core.state import WatcherState
 
         injector = InjectedContextBuilder(
-            CoreConfig(agents={"default": AgentConfig(timeout=10)}, default_agent="default")
+            CoreConfig(agents={"default": AgentConfig(timeout=10)})
         )
         ws = WatcherState(
             watcher_name="w1", session_id="ses_retry", room_id="room_1",
@@ -388,7 +376,7 @@ class TestEnsureContextInjectedRetryOnMessage(unittest.IsolatedAsyncioTestCase):
 
             async def ensure_durable_instructions(
                 self, session_id, working_directory, timeout, content,
-                *, watcher_name, already_delivered,
+                *, path_key, already_delivered,
             ):
                 return await self._send_once_as_durable_fallback(
                     session_id, working_directory, timeout, content, already_delivered,
@@ -400,7 +388,7 @@ class TestEnsureContextInjectedRetryOnMessage(unittest.IsolatedAsyncioTestCase):
         # Simulate the failed startup attempt directly via ensure(), exactly
         # as WatcherLifecycle._start_watcher() would have on gateway boot.
         await injector.ensure(
-            ws, ws.session_id, agent, "/tmp", 10, watcher_name="w1", content="ctx",
+            ws, ws.session_id, agent, "/tmp", 10, watcher_name="w1", path_key='pk-test', content="ctx",
         )
         self.assertEqual(injector.status_for(ws.session_id).state, "failed_retryable")
         self.assertFalse(ws.context_injected)
@@ -421,7 +409,7 @@ class TestEnsureContextInjectedRetryOnMessage(unittest.IsolatedAsyncioTestCase):
         from gateway.core.state import WatcherState
 
         injector = InjectedContextBuilder(
-            CoreConfig(agents={"default": AgentConfig(timeout=10)}, default_agent="default")
+            CoreConfig(agents={"default": AgentConfig(timeout=10)})
         )
         ws = WatcherState(
             watcher_name="w1", session_id="ses_degraded", room_id="room_1",
@@ -445,7 +433,7 @@ class TestEnsureContextInjectedRetryOnMessage(unittest.IsolatedAsyncioTestCase):
 
             async def ensure_durable_instructions(
                 self, session_id, working_directory, timeout, content,
-                *, watcher_name, already_delivered,
+                *, path_key, already_delivered,
             ):
                 return await self._send_once_as_durable_fallback(
                     session_id, working_directory, timeout, content, already_delivered,
@@ -456,7 +444,7 @@ class TestEnsureContextInjectedRetryOnMessage(unittest.IsolatedAsyncioTestCase):
 
         for _ in range(_MAX_INJECT_ATTEMPTS):
             await injector.ensure(
-                ws, ws.session_id, agent, "/tmp", 10, watcher_name="w1", content="ctx",
+                ws, ws.session_id, agent, "/tmp", 10, watcher_name="w1", path_key='pk-test', content="ctx",
             )
         self.assertEqual(injector.status_for(ws.session_id).state, "failed_degraded")
         self.assertTrue(ws.context_injected)
@@ -483,7 +471,7 @@ class TestProcessorStoppingFlag(_IsolatedTestCase3):
 
     def _make_processor(self, connector, agent):
         agent_cfg = AgentConfig(timeout=10)
-        config = CoreConfig(agents={"default": agent_cfg}, default_agent="default")
+        config = CoreConfig(agents={"default": agent_cfg})
         room = Room(id="room-1", name="general", type="channel")
         return MessageProcessor(
             session_id="test-session",

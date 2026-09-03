@@ -19,8 +19,8 @@ from __future__ import annotations
 import unittest
 from unittest.mock import AsyncMock, MagicMock
 
-from gateway.core.connector import IncomingMessage, Room, User, UserRole
-from gateway.core.dispatch import MessageDispatcher
+from gateway.core.connector import IncomingMessage, Room, RoomCapacity, User, UserRole
+from gateway.core.dispatch import MessageDispatcher, RoomAlreadyRoutedError
 from gateway.core.permission import PermissionRegistry, PermissionRequest
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
@@ -342,55 +342,116 @@ class TestPermissionCommandInterception(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(result)
 
 
-# ── Watermark semantics (any vs all) ─────────────────────────────────────────
+# ── One room, one processor (§4.1) ───────────────────────────────────────────
 
 
-class TestDispatchWatermarkSemantics(unittest.IsolatedAsyncioTestCase):
-    """dispatch() uses any(results): watermark advances if at least one processor accepts."""
+class TestOneRoomOneProcessor(unittest.IsolatedAsyncioTestCase):
+    """The index is a single slot, so the invariant cannot be violated at all.
 
-    def _make_processor(self, accepts: bool) -> MagicMock:
+    It used to be a list, and `dispatch` fanned out to every entry — which meant a
+    duplicate registration silently became two agents answering every message. The
+    tests that stood here pinned that fan-out (`any()` across results, one accepting
+    while another was full). They are gone rather than adapted: they described a state
+    the index can no longer hold, and rewriting them to pass would have been keeping
+    the shape of a removed behaviour.
+
+    This does not touch the multi-agent model, where each agent has its own bot account
+    and therefore its own connector — and each connector its own dispatcher.
+    """
+
+    def _make_processor(self, watcher_id: str, accepts: bool = True) -> MagicMock:
         proc = MagicMock()
         proc.enqueue = AsyncMock(return_value=accepts)
         proc.is_accepting = accepts
+        proc.watcher_id = watcher_id
         return proc
 
-    async def test_both_accept_returns_true(self):
+    async def test_the_processor_that_holds_the_room_receives_the_message(self):
         dispatcher, _ = _make_dispatcher()
-        p1 = self._make_processor(True)
-        p2 = self._make_processor(True)
-        dispatcher.add_processor("room_1", p1)
-        dispatcher.add_processor("room_1", p2)
+        proc = self._make_processor("w1")
+        dispatcher.add_processor("room_1", proc)
 
-        result = await dispatcher.dispatch(_make_msg("hello", role=UserRole.GUEST))
-        self.assertTrue(result)
+        self.assertTrue(await dispatcher.dispatch(_make_msg("hi", role=UserRole.GUEST)))
+        proc.enqueue.assert_awaited_once()
 
-    async def test_one_accepts_one_drops_returns_true(self):
-        """If p1 accepts and p2 drops (queue full), watermark still advances."""
+    async def test_a_full_queue_returns_false_so_the_watermark_holds(self):
+        """A drop must not advance the connector's dedup cursor, or the message is lost
+        on reconnect instead of redelivered."""
         dispatcher, _ = _make_dispatcher()
-        p1 = self._make_processor(True)
-        p2 = self._make_processor(False)
-        dispatcher.add_processor("room_1", p1)
-        dispatcher.add_processor("room_1", p2)
+        dispatcher.add_processor("room_1", self._make_processor("w1", accepts=False))
 
-        result = await dispatcher.dispatch(_make_msg("hello", role=UserRole.GUEST))
-        self.assertTrue(result)
+        self.assertFalse(await dispatcher.dispatch(_make_msg("hi", role=UserRole.GUEST)))
 
-    async def test_both_drop_returns_false(self):
-        """If ALL processors drop the message, watermark must NOT advance."""
+    async def test_no_processor_returns_false(self):
         dispatcher, _ = _make_dispatcher()
-        p1 = self._make_processor(False)
-        p2 = self._make_processor(False)
-        dispatcher.add_processor("room_1", p1)
-        dispatcher.add_processor("room_1", p2)
+        self.assertFalse(await dispatcher.dispatch(_make_msg("hi", role=UserRole.GUEST)))
 
-        result = await dispatcher.dispatch(_make_msg("hello", role=UserRole.GUEST))
-        self.assertFalse(result)
-
-    async def test_no_processors_returns_false(self):
-        """No processors registered for the room → dispatch returns False."""
+    async def test_a_second_watcher_cannot_take_an_occupied_room(self):
         dispatcher, _ = _make_dispatcher()
-        result = await dispatcher.dispatch(_make_msg("hello", role=UserRole.GUEST))
-        self.assertFalse(result)
+        first = self._make_processor("w1")
+        dispatcher.add_processor("room_1", first)
+
+        with self.assertRaises(RoomAlreadyRoutedError) as cm:
+            dispatcher.add_processor("room_1", self._make_processor("w2"))
+
+        msg = str(cm.exception)
+        self.assertIn("w1", msg)
+        self.assertIn("w2", msg)
+
+        # And the refusal leaves the incumbent serving the room.
+        await dispatcher.dispatch(_make_msg("hi", role=UserRole.GUEST))
+        first.enqueue.assert_awaited_once()
+
+    async def test_the_same_watcher_may_register_again(self):
+        """A restart — reset, or a recreation — builds a new processor object for the
+        same watcher. Refusing that would leave the room unroutable until the daemon
+        restarted, so identity is by watcher, not by object."""
+        dispatcher, _ = _make_dispatcher()
+        dispatcher.add_processor("room_1", self._make_processor("w1"))
+        replacement = self._make_processor("w1")
+        dispatcher.add_processor("room_1", replacement)
+
+        await dispatcher.dispatch(_make_msg("hi", role=UserRole.GUEST))
+        replacement.enqueue.assert_awaited_once()
+
+    def test_removal_is_identity_checked(self):
+        """A watcher whose claim was refused runs the same teardown path, and it must
+        not unroute the watcher that actually holds the room."""
+        dispatcher, _ = _make_dispatcher()
+        holder = self._make_processor("w1")
+        dispatcher.add_processor("room_1", holder)
+
+        dispatcher.remove_processor("room_1", self._make_processor("w2"))
+        self.assertIs(dispatcher._room_processor.get("room_1"), holder)
+
+        dispatcher.remove_processor("room_1", holder)
+        self.assertNotIn("room_1", dispatcher._room_processor)
+
+
+class TestCapacityDistinguishesEmptyFromFull(unittest.IsolatedAsyncioTestCase):
+    """A bool made an idle gateway announce it was busy.
+
+    Both connectors read this to decide whether to post "server busy" into the room, and
+    a room with no processor answered identically to a room whose queue was full — so a
+    message for an unrouted room produced backpressure language from a gateway with
+    nothing to do (§2.7).
+    """
+
+    def _make_processor(self, accepts: bool) -> MagicMock:
+        proc = MagicMock()
+        proc.is_accepting = accepts
+        proc.watcher_id = "w1"
+        return proc
+
+    def test_the_three_states_are_distinct(self):
+        dispatcher, _ = _make_dispatcher()
+        self.assertIs(dispatcher.capacity("room_1"), RoomCapacity.UNROUTED)
+
+        dispatcher.add_processor("room_1", self._make_processor(accepts=True))
+        self.assertIs(dispatcher.capacity("room_1"), RoomCapacity.AVAILABLE)
+
+        dispatcher.add_processor("room_1", self._make_processor(accepts=False))
+        self.assertIs(dispatcher.capacity("room_1"), RoomCapacity.FULL)
 
 
 if __name__ == "__main__":
@@ -426,10 +487,15 @@ class _MockAgentBackend(_AgentBackend):
         return None
 
 
-def _make_watcher_cr(room="script", name=None):
-    from gateway.config import WatcherConfig
-    return WatcherConfig(
-        name=name or room, connector="script", room=room, agent="default"
+def _make_rule_cr(room="script", name=None):
+    """A rule naming the script room literally — the eager-start loop (§2.6)
+    creates the watcher at run_once, the port of the old static start."""
+    from gateway.core.room_pattern import RoomPattern
+    from gateway.core.watcher_rule import RoomMatcher, WatcherRule
+
+    return WatcherRule(
+        name=name or room, connector="script", agent="default",
+        rooms=RoomMatcher(include=(RoomPattern(room),)),
     )
 
 
@@ -446,19 +512,21 @@ def _make_permission_request_cr(registry, room_id="script", session_id="mock-ses
     return req
 
 
-def _make_manager_cr(connector, agent, watcher_configs=None, permission_registry=None):
+def _make_manager_cr(connector, agent, watcher_rules=None, permission_registry=None):
     from gateway.config import AgentConfig
     from gateway.core.config import CoreConfig
     from gateway.core.session_manager import SessionManager
 
     agent_cfg = AgentConfig(timeout=10)
-    config = CoreConfig(agents={"default": agent_cfg}, default_agent="default")
+    config = CoreConfig(agents={"default": agent_cfg})
     return SessionManager(
         connector,
         {"default": agent},
-        "default",
         config,
-        watcher_configs=watcher_configs or [],
+        # The name rules bind to: _make_rule_cr's rules say connector="script",
+        # and the manager keys its matches on state_name.
+        state_name="script",
+        watcher_rules=watcher_rules,
         permission_registry=permission_registry,
     )
 
@@ -476,7 +544,7 @@ class TestPermissionCommandPreFanOut(_IsolatedTestCase):
         agent = _MockAgentBackend()
         registry = PermissionRegistry()
         manager = _make_manager_cr(
-            connector, agent, watcher_configs=[_make_watcher_cr()], permission_registry=registry
+            connector, agent, watcher_rules=[_make_rule_cr()], permission_registry=registry
         )
         await manager.run_once()
 
@@ -498,7 +566,7 @@ class TestPermissionCommandPreFanOut(_IsolatedTestCase):
         agent = _MockAgentBackend()
         registry = PermissionRegistry()
         manager = _make_manager_cr(
-            connector, agent, watcher_configs=[_make_watcher_cr()], permission_registry=registry
+            connector, agent, watcher_rules=[_make_rule_cr()], permission_registry=registry
         )
         await manager.run_once()
 
@@ -518,7 +586,7 @@ class TestPermissionCommandPreFanOut(_IsolatedTestCase):
         agent = _MockAgentBackend()
         registry = PermissionRegistry()
         manager = _make_manager_cr(
-            connector, agent, watcher_configs=[_make_watcher_cr()], permission_registry=registry
+            connector, agent, watcher_rules=[_make_rule_cr()], permission_registry=registry
         )
         await manager.run_once()
 
@@ -540,7 +608,7 @@ class TestPermissionCommandPreFanOut(_IsolatedTestCase):
         agent = _MockAgentBackend()
         registry = PermissionRegistry()
         manager = _make_manager_cr(
-            connector, agent, watcher_configs=[_make_watcher_cr()], permission_registry=registry
+            connector, agent, watcher_rules=[_make_rule_cr()], permission_registry=registry
         )
         await manager.run_once()
 
@@ -559,7 +627,7 @@ class TestPermissionCommandPreFanOut(_IsolatedTestCase):
         agent = _MockAgentBackend()
         registry = PermissionRegistry()
         manager = _make_manager_cr(
-            connector, agent, watcher_configs=[_make_watcher_cr()], permission_registry=registry
+            connector, agent, watcher_rules=[_make_rule_cr()], permission_registry=registry
         )
         await manager.run_once()
 
@@ -578,7 +646,7 @@ class TestPermissionCommandPreFanOut(_IsolatedTestCase):
         agent = _MockAgentBackend()
         registry = PermissionRegistry()
         manager = _make_manager_cr(
-            connector, agent, watcher_configs=[_make_watcher_cr()], permission_registry=registry
+            connector, agent, watcher_rules=[_make_rule_cr()], permission_registry=registry
         )
         await manager.run_once()
 
@@ -600,7 +668,7 @@ class TestPermissionCommandPreFanOut(_IsolatedTestCase):
         agent = _MockAgentBackend(responses=["hello back"])
         registry = PermissionRegistry()
         manager = _make_manager_cr(
-            connector, agent, watcher_configs=[_make_watcher_cr()], permission_registry=registry
+            connector, agent, watcher_rules=[_make_rule_cr()], permission_registry=registry
         )
         await manager.run_once()
 

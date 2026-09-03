@@ -2,6 +2,15 @@
 helpers — find_referencing_watcher_labels() specifically, since it's the
 basis for the pre-delete "still used by watcher(s): ..." check on both
 AgentDetailScreen and ConnectorDetailScreen.
+
+Rewritten with the Rules tab: a `watchers:` entry is a RULE with a required
+unique name, so labels are the rules' own names (position fallback for a
+malformed nameless entry) and matching walks the raw entries' MERGED view —
+it no longer needs the whole config to load, which the old
+expanded-watchers implementation did. That old implementation returned []
+for every rule (rules never expanded), silently unblocking the deletion of
+a connector every rule referenced — the regression this suite now pins
+against.
 """
 
 from __future__ import annotations
@@ -12,7 +21,14 @@ import unittest
 from pathlib import Path
 
 from gateway.configtool.model import EditableConfig
-from gateway.configtool.screens.form_common import find_referencing_watcher_labels
+from gateway.configtool.screens.form_common import (
+    FieldSpec,
+    find_referencing_watcher_labels,
+    list_to_text,
+    list_value_is_lossy,
+    read_widget_value,
+    round_trip_value,
+)
 
 
 class TestFindReferencingWatcherLabels(unittest.TestCase):
@@ -26,8 +42,9 @@ class TestFindReferencingWatcherLabels(unittest.TestCase):
         path.write_text(textwrap.dedent(yaml_text))
         return EditableConfig.load(path)
 
-    def test_finds_a_watcher_by_explicit_connector(self):
-        cfg = self._cfg(f"""\
+    def _base(self, watchers_yaml: str, extra_top: str = "") -> EditableConfig:
+        return self._cfg(f"""\
+            {extra_top}
             agents:
               default:
                 type: claude
@@ -36,145 +53,119 @@ class TestFindReferencingWatcherLabels(unittest.TestCase):
               - name: rc
                 type: rocketchat
                 server: {{url: http://localhost:3000, username: bot, password: pw}}
-            watchers:
-              - name: my-watcher
-                connector: rc
-                agent: default
-                room: general
+            watcher_rules:
+{watchers_yaml}
         """)
-        labels = find_referencing_watcher_labels(cfg, connector_name="rc")
-        self.assertEqual(labels, ["my-watcher"])
 
-    def test_finds_a_watcher_by_explicit_agent(self):
-        cfg = self._cfg(f"""\
-            agents:
-              default:
-                type: claude
-                working_directory: {self.agent_dir}
-            connectors:
-              - name: rc
-                type: rocketchat
-                server: {{url: http://localhost:3000, username: bot, password: pw}}
-            watchers:
-              - name: my-watcher
-                connector: rc
-                agent: default
-                room: general
-        """)
-        labels = find_referencing_watcher_labels(cfg, agent_name="default")
-        self.assertEqual(labels, ["my-watcher"])
+    def test_finds_a_rule_by_explicit_connector(self):
+        cfg = self._base(
+            "              - name: my-rule\n"
+            "                connector: rc\n"
+            "                agent: default\n"
+            "                rooms:\n"
+            "                  include: [general]\n"
+        )
+        self.assertEqual(find_referencing_watcher_labels(cfg, connector_name="rc"), ["my-rule"])
+
+    def test_finds_a_rule_by_explicit_agent(self):
+        cfg = self._base(
+            "              - name: my-rule\n"
+            "                connector: rc\n"
+            "                agent: default\n"
+            "                rooms:\n"
+            "                  include: [general]\n"
+        )
+        self.assertEqual(find_referencing_watcher_labels(cfg, agent_name="default"), ["my-rule"])
 
     def test_returns_empty_when_nothing_references_the_name(self):
-        cfg = self._cfg(f"""\
-            agents:
-              default:
-                type: claude
-                working_directory: {self.agent_dir}
-            connectors:
-              - name: rc
-                type: rocketchat
-                server: {{url: http://localhost:3000, username: bot, password: pw}}
-            watchers:
-              - name: my-watcher
-                connector: rc
-                agent: default
-                room: general
-        """)
+        cfg = self._base(
+            "              - name: my-rule\n"
+            "                connector: rc\n"
+            "                agent: default\n"
+            "                rooms:\n"
+            "                  include: [general]\n"
+        )
         self.assertEqual(find_referencing_watcher_labels(cfg, connector_name="unrelated"), [])
         self.assertEqual(find_referencing_watcher_labels(cfg, agent_name="unrelated"), [])
 
-    def test_finds_a_watcher_that_only_inherits_its_connector_from_a_template(self):
+    def test_finds_a_rule_that_only_inherits_its_connector_from_a_template(self):
         """A watcher_templates: entry may set connector/agent (unlike
-        name/room/rooms/session_id) — a watcher entry with no explicit
-        'connector:' of its own, only inheriting one via 'inherits:', still
-        counts as referencing it. Goes through the real loader
-        (expanded_watchers() -> GatewayConfig.from_file()), which resolves
-        inherits: templates just like it resolves anything else — this is
-        NOT one of the TUI's own stale *_defaults-display concerns."""
-        cfg = self._cfg(f"""\
-            watcher_templates:
-              standard:
-                connector: rc
-            agents:
-              default:
-                type: claude
-                working_directory: {self.agent_dir}
-            connectors:
-              - name: rc
-                type: rocketchat
-                server: {{url: http://localhost:3000, username: bot, password: pw}}
-            watchers:
-              - name: my-watcher
-                inherits: standard
-                agent: default
-                room: general
-        """)
-        labels = find_referencing_watcher_labels(cfg, connector_name="rc")
-        self.assertEqual(labels, ["my-watcher"])
+        name/room/rooms/session_id) — a rule with no explicit 'connector:'
+        of its own, only inheriting one via 'inherits:', still counts as
+        referencing it (checked against the MERGED view)."""
+        cfg = self._base(
+            "              - name: my-rule\n"
+            "                inherits: standard\n"
+            "                agent: default\n"
+            "                rooms:\n"
+            "                  include: [general]\n",
+            extra_top="watcher_templates:\n              standard:\n                connector: rc\n",
+        )
+        self.assertEqual(find_referencing_watcher_labels(cfg, connector_name="rc"), ["my-rule"])
 
-    def test_label_uses_the_real_auto_generated_name_when_the_watcher_has_no_name(self):
-        """The real name an unnamed watcher gets everywhere else in the TUI
-        (e.g. the Overview's Watchers tab) is `_auto_watcher_name()`'s
-        "<connector>-<room>" (gateway/config.py) — NOT the bare room string.
-        A user-reported mismatch here was the actual bug this test pins."""
-        cfg = self._cfg(f"""\
-            agents:
-              default:
-                type: claude
-                working_directory: {self.agent_dir}
-            connectors:
-              - name: rc
-                type: rocketchat
-                server: {{url: http://localhost:3000, username: bot, password: pw}}
-            watchers:
-              - connector: rc
-                agent: default
-                room: general
-        """)
-        labels = find_referencing_watcher_labels(cfg, connector_name="rc")
-        self.assertEqual(labels, ["rc-general"])
+    def test_a_nameless_malformed_entry_falls_back_to_its_position_label(self):
+        """A rule's name is required — a raw entry without one is malformed
+        (the loader refuses it), but if it names the connector, deleting
+        that connector still deserves a block with SOME label."""
+        cfg = self._base(
+            "              - connector: rc\n"
+            "                agent: default\n"
+            "                rooms:\n"
+            "                  include: [general]\n"
+        )
+        self.assertEqual(find_referencing_watcher_labels(cfg, connector_name="rc"), ["watchers[0]"])
 
-    def test_a_rooms_group_produces_one_label_per_real_expanded_watcher(self):
-        """A `rooms: [a, b]` entry is 2 SEPARATE real watchers (rc-general,
-        rc-dev), not one joined "general, dev" string."""
-        cfg = self._cfg(f"""\
-            agents:
-              default:
-                type: claude
-                working_directory: {self.agent_dir}
-            connectors:
-              - name: rc
-                type: rocketchat
-                server: {{url: http://localhost:3000, username: bot, password: pw}}
-            watchers:
-              - connector: rc
-                agent: default
-                rooms: [general, dev]
-        """)
-        labels = find_referencing_watcher_labels(cfg, connector_name="rc")
-        self.assertEqual(labels, ["rc-general", "rc-dev"])
+    def test_the_position_label_uses_the_unfiltered_document_index(self):
+        """Internal review (lens A): the `watchers[i]` fallback used to be
+        numbered over the FILTERED dict-only list, so a non-mapping entry
+        earlier in `watchers:` made the label disagree with every other
+        consumer of that spelling — the Rules tab's row numbers and the
+        validator's own `(index i)`/`watchers[i]` attributions all number
+        the unfiltered document list."""
+        cfg = self._base(
+            "              - \"garbage string, not a mapping\"\n"
+            "              - connector: rc\n"
+            "                agent: default\n"
+            "                rooms:\n"
+            "                  include: [general]\n"
+        )
+        self.assertEqual(find_referencing_watcher_labels(cfg, connector_name="rc"), ["watchers[1]"])
 
-    def test_returns_empty_when_the_config_does_not_currently_load(self):
-        """A delete pre-check has nothing useful to say if the config is
-        already broken for some unrelated reason — save()'s own validation
-        remains the backstop for that; this must not raise."""
-        cfg = self._cfg(f"""\
-            agents:
-              default:
-                type: claude
-                working_directory: {self.agent_dir}
-            connectors:
-              - name: rc
-                type: rocketchat
-                server: {{url: http://localhost:3000, username: bot, password: pw}}
-            watchers:
-              - connector: rc
-                agent: nonexistent-agent
-                room: general
-        """)
+    def test_a_broken_config_still_blocks_on_explicit_references(self):
+        """Regression: the old expanded-watchers implementation returned []
+        whenever the config didn't fully load, so deleting a connector that
+        a (broken) rule explicitly referenced went unblocked. Matching is
+        raw-entry-based now — an unrelated breakage elsewhere must not
+        silently unblock this deletion."""
+        cfg = self._base(
+            "              - name: my-rule\n"
+            "                connector: rc\n"
+            "                agent: nonexistent-agent\n"
+            "                rooms:\n"
+            "                  include: [general]\n"
+        )
+        self.assertEqual(find_referencing_watcher_labels(cfg, connector_name="rc"), ["my-rule"])
+
+    def test_a_rule_with_no_connector_blocks_nobody(self):
+        """Inverted with the fallback it was written for.
+
+        Codex review of #129 established that a rule with no connector resolved
+        to the FIRST connector in document order, and that deleting that
+        connector left the config VALID — the fallback silently rebound the rule
+        — so `save()`'s gate never blocked it and this pre-check had to resolve
+        the same fallback by hand. There is no fallback now: such a rule is a
+        load error in its own right, the config does NOT stay valid, and
+        `save()` is the backstop it was always claimed to be. Nothing to
+        resolve, so nothing to block."""
+        cfg = self._base(
+            "              - name: my-rule\n"
+            "                agent: default\n"
+            "                rooms:\n"
+            "                  include: [general]\n"
+        )
         self.assertEqual(find_referencing_watcher_labels(cfg, connector_name="rc"), [])
 
-    def test_multiple_referencing_watchers_are_all_returned(self):
+    def test_the_fallback_rule_does_not_block_a_non_first_connector(self):
         cfg = self._cfg(f"""\
             agents:
               default:
@@ -184,18 +175,70 @@ class TestFindReferencingWatcherLabels(unittest.TestCase):
               - name: rc
                 type: rocketchat
                 server: {{url: http://localhost:3000, username: bot, password: pw}}
-            watchers:
-              - name: watcher-a
+              - name: rc2
+                type: rocketchat
+                server: {{url: http://localhost:3001, username: bot2, password: pw2}}
+            watcher_rules:
+              - name: my-rule
                 connector: rc
                 agent: default
-                room: general
-              - name: watcher-b
-                connector: rc
-                agent: default
-                room: dev
+                rooms:
+                  include: [general]
         """)
-        labels = find_referencing_watcher_labels(cfg, connector_name="rc")
-        self.assertEqual(labels, ["watcher-a", "watcher-b"])
+        # The rule names 'rc' explicitly, which is the only way to reference one
+        # now — rc2 is untouched.
+        self.assertEqual(find_referencing_watcher_labels(cfg, connector_name="rc2"), [])
+        self.assertEqual(find_referencing_watcher_labels(cfg, connector_name="rc"), ["my-rule"])
+
+    def test_a_rule_with_no_agent_blocks_nobody(self):
+        """There is no agent fallback left to blame.
+
+        This test used to assert the opposite: a rule with no `agent:` anywhere
+        referenced the loader's FALLBACK agent (`default_agent:` when set, the
+        first agent otherwise) and blocked THAT agent's deletion — because
+        deleting it left the config valid while silently rebinding the rule.
+        `default_agent:` is gone and `agent:` is required, so such a rule is a
+        load error in its own right; there is nothing to rebind to and nothing
+        to protect. The connector fallback has since gone the same way — see
+        `test_a_rule_with_no_connector_blocks_nobody` above.
+        """
+        cfg = self._cfg(f"""\
+            agents:
+              default:
+                type: claude
+                working_directory: {self.agent_dir}
+              other:
+                type: claude
+                working_directory: {self.agent_dir}
+            connectors:
+              - name: rc
+                type: rocketchat
+                server: {{url: http://localhost:3000, username: bot, password: pw}}
+            watcher_rules:
+              - name: my-rule
+                connector: rc
+                rooms:
+                  include: [general]
+        """)
+        self.assertEqual(find_referencing_watcher_labels(cfg, agent_name="other"), [])
+        self.assertEqual(find_referencing_watcher_labels(cfg, agent_name="default"), [])
+
+    def test_multiple_referencing_rules_are_all_returned(self):
+        cfg = self._base(
+            "              - name: rule-a\n"
+            "                connector: rc\n"
+            "                agent: default\n"
+            "                rooms:\n"
+            "                  include: [general]\n"
+            "              - name: rule-b\n"
+            "                connector: rc\n"
+            "                agent: default\n"
+            "                rooms:\n"
+            "                  include: [dev]\n"
+        )
+        self.assertEqual(
+            find_referencing_watcher_labels(cfg, connector_name="rc"), ["rule-a", "rule-b"]
+        )
 
     def test_both_connector_and_agent_filters_must_match(self):
         cfg = self._cfg(f"""\
@@ -210,11 +253,12 @@ class TestFindReferencingWatcherLabels(unittest.TestCase):
               - name: rc
                 type: rocketchat
                 server: {{url: http://localhost:3000, username: bot, password: pw}}
-            watchers:
-              - name: watcher-a
+            watcher_rules:
+              - name: rule-a
                 connector: rc
                 agent: other
-                room: general
+                rooms:
+                  include: [general]
         """)
         # connector matches but agent doesn't -> no match
         self.assertEqual(
@@ -222,9 +266,124 @@ class TestFindReferencingWatcherLabels(unittest.TestCase):
         )
         self.assertEqual(
             find_referencing_watcher_labels(cfg, connector_name="rc", agent_name="other"),
-            ["watcher-a"],
+            ["rule-a"],
         )
 
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestListToTextTolerance(unittest.TestCase):
+    """A "list"-kind field's box must render ANY on-disk value without
+    crashing and without silently rewriting it (Codex review of #129,
+    round 4 — both failures pre-existed this branch, and the same pair is
+    documented at the loader in `_resolve_paths`)."""
+
+    def test_a_real_list_is_joined(self):
+        self.assertEqual(list_to_text(["a", "b"]), "a, b")
+
+    def test_an_empty_or_absent_value_is_blank(self):
+        self.assertEqual(list_to_text([]), "")
+        self.assertEqual(list_to_text(None), "")
+
+    def test_a_truthy_non_iterable_renders_as_one_item_not_a_typeerror(self):
+        """`rooms.include: 5` used to raise TypeError mid-compose, taking
+        the TUI down on a row the validator had just invited the operator
+        to repair."""
+        self.assertEqual(list_to_text(5), "5")
+
+    def test_a_bare_string_is_one_item_not_one_item_per_character(self):
+        """`context_inject_files: notes.md` used to display
+        'n, o, t, e, s, ., m, d' — and saving that box wrote eight bogus
+        one-character paths over the operator's one real value."""
+        self.assertEqual(list_to_text("notes.md"), "notes.md")
+
+
+class _Shim:
+    def __init__(self, value):
+        self.value = value
+
+
+class TestRoundTripValueEnumeratesEveryKind(unittest.TestCase):
+    """The snapshot a form diffs against must be what a freshly-composed
+    widget reads back, or an untouched field looks edited and Save rewrites
+    it. Two rounds of review each found another value shape where the two
+    disagreed, so this enumerates the surface: for EVERY field kind, the
+    round-tripped snapshot must be a fixed point of the widget's own
+    read-back (Codex review of #129, rounds 4-5)."""
+
+    # (spec, on-disk value) pairs covering each kind plus the shapes that
+    # actually broke: a quoted number, a bare string in a list field, a
+    # list item containing the join delimiter, falsy-but-present values.
+    CASES = [
+        (FieldSpec("s", "str", "S"), "hello"),
+        (FieldSpec("s", "str", "S"), ""),
+        (FieldSpec("s", "str", "S"), None),
+        (FieldSpec("i", "int", "I"), 15),
+        (FieldSpec("i", "int", "I"), 0),
+        (FieldSpec("i", "int", "I"), "15"),          # quoted number
+        (FieldSpec("i", "int", "I"), None),
+        (FieldSpec("f", "float", "F"), 1.5),
+        (FieldSpec("f", "float", "F"), 0.0),
+        (FieldSpec("f", "float", "F"), "1.5"),       # quoted number
+        (FieldSpec("b", "bool", "B"), True),
+        (FieldSpec("b", "bool", "B"), False),
+        (FieldSpec("b", "bool", "B"), None),
+        (FieldSpec("l", "list", "L"), ["a", "b"]),
+        (FieldSpec("l", "list", "L"), []),
+        (FieldSpec("l", "list", "L"), None),
+        (FieldSpec("l", "list", "L"), "notes.md"),   # bare string
+        (FieldSpec("l", "list", "L"), ["team,one"]),  # delimiter in an item
+        (FieldSpec("l", "list", "L"), 5),            # truthy non-iterable
+        (FieldSpec("e", "enum", "E", options=("x", "y")), "y"),
+        (FieldSpec("e", "enum", "E", options=("x", "y")), "nope"),
+    ]
+
+    def test_every_kind_and_shape_is_a_fixed_point_of_the_widget_readback(self):
+        for spec, raw in self.CASES:
+            with self.subTest(kind=spec.kind, raw=raw):
+                snapshot = round_trip_value(spec, raw)
+                # What the composed widget shows for that snapshot, read back
+                # exactly as _collect_field_updates() would read it.
+                if spec.kind == "bool":
+                    readback = read_widget_value(spec, _Shim(bool(snapshot)))
+                elif spec.kind == "enum":
+                    readback = read_widget_value(spec, _Shim(snapshot))
+                elif spec.kind == "list":
+                    readback = read_widget_value(spec, _Shim(list_to_text(snapshot)))
+                else:
+                    readback = read_widget_value(
+                        spec, _Shim("" if snapshot is None else str(snapshot))
+                    )
+                self.assertEqual(
+                    readback, snapshot,
+                    f"{spec.kind} field with {raw!r} on disk would read as "
+                    f"{readback!r} against a snapshot of {snapshot!r} — an "
+                    "untouched field that Save would rewrite",
+                )
+
+    def test_an_unparseable_number_is_kept_raw_rather_than_invented(self):
+        """Save is refused loudly on it either way; inventing a value here
+        would be the silent rewrite this exists to stop."""
+        self.assertEqual(round_trip_value(FieldSpec("i", "int", "I"), "abc"), "abc")
+
+
+class TestListValueIsLossy(unittest.TestCase):
+    """Which list values the comma-joined box cannot represent (Codex review
+    of #129, round 6)."""
+
+    def test_an_item_containing_the_delimiter_is_lossy(self):
+        self.assertTrue(list_value_is_lossy(["team,one"]))
+        self.assertTrue(list_value_is_lossy(["ok", "my,notes.md"]))
+
+    def test_ordinary_items_are_not_lossy(self):
+        self.assertFalse(list_value_is_lossy(["a", "b"]))
+        self.assertFalse(list_value_is_lossy([]))
+        self.assertFalse(list_value_is_lossy(None))
+
+    def test_a_non_list_is_not_lossy(self):
+        """A bare string or scalar renders as one item verbatim
+        (list_to_text) and is not split, so there is nothing to lose."""
+        self.assertFalse(list_value_is_lossy("notes.md"))
+        self.assertFalse(list_value_is_lossy(5))

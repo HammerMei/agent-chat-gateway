@@ -40,7 +40,7 @@ import hmac
 import logging
 import uuid
 from dataclasses import dataclass, field
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
 
 from ...agents.response import AgentResponse
 from ...core.connector import (
@@ -51,6 +51,9 @@ from ...core.connector import (
     User,
     UserRole,
 )
+
+if TYPE_CHECKING:
+    from ...core.watcher_manager import RoomRef
 from .config import VoiceConfig
 
 logger = logging.getLogger("agent-chat-gateway.connectors.voice")
@@ -87,7 +90,20 @@ class VoiceConnector(Connector):
     """HTTP voice gateway connector.
 
     One instance per ``type: voice`` connector entry in config.yaml.
-    Starts an asyncio HTTP server on ``connect()`` and stops it on ``disconnect()``.
+
+    Lifecycle, and the middle step is not optional::
+
+        await connector.connect()        # binds the port; does NOT accept yet
+        # ... watchers start, processors are installed ...
+        await connector.start_inbound()  # begins accepting requests
+        await connector.disconnect()     # closes the server
+
+    Binding and accepting are separate on purpose. Binding early keeps a port conflict
+    a startup failure where it is easy to attribute; accepting late means a request
+    never arrives before a watcher can answer it — one that did would reach a
+    dispatcher with no processor and be told the gateway is busy, which is a wrong
+    answer from a daemon that is merely still starting. An embedding that skips
+    ``start_inbound()`` gets a bound port that refuses every connection.
 
     Endpoint: ``POST /ask/<room>``
         The ``<room>`` segment is the ACG room name — matches the ``room:``
@@ -106,11 +122,22 @@ class VoiceConnector(Connector):
     # ── Lifecycle ─────────────────────────────────────────────────────────────
 
     async def connect(self) -> None:
-        """Start the HTTP server and log the listen address."""
+        """Bind the listen address without accepting connections yet.
+
+        `start_inbound()` is what opens the door; see the class docstring for why the
+        two halves are separate.
+        """
+        # Bound but not accepting: `start_serving=False` keeps a port conflict a
+        # startup failure at the moment it is easiest to attribute, while leaving the
+        # listener closed until `start_inbound()`. Serving from here would answer
+        # requests that arrive before the watcher's processor is installed, and the
+        # dispatcher has nothing to route them to — the caller hears "the gateway is
+        # busy" from a gateway that is merely still starting.
         self._server = await asyncio.start_server(
             self._handle_connection,
             host=self._config.host,
             port=self._config.port,
+            start_serving=False,
         )
         addrs = ", ".join(
             str(s.getsockname()) for s in self._server.sockets or []
@@ -127,6 +154,16 @@ class VoiceConnector(Connector):
                 "VoiceConnector has no 'secret' set — any device on the network "
                 "can send voice commands to the agent. Set a bearer token in config."
             )
+
+    async def start_inbound(self) -> None:
+        """Begin accepting requests, once the watchers that answer them exist.
+
+        The socket is already bound (see `connect()`), so this only starts accepting.
+        Callers arriving before it are refused by the OS rather than told the gateway is
+        busy — an honest "not up yet" instead of a wrong answer from a healthy daemon.
+        """
+        if self._server is not None:
+            await self._server.start_serving()
 
     async def disconnect(self) -> None:
         """Stop the HTTP server."""
@@ -183,6 +220,26 @@ class VoiceConnector(Connector):
 
     async def resolve_room(self, room_name: str) -> Room:
         return Room(id=room_name, name=room_name, type="channel")
+
+    async def room_ref_by_id(self, room_id: str) -> "RoomRef | None":
+        """See `Connector.room_ref_by_id`.
+
+        Voice has no room directory to consult: `resolve_room` returns a
+        `Room` whose id IS its name, so the inverse is the same identity read the
+        other way. Any id names a valid room here — a room is the `/ask/<room>` path a caller chooses, created on first use — so this never
+        answers `None`. Kind is `CHANNEL`, which is what the inbound path assigns
+        (`kind_for.get('channel')`).
+
+        Without this, a scheduled job could not bring one of these watchers back
+        after an `expire`: the base class answers `None` for a connector that
+        cannot look a room up by id, and the fire then failed at every slot while
+        logging that the room was "gone, in another team, or this account is no
+        longer in it" — none of which can be true of a voice room.
+        """
+        from ...core.watcher_manager import RoomRef
+        from ...core.watcher_rule import RoomKind
+
+        return RoomRef(id=room_id, kind=RoomKind.CHANNEL, name=room_id)
 
     # ── Security: prompt prefix ───────────────────────────────────────────────
 

@@ -14,7 +14,7 @@ import textwrap
 import unittest
 from pathlib import Path
 
-from gateway.config import _parse_one_watcher_entry, collect_config
+from gateway.config import GatewayConfig, collect_config
 
 
 class _CollectConfigTestBase(unittest.TestCase):
@@ -29,52 +29,6 @@ class _CollectConfigTestBase(unittest.TestCase):
         return str(path)
 
 
-class TestCollectConfigWatcherNameLeak(_CollectConfigTestBase):
-    """PR review finding: seen_watcher_names (shared across ALL watcher
-    entries in one collect_config() pass) used to be updated AS EACH ROOM
-    was processed, not just once the whole entry succeeded. A multi-room
-    entry that registered its first room's name fine and then raised on a
-    LATER room left that first room's name permanently staged as "seen" —
-    even though the entry's failure means NONE of its watchers actually
-    exist in the result — so a later, perfectly valid entry wanting that
-    same name was rejected as a false "duplicate"."""
-
-    def test_a_failed_multi_room_entry_does_not_poison_later_valid_entries(self):
-        config_path = self._write(f"""\
-            connectors:
-              - name: rc
-                type: rocketchat
-                server: {{url: "http://localhost:3000", username: bot, password: pw}}
-            agents:
-              default:
-                type: claude
-                working_directory: {self.agent_dir}
-            watchers:
-              - name: rc-random
-                connector: rc
-                room: "collision-room"
-              - connector: rc
-                rooms: ["general", "random"]
-              - name: rc-general
-                connector: rc
-                room: "another-room"
-        """)
-        config, issues = collect_config(config_path)
-        self.assertIsNotNone(config)
-        names = [w.name for w in config.watchers]
-        # entry 2 ("random" room auto-name collides with entry 0's explicit
-        # name "rc-random"? No — entry 1's SECOND room "random" auto-names
-        # to "rc-random" too, genuinely colliding with entry 0 — entry 1 as
-        # a whole is correctly rejected. What must NOT happen: entry 2
-        # ("rc-general") getting rejected as a phantom duplicate of
-        # something entry 1 never actually contributed.
-        self.assertIn("rc-general", names)
-        watcher_issues = [i for i in issues if i.entity_kind == "watcher"]
-        # Exactly the genuinely-broken entry (index 1) should be reported —
-        # not entry 2.
-        self.assertEqual(len(watcher_issues), 1)
-
-
 class TestCollectConfigPartialProgressPreserved(_CollectConfigTestBase):
     """PR review finding: several structural-failure branches used to
     `return None, issues` outright, discarding every connector/agent that
@@ -82,7 +36,14 @@ class TestCollectConfigPartialProgressPreserved(_CollectConfigTestBase):
     already-real problem (e.g. a connector's empty credentials) behind a
     completely different structural issue elsewhere in the file."""
 
-    def test_invalid_default_agent_still_returns_the_good_connectors(self):
+    def test_an_unknown_top_level_key_still_returns_the_good_connectors(self):
+        """Renamed with its subject. This used to write an invalid
+        `default_agent:` and assert the connectors survived it. That key no
+        longer exists, so the same config now trips the UNKNOWN-top-level-key
+        check instead — the assertion kept passing while testing something else,
+        which is worse than failing. The structural point is the same and is
+        what the name says now: a global-scope issue must not discard the
+        per-entity parsing that already succeeded."""
         config_path = self._write(f"""\
             connectors:
               - name: rc1
@@ -95,17 +56,18 @@ class TestCollectConfigPartialProgressPreserved(_CollectConfigTestBase):
                 type: claude
                 working_directory: {self.agent_dir}
             default_agent: broken_default
-            watchers:
+            watcher_rules:
               - connector: rc1
                 agent: other_agent
-                room: general
+                rooms:
+                  include: [general]
         """)
         config, issues = collect_config(config_path)
         self.assertIsNotNone(config)
         self.assertEqual([c.name for c in config.connectors], ["rc1"])
-        self.assertEqual(config.watchers, [])  # can't safely expand without a valid default_agent
         self.assertTrue(
-            any("default_agent" in i.message and i.entity_kind == "global" for i in issues)
+            any("does not use" in i.message and i.entity_kind == "global" for i in issues),
+            [i.message for i in issues],
         )
 
     def test_all_connectors_failing_still_returns_the_good_agents(self):
@@ -147,13 +109,12 @@ class TestCollectConfigPartialProgressPreserved(_CollectConfigTestBase):
               default:
                 type: claude
                 working_directory: {self.agent_dir}
-            watchers: {{not: a-list}}
+            watcher_rules: {{not: a-list}}
         """)
         config, issues = collect_config(config_path)
         self.assertIsNotNone(config)
         self.assertEqual([c.name for c in config.connectors], ["rc1"])
         self.assertEqual(list(config.agents), ["default"])
-        self.assertEqual(config.watchers, [])
 
     def test_malformed_watchers_block_still_keeps_a_valid_max_queue_depth_and_scheduler(self):
         """PR review finding: every structural early-return branch above
@@ -173,7 +134,7 @@ class TestCollectConfigPartialProgressPreserved(_CollectConfigTestBase):
               default:
                 type: claude
                 working_directory: {self.agent_dir}
-            watchers: {{not: a-list}}
+            watcher_rules: {{not: a-list}}
             max_queue_depth: 42
             scheduler:
               completed_job_ttl_days: 30
@@ -188,9 +149,9 @@ class TestCollectConfigNonStringScalarFields(_CollectConfigTestBase):
     """PR review finding (round 6): the same class of bug round 5 fixed for
     a non-string 'name'/'inherits' (a truthy-but-wrong-type raw value
     slipping past a bare `if not x` check into a hash-based `in`/`.get()`,
-    or a string method) was also live on five other raw scalar reference
-    fields — connector 'type', watcher 'connector'/'agent'/'room'/
-    'session_id', and the top-level 'default_agent' — reachable via BOTH
+    or a string method) was also live on the other raw scalar reference
+    fields — connector 'type', watcher 'connector'/'agent' — reachable via
+    BOTH
     from_file() (see test_config_loading.py's
     TestConfigValidationHardening for the strict-path pins) and
     collect_config(). Each must surface as a collected, per-entity/global
@@ -222,8 +183,11 @@ class TestCollectConfigNonStringScalarFields(_CollectConfigTestBase):
               default:
                 type: claude
                 working_directory: {self.agent_dir}
-            watchers:
-              - room: general
+            watcher_rules:
+              - name: w1
+                agent: default
+                rooms:
+                  include: [general]
                 connector: [rc]
         """)
         config, issues = collect_config(config_path)
@@ -240,8 +204,10 @@ class TestCollectConfigNonStringScalarFields(_CollectConfigTestBase):
               default:
                 type: claude
                 working_directory: {self.agent_dir}
-            watchers:
-              - room: general
+            watcher_rules:
+              - name: w1
+                rooms:
+                  include: [general]
                 connector: rc
                 agent: [default]
         """)
@@ -259,13 +225,16 @@ class TestCollectConfigNonStringScalarFields(_CollectConfigTestBase):
               default:
                 type: claude
                 working_directory: {self.agent_dir}
-            watchers:
-              - room: 12345
+            watcher_rules:
+              - name: w1
+                agent: default
+                rooms:
+                  include: [12345]
                 connector: rc
         """)
         config, issues = collect_config(config_path)
         self.assertIsNotNone(config)
-        self.assertTrue(any("'room' must be a string" in i.message for i in issues))
+        self.assertTrue(any("'rooms.include' entries must be non-empty strings" in i.message for i in issues))
 
     def test_non_string_watcher_session_id_is_a_collected_issue(self):
         config_path = self._write(f"""\
@@ -277,30 +246,27 @@ class TestCollectConfigNonStringScalarFields(_CollectConfigTestBase):
               default:
                 type: claude
                 working_directory: {self.agent_dir}
-            watchers:
-              - room: general
+            watcher_rules:
+              - name: w1
+                agent: default
+                rooms:
+                  include: [general]
                 connector: rc
                 session_id: [abc]
         """)
         config, issues = collect_config(config_path)
         self.assertIsNotNone(config)
-        self.assertTrue(any("'session_id' must be a string" in i.message for i in issues))
-
-    def test_non_string_default_agent_is_a_collected_issue(self):
-        config_path = self._write(f"""\
-            connectors:
-              - name: rc
-                type: rocketchat
-                server: {{url: "http://localhost:3000", username: bot, password: pw}}
-            agents:
-              default:
-                type: claude
-                working_directory: {self.agent_dir}
-            default_agent: [prod]
-        """)
-        config, issues = collect_config(config_path)
-        self.assertIsNotNone(config)
-        self.assertTrue(any("'default_agent' must be a string" in i.message for i in issues))
+        # Inverted with the field's removal: the key is refused whatever its value,
+        # and the refusal must still arrive as an attributed issue rather than an
+        # exception that aborts the pass.
+        watcher_issues = [i for i in issues if i.entity_kind == "watcher"]
+        self.assertEqual(len(watcher_issues), 1, [i.message for i in issues])
+        # `session_id` no longer has a rejection path of its own — it is simply
+        # not a key, so the closed rule shape reports it like any other. What the
+        # test is really about survives: refused whatever its value, and arriving
+        # as an attributed issue rather than an exception that aborts the pass.
+        self.assertIn("session_id", watcher_issues[0].message)
+        self.assertIn("unknown key(s)", watcher_issues[0].message)
 
 
 class TestCollectConfigNonStringNameHint(_CollectConfigTestBase):
@@ -324,9 +290,12 @@ class TestCollectConfigNonStringNameHint(_CollectConfigTestBase):
               default:
                 type: claude
                 working_directory: {self.agent_dir}
-            watchers:
+            watcher_rules:
               - name: w1
-                room: general
+                connector: rc
+                agent: default
+                rooms:
+                  include: [general]
         """)
         config, issues = collect_config(config_path)
         self.assertIsNotNone(config)
@@ -347,8 +316,9 @@ class TestCollectConfigNonStringNameHint(_CollectConfigTestBase):
               default:
                 type: claude
                 working_directory: {self.agent_dir}
-            watchers:
+            watcher_rules:
               - name: [a, b]
+                agent: default
                 connector: rc
         """)
         config, issues = collect_config(config_path)
@@ -357,34 +327,6 @@ class TestCollectConfigNonStringNameHint(_CollectConfigTestBase):
         self.assertEqual(len(watcher_issues), 1)
         self.assertEqual(watcher_issues[0].entity_name, "(index 0)")
         {(i.entity_kind, i.entity_name, i.message) for i in issues}
-
-
-class TestParseOneWatcherEntryEmptyConnectors(_CollectConfigTestBase):
-    """PR review finding: GatewayConfig.from_file() can never call
-    _parse_one_watcher_entry() with an empty `connectors` list — an earlier
-    structural check always raises first. collect_config() guards against
-    it too (its own "no connectors parsed successfully" branch returns
-    before ever reaching the watcher loop). But
-    EditableConfig.expanded_watchers() calls this function directly, per
-    raw watcher entry, against whatever partial `connectors` list
-    collect_config() returned — so an all-connectors-failed config CAN
-    legitimately reach this function with `connectors=[]`. Previously this
-    crashed with an uncaught IndexError (`connectors[0].name`) instead of
-    raising the ValueError every caller's `except ValueError` expects."""
-
-    def test_no_explicit_connector_and_zero_connectors_raises_value_error_not_index_error(self):
-        with self.assertRaises(ValueError):
-            _parse_one_watcher_entry(
-                {"name": "w1", "room": "general"},
-                0,
-                watcher_templates={},
-                connector_names=set(),
-                connectors=[],
-                agents={},
-                default_agent="",
-                config_dir=Path(self.tmp),
-                seen_watcher_names=set(),
-            )
 
 
 class TestCollectConfigQueueSchedulerSessionId(_CollectConfigTestBase):
@@ -411,11 +353,12 @@ class TestCollectConfigQueueSchedulerSessionId(_CollectConfigTestBase):
               default:
                 type: claude
                 working_directory: {self.agent_dir}
-            watchers:
+            watcher_rules:
               - name: w1
                 connector: rc
                 agent: default
-                room: general
+                rooms:
+                  include: [general]
 {indented_extra}
         """)
 
@@ -437,7 +380,11 @@ class TestCollectConfigQueueSchedulerSessionId(_CollectConfigTestBase):
         self.assertEqual(config.scheduler.completed_job_ttl_days, 7)  # dataclass default
         self.assertTrue(any("scheduler" in i.message for i in issues))
 
-    def test_duplicate_session_id_across_watchers_is_an_issue_not_a_discard(self):
+    def test_each_watcher_carrying_session_id_is_its_own_attributed_issue(self):
+        """Replaces the duplicate-sticky-session_id case: the field is removed, so two
+        watchers cannot share one and the cross-watcher pass is gone with it. What
+        matters now is that each offending entry is reported on its own — the property
+        the old test was really pinning (an issue per entry, not one discard)."""
         config_path = self._write(f"""\
             connectors:
               - name: rc
@@ -447,32 +394,49 @@ class TestCollectConfigQueueSchedulerSessionId(_CollectConfigTestBase):
               default:
                 type: claude
                 working_directory: {self.agent_dir}
-            watchers:
+            watcher_rules:
               - name: w1
                 connector: rc
                 agent: default
-                room: general
+                rooms:
+                  include: [general]
                 session_id: sticky-1
               - name: w2
                 connector: rc
                 agent: default
-                room: dev
+                rooms:
+                  include: [dev]
                 session_id: sticky-1
+              - name: w3
+                connector: rc
+                agent: default
+                rooms:
+                  include: [ops]
         """)
         config, issues = collect_config(config_path)
         self.assertIsNotNone(config)
-        self.assertEqual([w.name for w in config.watchers], ["w1", "w2"])
-        self.assertTrue(any("Duplicate sticky session_id" in i.message for i in issues))
+        self.assertEqual(
+            [(i.entity_kind, i.entity_name) for i in issues],
+            [("watcher", "w1"), ("watcher", "w2")],
+        )
+        for issue in issues:
+            self.assertIn("session_id", issue.message)
+            self.assertIn("unknown key(s)", issue.message)
+        # The clean entry either side still parses — the "not a discard" half.
+        self.assertEqual([r.name for r in config.watcher_rules], ["w3"])
 
 
 class TestCollectConfigOnTheFlyWatcherFields(_CollectConfigTestBase):
-    """session_idle_days/session_expire_days (AgentConfig) and exclude_room/
-    room: "*" (WatcherConfig) — docs/design/dynamic-watcher-design.md. Same
-    class of requirement as the fields above: a bad value must surface as a
-    collected, per-entity ConfigIssue through collect_config(), never an
-    uncaught exception that aborts the whole file."""
+    """exclude_room / room: "*" (WatcherConfig), and the TTL keys that moved off the
+    agent — docs/design/dynamic-watcher-design.md. Same class of requirement as the
+    fields above: a bad value must surface as a collected, per-entity ConfigIssue
+    through collect_config(), never an uncaught exception that aborts the whole
+    file."""
 
-    def test_invalid_session_idle_expire_ordering_is_a_collected_agent_issue(self):
+    def test_a_ttl_key_left_on_an_agent_is_a_collected_agent_issue(self):
+        """These moved to the watcher rule (design §5.4), and a leftover key is a
+        hard error rather than a silently ignored one — so it must arrive here as an
+        attributed issue, not as an exception that stops the pass."""
         config_path = self._write(f"""\
             connectors:
               - name: rc
@@ -483,16 +447,21 @@ class TestCollectConfigOnTheFlyWatcherFields(_CollectConfigTestBase):
                 type: claude
                 working_directory: {self.agent_dir}
                 session_idle_days: 30
-                session_expire_days: 10
-            watchers:
-              - room: general
+            watcher_rules:
+              - rooms:
+                  include: [general]
         """)
         config, issues = collect_config(config_path)
         self.assertIsNotNone(config)
         self.assertEqual(config.agents, {})
-        self.assertTrue(
-            any("must be strictly less than" in i.message for i in issues)
-        )
+        agent_issues = [i for i in issues if i.entity_kind == "agent"]
+        self.assertEqual(len(agent_issues), 1, [i.message for i in issues])
+        # Contract, not phrasing: the message was reworded for plain language.
+        # What must survive is that it names the key, says where the setting
+        # lives now, and does so as an attributed agent issue.
+        msg = agent_issues[0].message
+        self.assertIn("session_idle_days", msg)
+        self.assertIn("'watcher_rules:'", msg)
 
     def test_wildcard_room_is_a_collected_watcher_issue(self):
         config_path = self._write(f"""\
@@ -504,16 +473,69 @@ class TestCollectConfigOnTheFlyWatcherFields(_CollectConfigTestBase):
               default:
                 type: claude
                 working_directory: {self.agent_dir}
-            watchers:
+            watcher_rules:
               - connector: rc
                 agent: default
-                room: "*"
+                rooms:
+                  include: ["*"]
         """)
         config, issues = collect_config(config_path)
         self.assertIsNotNone(config)
-        self.assertEqual(config.watchers, [])
-        self.assertTrue(any("not implemented yet" in i.message for i in issues))
+        # The static-era "not implemented yet" rejection died with its shape:
+        # a wildcard include is exactly what a rule is for — on an inbound
+        # connector it is valid config, refused only where nothing can ever
+        # offer a room (test_literal_rooms).
+        self.assertEqual(len(issues), 1, [i.message for i in issues])
+        self.assertIn("'name' is required", issues[0].message)
 
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestExplicitNullWatchersBlock(_CollectConfigTestBase):
+    """A bare `watchers:` — the natural way to empty the block — used to
+    reach `enumerate(None)` and raise a raw TypeError, because the guard
+    checked truthiness BEFORE type. That crashed the daemon at startup and
+    `agent-chat-gateway config validate` with it, on a config an operator produces by
+    deleting their rules. Found while testing the config TUI's rollback
+    (Codex review of PR #129, round 11); the rule this violated is stated in
+    this same file, on `_resolve_watcher_connector`."""
+
+    def _with_watchers(self, literal: str) -> str:
+        return self._write(f"""\
+            connectors:
+              - name: rc
+                type: rocketchat
+                server: {{url: "http://localhost:3000", username: bot, password: pw}}
+            agents:
+              default:
+                type: claude
+                working_directory: {self.agent_dir}
+            watcher_rules:{literal}
+        """)
+
+    def test_an_explicit_null_is_treated_as_no_watchers(self):
+        config, issues = collect_config(self._with_watchers(""))
+        self.assertIsNotNone(config)
+        self.assertEqual(config.watcher_rules, [])
+        self.assertEqual(issues, [])
+
+    def test_the_strict_loader_accepts_it_too(self):
+        GatewayConfig.from_file(self._with_watchers(""))
+
+    def test_a_falsy_non_list_still_gets_the_clean_message(self):
+        """`0`/`""` took the same skipped-guard path as null; they are
+        mistakes rather than an empty block, so they must be REPORTED, not
+        silently treated as empty."""
+        for literal in (" 0", ' ""'):
+            with self.subTest(literal=literal):
+                config, issues = collect_config(self._with_watchers(literal))
+                self.assertTrue(
+                    any("'watcher_rules:' must be a list" in i.message for i in issues),
+                    [i.message for i in issues],
+                )
+
+    def test_a_truthy_non_list_is_unchanged(self):
+        config, issues = collect_config(self._with_watchers(" 5"))
+        self.assertTrue(any("'watcher_rules:' must be a list" in i.message for i in issues))

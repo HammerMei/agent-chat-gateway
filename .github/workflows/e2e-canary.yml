@@ -35,16 +35,43 @@ jobs:
       - name: Install Python dependencies
         run: uv sync --group dev
 
-      - name: Start RC + MongoDB (phase 1)
+      - name: Start RC + MongoDB + Mattermost + Postgres (phase 1)
         run: |
-          docker compose -f tests/e2e/docker-compose.yml up -d mongodb rocketchat
+          docker compose -f tests/e2e/docker-compose.yml up -d \
+            mongodb rocketchat postgres mattermost
 
+      # Both bootstraps must finish before ACG starts: each connector logs in
+      # as acg_bot at startup, and `depends_on: service_healthy` orders
+      # containers, not accounts. A connector that starts before its account
+      # exists fails to authenticate, and on Mattermost an unresolvable team
+      # is fatal to the whole gateway — including the Rocket.Chat tests.
       - name: Create RC accounts (waits for RC health)
         run: uv run python tests/e2e/setup.py --rc-url http://localhost:3100
+
+      - name: Create MM team + accounts (waits for MM health)
+        run: uv run python tests/e2e/mm_setup.py --mm-url http://localhost:8065
 
       - name: Build ACG image from source (latest agent versions)
         run: |
           docker compose -f tests/e2e/docker-compose.yml build acg
+
+      # Fail before the 40-minute version of this failure. Without credentials
+      # ACG starts fine, both connectors log in fine, mm_connected passes — and
+      # then every agent test burns its full --timeout=180 and reports "No
+      # matching post", which reads as a delivery bug. `make e2e-test` has a
+      # container-side check for exactly this, and neither workflow calls it.
+      - name: Require Claude credentials before starting ACG
+        env:
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          if [ -z "$CLAUDE_CODE_OAUTH_TOKEN$ANTHROPIC_API_KEY" ]; then
+            echo "::error::Neither CLAUDE_CODE_OAUTH_TOKEN nor ANTHROPIC_API_KEY is set."
+            echo "Set one as a repository secret. Compose bakes the value in at"
+            echo "container creation, so every agent test would otherwise fail as a"
+            echo "120s timeout that looks like a delivery or routing bug."
+            exit 1
+          fi
 
       - name: Start ACG (phase 2)
         env:
@@ -65,17 +92,48 @@ jobs:
           CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           E2E_RC_URL: http://localhost:3100
+          E2E_MM_URL: http://localhost:8065
         run: |
           uv run pytest tests/e2e/ -v -s --timeout=180 \
             --ignore=tests/unit --ignore=tests/integration
 
-      - name: Dump container logs on failure
+      - name: Collect container logs on failure
         if: failure()
         run: |
-          echo "=== ACG logs ==="
-          docker logs acg-e2e --tail 100 || true
-          echo "=== RC logs ==="
-          docker logs acg-e2e-rocketchat --tail 50 || true
+          mkdir -p e2e-logs
+          # FULL logs to files — a tail is the wrong tool for the failures
+          # that actually happen here, which are startup/subscription
+          # problems whose cause is at the TOP of the log, not the bottom.
+          for c in acg-e2e acg-e2e-rocketchat acg-e2e-mongodb \
+                   acg-e2e-mattermost acg-e2e-postgres; do
+            docker logs "$c" > "e2e-logs/$c.log" 2>&1 || true
+          done
+          docker compose -f tests/e2e/docker-compose.yml ps > e2e-logs/ps.txt 2>&1 || true
+          docker compose -f tests/e2e/docker-compose.yml config > e2e-logs/resolved-compose.yml 2>&1 || true
+          # The gateway's OWN log inside the container is where connector,
+          # watcher and agent detail lives — the container's stdout only
+          # carries entrypoint output plus whatever escapes the logger.
+          docker exec acg-e2e sh -c 'cat /root/.agent-chat-gateway/gateway.log' \
+            > e2e-logs/acg-gateway.log 2>&1 || true
+          # --all, because idle watchers are hidden by default and a plain
+          # list can say "No watchers" for a room that has one.
+          docker exec acg-e2e agent-chat-gateway list --all > e2e-logs/acg-list.txt 2>&1 || true
+          # Keep a short tail inline too, so an obvious failure is readable
+          # without downloading anything.
+          echo "=== ACG (last 50) ==="
+          tail -50 e2e-logs/acg-e2e.log || true
+          echo "=== Rocket.Chat (last 30) ==="
+          tail -30 e2e-logs/acg-e2e-rocketchat.log || true
+          echo "=== Mattermost (last 30) ==="
+          tail -30 e2e-logs/acg-e2e-mattermost.log || true
+
+      - name: Upload E2E logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-logs-${{ github.job }}-${{ github.run_attempt }}
+          path: e2e-logs/
+          retention-days: 14
 
       - name: Teardown
         if: always()

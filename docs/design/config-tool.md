@@ -13,13 +13,43 @@ auto-migration for any config still using `.env` — see decision 6's
 tool-list/preset editor is not yet built. Phase 3 is designed below but not
 yet started. The
 v0.2 format simplification (`connector_defaults`/`agent_defaults`/
-`watcher_defaults`, `tool_presets`, watcher `rooms:`) plus `acg config
+`watcher_defaults`, `tool_presets`, watcher `rooms:`) plus `agent-chat-gateway config
 validate` and the JSON Schema (see `docs/migration-0.2.md`) are prerequisites
 and have landed. A `description:` field (free-text, informational-only,
 ignored at runtime) was added to connectors/agents/watchers/`*_defaults`
 blocks alongside Phase 1, specifically so annotations survive a future
 TUI-driven save without needing YAML-comment preservation (see "YAML I/O"
 below).
+
+> **Rules rewrite (done, `impl/config-tooling`):** the dynamic-watcher cutover
+> made a `watchers:` entry a *rule* (name + connector + agent + a `rooms:`
+> matcher — `gateway/core/watcher_rule.py`) and the static shape a hard load
+> error, so the Watchers tab and everything Phase 3 built around the static
+> shape (the two-tier edit rule, merge-on-add/split-on-edit,
+> `add_watcher_rooms()`/`remove_watcher_room()`, "Clone for rooms",
+> `_parse_one_watcher_entry()`) was deleted rather than adapted — the data
+> shape those mechanisms reconciled no longer exists. In its place:
+>
+> - A **Rules tab** — one row per raw rule, keyed and displayed by **list
+>   index** (order is load-bearing: first match wins), never sorted. `[`/`]`
+>   move the rule under the cursor (persisted through the normal save gate).
+> - `RuleDetailScreen` — a plain one-entry form using the same trial-entry
+>   install/rollback pattern `ConnectorDetailScreen` uses; rule `name` is
+>   editable (nothing in config references a rule by name).
+> - Status lookups go through `StatusIndex.status_for_rule()`, which bridges
+>   the three entity-name spellings a rule's findings can carry (its own
+>   name, `(index i)`, `watchers[i]`) — the old tab's key mismatch is how
+>   broken rows used to display OK.
+> - Deleting a rule warns with the persisted session records and scheduled
+>   jobs it strands, counted **read-only off the daemon's files**
+>   (`gateway/configtool/state_peek.py`).
+> - The **Sessions tab** of dynamic-watcher-design §5.5 is deferred (owner
+>   decision 2026-08-18): the config tool operates on `config.yaml` only —
+>   it never talks to the control socket; runtime observability and the
+>   pause/resume/reset/expire verbs stay in the CLI (`agent-chat-gateway list` etc.).
+>
+> The Phase 3 sections below are kept as the design record of the static-era
+> tool; where they contradict this block, this block wins.
 
 > **v0.3 reconciliation (done):** the real config loader (`gateway/config.py`)
 > removed `connector_defaults`/`agent_defaults`/`watcher_defaults` entirely in
@@ -62,7 +92,7 @@ usable when ACG runs on a remote server reached over SSH, which is the
 common deployment shape for this project.
 
 **Rejected as the primary interface: plain CLI subcommands**
-(`acg config add-connector`, etc.). These don't give an overview of what's
+(`agent-chat-gateway config add-connector`, etc.). These don't give an overview of what's
 already configured, and a growing flag surface per subcommand doesn't
 converge into "one tool."
 
@@ -92,7 +122,10 @@ EditableConfig
 ├── entry_template_name(entry) -> str | None   (the entry's own `inherits:` value)
 ├── field_provenance(kind, entry, field) -> EXPLICIT | INHERITED |
 │     EXPLICIT_SUPPRESSING | DEFAULT — resolved against the entry's OWN
-│     `inherits:` template (v0.3 templates/inherits; see docs/migration-0.3.md)
+│     `inherits:` template (v0.3 templates/inherits; see docs/migration-0.3.md).
+│     `field` may be dotted (`rooms.direct`), answered PER SUB-KEY, since
+│     _deep_merge recurses into nested dicts — decided by membership, so an
+│     absent sub-key and one set to `null` stay distinguishable
 ├── merged_entry(kind, entry) -> dict
 │     replays the REAL _resolve_inherits (never reimplemented; the effective value)
 ├── expanded_watchers() -> list[ExpandedWatcher]
@@ -161,7 +194,7 @@ per-row status lookups.
    to clearing the box.
 3. **`rooms:` group editing — two-tier rule:** deleting a room removes it
    from the list (normalizing `rooms: [x]` → `room: x`); editing a
-   **per-room** field (`room` itself, `name`/`session_id` — already
+   **per-room** field (`room` itself, `name` — already
    hard-restricted to single-room by `from_file` — plus `connector`, `agent`,
    `inherits`, `online/offline_notification`, `history_handoff`,
    `context_inject_files`) auto-splits that room into its own single-room
@@ -234,7 +267,7 @@ per-row status lookups.
 | `OverviewScreen` | root | **Shipped.** 5 tabs: Connectors, Agents, Watchers, Templates, Tool Presets |
 | `AgentDetailScreen` | pushed | **Shipped, all 3 modes.** view/edit/create. Form fields are a manually-maintained mirror of `$defs/agent` (not a runtime schema interpreter — safe since the schema is closed). Nothing is written to `document` until Save; Save diffs every field against its value-at-open and writes only what changed (docs/design/config-tool.md decision 2). `type` is immutable once an agent exists — chosen via `TypePickerModal` at creation only, shown as a read-only header suffix in edit/create mode (user-reported: it used to be a live, editable `Select` even in edit mode, unlike `ConnectorDetailScreen`'s own `type`, letting an existing agent silently switch backend after creation — fixed to match that precedent exactly; agent TEMPLATES are unaffected, `type` stays an ordinary optional field there, see `TemplateDetailScreen` below). Tool-list fields (`owner_allowed_tools`/`guest_allowed_tools`) are **shipped, editable** — two `ListView`s with dedicated "+ Add"/"Edit"/"- Remove" `Button`s beside each (not key bindings — single-key 'a'/'x' bindings were tried first and dropped after user-reported conflicts with Input focus). "Edit" only applies to an inline rule (a dict); a preset reference (a bare string) just notifies instead of editing in place. This machinery lives in `gateway/configtool/screens/tool_list_editor.py`'s `ToolListEditorMixin`, extracted once `TemplateDetailScreen` became a second concrete user — diffed the same way (against the MERGED value at open) but OUTSIDE the `FieldSpec` pipeline, since a list of preset-refs/inline-rule-dicts doesn't fit it. An Inherits row (a "Change…" `Button` opens `InheritsPickerModal`, same button-not-keybinding reasoning) lets `inherits:` be set/cleared/changed — UNLIKE every other field, this triggers a full `_recompute_form()` (`form_common.py`) rather than a snapshot-once-at-open value, since switching templates changes every OTHER field's effective value too; a `ConfirmModal` warns first if any field was already overridden in this session (`_any_field_overridden()`). The picker itself is filtered against this entry's own explicit `type` (if any) — an agent that pins its own type can't pick a template whose own type conflicts (`gateway/config.py`'s `_resolve_inherits()` rejects that combination outright at save time regardless; the picker just catches it earlier). An entry with no own `type` (purely template-driven) still sees every template, preserving "switch template to switch effective type." Escape with unsaved changes routes through `ConfirmModal` |
 | `ConnectorDetailScreen` | pushed | **Shipped, all 3 modes.** Per-type fixed field lists (tree editor deferred — see Part 3). `type`/`name` immutable in edit mode. Same Inherits row/picker/recompute as `AgentDetailScreen`, including the same own-explicit-type-vs-template-type picker filtering and `_resolve_inherits()` validation described there |
-| `WatcherDetailScreen` | pushed | **Shipped, all 3 modes** (Phase 3). Extends `FormScreen` — the first subclass where one raw `watchers:` entry can back MULTIPLE entities (a `rooms:` group). Two-tier edit rule (decision 3, corrected post-launch): editing the ONE group-shared field (`description`) edits the shared entry in place; editing a per-room field (`room`, `name`, `session_id`, `connector`, `agent`, `inherits`, `online`/`offline_notification`, `context_inject_files`, `history_handoff.*`) auto-splits that one room out into its own entry — `connector`/`agent` originally shipped as group-shared, a user-reported bug that silently moved a whole group when only one room's connector should have changed; fixed to split like every other entry-level field. New-watcher creation and this split both route through the same `EditableConfig.add_watcher_rooms()`/`remove_watcher_room()` primitives, which ALSO merge a new/split-out room into an existing entry when its connector/agent/shared fields already match — see `EntityPickerModal`/`RoomListEditorScreen` rows below for what this superseded. A new "Clone for rooms" action ('c') bulk-adds several rooms sharing the current watcher's settings in one step, reusing the same merge-on-add primitive; a room already present in the group being cloned FROM is silently skipped (owner-requested: the end state is correct either way, erroring would just be busywork). Also reachable directly from the Watchers list ('c' on the row under the cursor, `OverviewScreen`), not just from inside the detail screen. |
+| `WatcherDetailScreen` | pushed | **Shipped, all 3 modes** (Phase 3). Extends `FormScreen` — the first subclass where one raw `watchers:` entry can back MULTIPLE entities (a `rooms:` group). Two-tier edit rule (decision 3, corrected post-launch): editing the ONE group-shared field (`description`) edits the shared entry in place; editing a per-room field (`room`, `name`, `connector`, `agent`, `inherits`, `online`/`offline_notification`, `context_inject_files`, `history_handoff.*`) auto-splits that one room out into its own entry — `connector`/`agent` originally shipped as group-shared, a user-reported bug that silently moved a whole group when only one room's connector should have changed; fixed to split like every other entry-level field. New-watcher creation and this split both route through the same `EditableConfig.add_watcher_rooms()`/`remove_watcher_room()` primitives, which ALSO merge a new/split-out room into an existing entry when its connector/agent/shared fields already match — see `EntityPickerModal`/`RoomListEditorScreen` rows below for what this superseded. A new "Clone for rooms" action ('c') bulk-adds several rooms sharing the current watcher's settings in one step, reusing the same merge-on-add primitive; a room already present in the group being cloned FROM is silently skipped (owner-requested: the end state is correct either way, erroring would just be busywork). Also reachable directly from the Watchers list ('c' on the row under the cursor, `OverviewScreen`), not just from inside the detail screen. |
 | `TemplateDetailScreen` | pushed | **Shipped, all 3 modes** — replaced the old `DefaultsScreen` in the v0.3 templates/inherits reconciliation. Full CRUD over NAMED `agent_templates`/`connector_templates`/`watcher_templates` entries (create/edit/delete, unlike the old fixed 3-row-per-kind block), extending `FormScreen` directly (unlike `DefaultsScreen`, which deliberately didn't — see its own history further down). Blast radius (per field, "N inherit, M override") is scoped to entries whose `inherits:` names THIS specific template, not "every entry in the config" the way the old global block worked. Connector templates pick a `type` up front via `TypePickerModal`, same as connector creation, and `type` is likewise immutable/banner-only thereafter. Agent templates have no such immutability — `type` stays an ordinary, optional `FieldSpec` row (a template need not declare one at all), deliberately NOT mirroring `AgentDetailScreen`'s own entity-level immutability (that's specific to an actual agent, chosen once at creation; a template has no equivalent creation-time picker to have chosen it from). For agent templates: also mixes in `ToolListEditorMixin` (user-reported gap: "agent template does not have ways to edit owner_allowed_tools and guest_allowed_tools" — legal on a template per `gateway/config.py`'s empty `agent_templates` forbidden-keys set, just never had an editor built for it), reading `self.entry` directly with no merge (a template has nothing to merge against) and folding any changed tool-list key into the same blast-radius confirm scalar fields already get |
 | `ToolPresetsScreen` | pushed | **Shipped, editable.** Rule list + "used by" (checked against the MERGED per-agent tool list, not the raw entry — see gotchas below). 'a' adds a rule (`InlineToolRuleModal`) / 'e' edits the selected one in place (same modal, pre-filled via its `initial:` param) / 'd' removes the selected one — all three save immediately (no separate edit mode; a bare list of rules has no provenance/blast-radius concept to protect). Deleting the WHOLE preset happens from `OverviewScreen`'s Tool Presets tab instead (`d` on the row), not from inside this screen — `OverviewScreen`'s own 'e' on that row is just an alias for Enter (pushes this same screen), for footer-shortcut consistency with the other tabs. The rules `ListView` focuses itself (and selects row 0, if any rules exist) on mount — user-reported: it used to require an explicit Tab press before 'a'/'e'/'d' or the arrow keys did anything, since the list mounts EMPTY and gets its rows appended afterward (`_refresh_rules()`), which — unlike a `ListView` composed WITH its children up front — does NOT auto-select index 0 on its own |
 | `ConfirmModal` | modal | **Shipped** (`gateway/configtool/modals.py`) — yes/no dialog, Cancel focused by default. Gates `ConfigToolApp.action_quit()` on `EditableConfig.dirty`, and `AgentDetailScreen`'s own per-screen form-dirty flag on Escape |
@@ -291,8 +324,8 @@ Max stack depth 3 (Overview → detail → modal).
 
 `gateway/config_validate.py`'s `ValidationResult` gained `findings:
 list[Finding]` (`severity`, `entity_kind`, `entity_name`, `field`, `message`)
-alongside the existing flat string lists, which remain untouched (`acg
-config validate`'s CLI output is byte-identical — regression-tested). Honest
+alongside the existing flat string lists, which remain untouched
+(`agent-chat-gateway config validate`'s CLI output is byte-identical — regression-tested). Honest
 boundary, as designed: `_check_connectors`/`_lint_config` findings are
 per-entity (often per-field); a `GatewayConfig.from_file` load failure is
 inherently global (`entity_kind="global"`, `entity_name=None`) — the Overview
@@ -1230,7 +1263,7 @@ rooms". A few things worth calling out beyond what's already there:
   `watcher_defaults` gets its own small field list
   (`WATCHER_DEFAULTS_FIELDS`): `online_notification`, `offline_notification`,
   `context_inject_files`, `history_handoff.*` — everything EXCEPT
-  `name`/`room`/`rooms`/`session_id`, which the loader already forbids
+  `name`/`room`/`rooms` (and the removed `session_id`), which the loader already forbids
   there (each pins one specific watcher's identity).
 - **Does NOT extend `FormScreen`.** A `*_defaults:` block has no "entity" to
   create or delete, and its own fields have no provenance concept (a

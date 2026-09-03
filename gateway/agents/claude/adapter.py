@@ -35,6 +35,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from ...core.adapter_utils import build_attachment_prompt
+from ...core.paths import resolve_under
 from .. import AgentBackend, GatewayBrokerConfig
 from ..errors import (
     AgentExecutionError,
@@ -429,7 +430,7 @@ class ClaudeBackend(AgentBackend):
         timeout: int,
         content: str,
         *,
-        watcher_name: str,
+        path_key: str,
         already_delivered: bool,
     ) -> str | None:
         """Write `content` to a stable per-watcher file for --append-system-prompt-file.
@@ -452,15 +453,33 @@ class ClaudeBackend(AgentBackend):
         accidental `git add` if that directory is a real user project under
         version control (a documented, real configuration — see
         docs/user-guide.md's ``working_directory: ~/my-project`` examples).
-        ``watcher_name`` is globally unique (enforced at config-load time) and
-        forbidden from containing ``/`` (see gateway/config.py), so this path
-        cannot collide with another watcher's file or escape RUNTIME_DIR.
+        The file is named by ``path_key``, which the caller derives — treat it as opaque.
+        It is scoped to the *watcher in a room*, not to the room alone. Two watchers on one
+        connector+room are refused now (§4.1), so the collision it was written for cannot
+        occur; the key stays because it names files on disk and re-keying would orphan
+        every existing one. The display name used to be the
+        path component outright, which made it load-bearing — a rename orphaned the file
+        and two rooms could collide (§2.3). ``resolve_under`` re-checks containment,
+        because the key is built from external connector data and a path from such data
+        is validated rather than trusted.
         """
         acg_dir = RUNTIME_DIR / "system-prompts"
         await asyncio.to_thread(acg_dir.mkdir, parents=True, exist_ok=True)
-        path = acg_dir / f"{watcher_name}.md"
+        path = resolve_under(acg_dir, f"{path_key}.md")
         await asyncio.to_thread(_atomic_write_text, path, content)
         return str(path)
+
+    async def reclaim_durable_instructions(self, path_key: str) -> None:
+        """Remove the per-watcher prompt file `ensure_durable_instructions` wrote.
+
+        Expiry's half of that contract (§2.5): same directory, same
+        `resolve_under` containment check — the key is built from external
+        connector data and a path from such data is validated on the way out
+        exactly as it was on the way in. Idempotent: a missing file is
+        success.
+        """
+        path = resolve_under(RUNTIME_DIR / "system-prompts", f"{path_key}.md")
+        await asyncio.to_thread(path.unlink, missing_ok=True)
 
     async def create_session(
         self,

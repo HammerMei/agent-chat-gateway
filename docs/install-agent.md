@@ -166,7 +166,7 @@ agents:
       enabled: true
       timeout: 300
 
-watchers:
+watcher_rules:
   - name: dm-me
     connector: rc-home
     room: "@your-username"
@@ -174,7 +174,7 @@ watchers:
 EOF
 ```
 
-**Mattermost** (same `agents:`/`watchers:` shape — only the `connectors:` block and the
+**Mattermost** (same `agents:`/`watcher_rules:` shape — only the `connectors:` block and the
 watcher's `connector:`/`room:` values differ from the Rocket.Chat example above):
 ```bash
 cat > ~/.agent-chat-gateway/config.yaml << 'EOF'
@@ -242,7 +242,7 @@ agents:
       enabled: true
       timeout: 300
 
-watchers:
+watcher_rules:
   - name: dm-me
     connector: mm-home
     room: "@your-username"
@@ -316,7 +316,8 @@ agent-chat-gateway list
 
 Expected output:
 ```
-dm-me: (rc-home) @your-username [my-agent] session=agent-chat-xxxx [active]
+NAME   CONNECTOR  ROOM            ROOM ID               AGENT     STATE   SESSION          PARTICIPANTS
+dm-me  rc-home    @your-username  aBcD1234efGh5678iJkL  my-agent  active  agent-chat-xxxx  —
 ```
 
 ---
@@ -336,18 +337,20 @@ To monitor additional rooms/channels:
 
 1. Add the bot to the room (Rocket.Chat) or channel (Mattermost — must also already be a
    team member, see Step 2)
-2. Edit `~/.agent-chat-gateway/config.yaml` and add the room to your watcher. If you're
-   watching several rooms with the same connector+agent, use `rooms:` instead of adding a
-   whole new entry per room — it expands into one watcher per room automatically, naming
-   each one `<connector>-<room>`:
+2. Edit `~/.agent-chat-gateway/config.yaml` and make sure a watcher RULE claims the
+   room. Rules match room names by glob, so one rule usually covers many rooms — the
+   watcher itself is created automatically on the room's first message, named
+   `<connector>:<room>`:
    ```yaml
-   - connector: rc-home   # or mm-home
-     agent: my-agent
-     rooms: ["general", "dev"]   # bare channel name, no leading "#", on either platform
+   watcher_rules:
+     - name: my-rooms
+       connector: rc-home   # or mm-home
+       agent: my-agent
+       rooms:
+         include: ["general", "dev"]   # bare channel names or globs (eng-*), no leading "#"
    ```
-   A one-off room still works as a single entry with `room:` instead of `rooms:` — see
-   `config.example.yaml` for the full annotated format, including `name:` for pinning a
-   specific watcher's identity (needed if you rely on its session surviving a config edit).
+   See `config.example.yaml` for the full annotated format (DM opt-ins, `except_for`,
+   per-rule session TTLs).
 3. Validate before restarting: `agent-chat-gateway config validate --config ~/.agent-chat-gateway/config.yaml`
 4. Restart the daemon: `agent-chat-gateway restart`
 
@@ -369,7 +372,7 @@ To monitor additional rooms/channels:
 | `agent-chat-gateway start` | Start the daemon |
 | `agent-chat-gateway stop` | Stop the daemon |
 | `agent-chat-gateway status` | Show status and uptime |
-| `agent-chat-gateway list` | List all watchers |
+| `agent-chat-gateway list` | List active, failed and paused watchers (`--all` for every state) |
 | `agent-chat-gateway pause WATCHER` | Pause a watcher |
 | `agent-chat-gateway resume WATCHER` | Resume a paused watcher |
 | `agent-chat-gateway reset WATCHER` | Reset a watcher session |

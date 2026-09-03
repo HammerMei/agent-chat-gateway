@@ -17,7 +17,9 @@ import logging
 from typing import TYPE_CHECKING
 
 from . import runtime_lock
+from .core.connector import Room
 from .core.tz_utils import local_iana_timezone as _server_local_timezone
+from .core.watcher_manager import config_from_record
 from .runtime_lock import RUNTIME_DIR
 
 if TYPE_CHECKING:
@@ -25,6 +27,20 @@ if TYPE_CHECKING:
     from .service import ConnectorEntry
 
 logger = logging.getLogger("agent-chat-gateway.control")
+
+
+def _to_epoch_ms(dt) -> str | None:
+    """An operator's ISO timestamp as the internal representation (§5.2).
+
+    A naive datetime is read as local time, which is what an operator who
+    omitted the offset meant — the alternative, UTC, would silently shift the
+    window by the local offset.
+    """
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.astimezone()
+    return str(int(dt.timestamp() * 1000))
 
 CONTROL_SOCK = RUNTIME_DIR / "control.sock"
 
@@ -224,13 +240,19 @@ class ControlServer:
         if cmd == "instructions":
             return self._handle_instructions(request)
 
+        # schedule-migrate is the one that has to await: it asks connectors to
+        # resolve room names. Handled here rather than inside the sync
+        # `_handle_schedule` below, whose whole point is that it needs no await.
+        if cmd == "schedule-migrate":
+            return await self._handle_schedule_migrate()
+
         # schedule-*: managed by JobStore (no connector routing needed)
         if cmd and cmd.startswith("schedule-"):
             return self._handle_schedule(cmd, request)
 
-        # pause/resume/reset: auto-resolve connector from watcher name (watcher names are
-        # globally unique across all connectors, so no --connector is needed).
-        if cmd in ("pause", "resume", "reset") and not connector_name:
+        # pause/resume/reset/expire: auto-resolve connector from watcher name (watcher
+        # names are globally unique across all connectors, so no --connector is needed).
+        if cmd in ("pause", "resume", "reset", "expire") and not connector_name:
             watcher_name = request.get("watcher_name", "")
             entry = self._find_entry_for_watcher(watcher_name)
             if isinstance(entry, dict):
@@ -283,14 +305,20 @@ class ControlServer:
     def _find_entry_for_watcher(self, watcher_name: str) -> "ConnectorEntry | dict":
         """Find the ConnectorEntry that owns the named watcher.
 
-        Watcher names are globally unique (enforced at config load time), so
-        searching all entries by name is unambiguous.  Returns an error dict
-        if no entry owns the watcher.
+        Watcher names are globally unique because the handle is injective by
+        construction (Codex round 8 found the old claim false): `:` joins
+        connector and room label, a connector name may not contain `:`
+        (config load refuses it), and the label encoder percent-encodes `:`
+        out of room and user names — so no two (connector, room) pairs can
+        derive one handle, and searching all entries by name is unambiguous.
+        Returns an error dict if no entry owns the watcher.
         """
         if not watcher_name:
             return {"ok": False, "error": "Missing 'watcher_name'"}
+        # The persisted record is the only watcher identity left (§2.8) —
+        # the config lookup died with the static shape.
         for entry in self._entries:
-            if entry.session_manager.get_watcher_config(watcher_name) is not None:
+            if entry.session_manager.get_watcher_state(watcher_name) is not None:
                 return entry
         return {"ok": False, "error": f"Unknown watcher: {watcher_name!r}"}
 
@@ -317,6 +345,31 @@ class ControlServer:
         if cmd == "schedule-resume":
             return self._handle_schedule_resume(request)
         return {"ok": False, "error": f"Unknown schedule command: {cmd!r}"}
+
+    async def _handle_schedule_migrate(self) -> dict:
+        """`schedule migrate`: bring jobs.json up to the current schema.
+
+        Runs in the daemon because resolving a room name needs the connectors.
+        Reports every job it looked at, changed or not — the output IS the record
+        of what happened, which is the reason this is a command rather than
+        something done invisibly at fire time.
+        """
+        if self._job_store is None:
+            return {
+                "ok": False,
+                "error": "Scheduler is not enabled (JobStore not configured)",
+            }
+        from .core.job_migrate import migrate
+
+        try:
+            report = await migrate(self._job_store, self._entries)
+        except ValueError as exc:
+            # The file is newer than this code — there is nothing safe to do.
+            return {"ok": False, "error": str(exc)}
+        except Exception as exc:
+            logger.exception("schedule migrate failed")
+            return {"ok": False, "error": f"Migration failed: {exc}"}
+        return {"ok": True, **report.to_dict()}
 
     def _handle_schedule_create(self, request: dict) -> dict:
         from datetime import UTC, datetime
@@ -416,9 +469,31 @@ class ControlServer:
             except Exception as e:
                 return {"ok": False, "error": f"Failed to compute next run time: {e}"}
 
+        # The record is already in hand — `_find_entry_for_watcher` above refuses
+        # the create unless one exists — so the room's identity costs nothing to
+        # capture here, and capturing it is what lets the job outlive the record.
+        #
+        # Refused rather than defaulted to `""`. A job with no room id cannot
+        # bring its watcher back once the record is reclaimed — it fails at every
+        # slot — and since the daemon now warns at startup about exactly that,
+        # creating one would raise a warning the operator can never clear by
+        # migrating, because there is nothing wrong with the FILE. The empty case
+        # means the watcher's own record is missing its room, which is a broken
+        # record, not a job problem: say so instead of persisting the consequence.
+        record = entry.session_manager.get_watcher_state(watcher)
+        if record is None or not record.room_id:
+            return {
+                "ok": False,
+                "error": (
+                    f"Watcher {watcher!r} has no recorded room, so a job created "
+                    f"against it could never deliver. Send a message in the room "
+                    f"to rebuild the record, then create the job."
+                ),
+            }
         job = ScheduledJob(
             watcher=watcher,
             connector=entry.name,
+            room_id=record.room_id,
             message=message,
             cron=cron,
             timezone=timezone,
@@ -438,7 +513,20 @@ class ControlServer:
         include_completed = request.get("include_completed", False)
         try:
             jobs = self._job_store.list_jobs(connector=connector, include_completed=include_completed)
-            return {"ok": True, "jobs": [j.to_dict() for j in jobs]}
+            rows = [j.to_dict() for j in jobs]
+            # The WATCHER column is the handle as it is NOW, derived from the
+            # room the job records, not the spelling stored at creation: a
+            # handle follows a room rename (§2.3), and the operator must be
+            # able to type what this column shows into `pause`/`expire`.
+            by_name = {e.name: e for e in self._entries}
+            for row in rows:
+                entry = by_name.get(row.get("connector") or "")
+                if entry is None or not row.get("room_id"):
+                    continue
+                record = entry.session_manager.record_for_room(row["room_id"])
+                if record is not None and record.watcher_name:
+                    row["watcher"] = record.watcher_name
+            return {"ok": True, "jobs": rows}
         except Exception as e:
             return {"ok": False, "error": str(e)}
 
@@ -461,6 +549,8 @@ class ControlServer:
             return {"ok": False, "error": f"Job {job_id!r} not found"}
         if job.status == JobStatus.COMPLETED:
             return {"ok": False, "error": f"Job {job_id!r} is already completed"}
+        if job.status == JobStatus.CANCELLED:
+            return {"ok": False, "error": f"Job {job_id!r} is cancelled — 'schedule resume' restores it"}
         if job.status == JobStatus.PAUSED:
             return {"ok": True}  # idempotent: already paused
         job.status = JobStatus.PAUSED
@@ -486,31 +576,23 @@ class ControlServer:
         if job.status == JobStatus.ACTIVE:
             return {"ok": True, "next_run": job.next_run}  # idempotent: already active
         # Compute next_run BEFORE mutating status so that a bad cron expression
-        # leaves the job in its current (paused) state rather than half-resuming.
+        # leaves the job in its current (paused or cancelled) state rather than half-resuming.
         try:
             next_run = compute_next_run(job.cron, job.timezone, after=datetime.now(UTC))
         except Exception as e:
             return {"ok": False, "error": f"Failed to compute next_run: {e}"}
         job.status = JobStatus.ACTIVE
         job.next_run = next_run
+        # Resume is also the restore for a job the gateway cancelled: the
+        # record was kept for exactly this. The cancellation's own fields go
+        # with the status, so a restored job does not read as both.
+        job.cancelled_at = None
+        job.cancel_reason = ""
         try:
             self._job_store.update(job)
         except Exception as e:
             return {"ok": False, "error": str(e)}
         return {"ok": True, "next_run": job.next_run}
-
-    def _find_connector_for_watcher(self, watcher_name: str) -> str:
-        """Find the connector name for a watcher by searching all entries."""
-        for entry in self._entries:
-            sm = entry.session_manager
-            # Check running watcher state first (watcher is active)
-            if sm.get_watcher_state(watcher_name) is not None:
-                return entry.name
-        # Fallback: check watcher configs (watcher defined but may be paused/stopped)
-        for entry in self._entries:
-            if entry.session_manager.get_watcher_config(watcher_name) is not None:
-                return entry.name
-        return ""
 
     def _list_all_watcher_names(self) -> str:
         """Return a comma-separated string of all configured watcher names."""
@@ -578,9 +660,12 @@ class ControlServer:
                 ),
             }
 
-        wc = entry.session_manager.get_watcher_config(watcher_name)
+        state = entry.session_manager.get_watcher_state(watcher_name)
+        if state is None or not state.room_id:
+            return {"ok": False, "error": f"No watcher record found for '{watcher_name}'"}
+        wc = config_from_record(state)
         if wc is None:
-            return {"ok": False, "error": f"Watcher config not found for '{watcher_name}'"}
+            return {"ok": False, "error": f"Watcher record for '{watcher_name}' carries no config"}
 
         # Validate and parse count.
         raw_count = request.get("count", 50)
@@ -652,9 +737,23 @@ class ControlServer:
                 pass  # mixed tz-aware/naive: skip comparison, connector will handle
 
         try:
-            room = await entry.connector.resolve_room(wc.room)
+            # By id, never by name (§2.8): the record's `room` is a
+            # description — a group DM's description resolves to nothing.
+            room = Room(
+                id=state.room_id,
+                name=state.room_name or watcher_name,
+                type=state.room_kind or state.room_type or "channel",
+            )
+            # Converted here, at the one boundary where a human types a
+            # timestamp: connector bounds are epoch milliseconds like every
+            # other timestamp inside ACG (§5.2). Both values are already
+            # parsed above, so this reuses the datetimes rather than the
+            # strings.
             msgs = await entry.connector.fetch_room_history(
-                room, count, before_ts=before_ts, after_ts=after_ts
+                room,
+                count,
+                before_ts=_to_epoch_ms(before_dt),
+                after_ts=_to_epoch_ms(after_dt),
             )
         except Exception as e:
             logger.error("fetch_room_history failed for watcher '%s': %s", watcher_name, e)

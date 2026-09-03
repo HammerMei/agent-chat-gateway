@@ -1,7 +1,7 @@
 """DetailScreen — shared base for the config TUI's detail/entity screens.
 
-Code review (post Phase 1) flagged that ConnectorDetailScreen, AgentDetailScreen,
-WatcherDetailScreen, DefaultsScreen, and ToolPresetsScreen each hand-duplicated
+Code review (post Phase 1) flagged that the detail screens (connector, agent,
+watcher — now rule — plus defaults and tool presets) each hand-duplicated
 the same `BINDINGS = [Binding("escape", "back", "Back")]`, the same
 Header/VerticalScroll(Static)/Footer compose() shape, and the same
 `action_back()`. Extracted here so Phase 2's edit/create additions to these

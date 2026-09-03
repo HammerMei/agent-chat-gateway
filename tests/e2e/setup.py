@@ -46,6 +46,9 @@ TEST_USER_NAME = "E2E Test User"
 CLAUDE_CHANNEL = "acg-e2e-claude"
 PERMISSION_CHANNEL = "acg-e2e-permission"
 OPENCODE_PERMISSION_CHANNEL = "acg-e2e-opencode-permission"
+# Admin-only on purpose: the RC probe needs a room the probe user is NOT a
+# member of (see the setup step that creates it).
+OUTSIDE_CHANNEL = "acg-e2e-outside"
 
 
 def setup(rc_url: str = RC_URL) -> dict:
@@ -68,23 +71,11 @@ def setup(rc_url: str = RC_URL) -> dict:
 
         # ── Disable 2FA (required so bot can login without email verification) ─
         print("[setup] Disabling 2FA ...", flush=True)
-        resp = admin._client.post(
-            "/api/v1/settings/Accounts_TwoFactorAuthentication_Enabled",
-            json={"value": False},
-        )
-        resp.raise_for_status()
-        if not resp.json().get("success"):
-            print("[setup] Warning: could not disable 2FA", flush=True)
+        admin.set_setting("Accounts_TwoFactorAuthentication_Enabled", False)
 
         # ── Disable API rate limiter (avoids 429 during tests) ───────────────
         print("[setup] Disabling API rate limiter ...", flush=True)
-        resp = admin._client.post(
-            "/api/v1/settings/API_Enable_Rate_Limiter",
-            json={"value": False},
-        )
-        resp.raise_for_status()
-        if not resp.json().get("success"):
-            print("[setup] Warning: could not disable rate limiter", flush=True)
+        admin.set_setting("API_Enable_Rate_Limiter", False)
 
         # ── Bot account ───────────────────────────────────────────────────────
         if not admin.user_exists(BOT_USERNAME):
@@ -137,6 +128,16 @@ def setup(rc_url: str = RC_URL) -> dict:
                 if test_id:
                     admin.invite_to_channel(ch["_id"], test_id)
 
+        # ── Admin-only channel, for scripts/probe_a1_rc.py ──────────────────
+        # The probe needs a room the probe user is NOT in, to check that the
+        # subscribe-all stream reports `roomParticipant: false` for a room the
+        # account can merely read (design §6.1 — the membership gate the
+        # router depends on). Every other channel here has test_user invited,
+        # so none of them can play that part.
+        if admin.get_channel(OUTSIDE_CHANNEL) is None:
+            print(f"[setup] Creating channel '#{OUTSIDE_CHANNEL}' (admin only) ...", flush=True)
+            admin.create_channel(OUTSIDE_CHANNEL, members=[])
+
     print("[setup] Done.", flush=True)
 
     return {
@@ -150,6 +151,7 @@ def setup(rc_url: str = RC_URL) -> dict:
         "claude_channel": CLAUDE_CHANNEL,
         "permission_channel": PERMISSION_CHANNEL,
         "opencode_permission_channel": OPENCODE_PERMISSION_CHANNEL,
+        "outside_channel": OUTSIDE_CHANNEL,
     }
 
 

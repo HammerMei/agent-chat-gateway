@@ -11,14 +11,22 @@ are still visible:
      an explicit ``null`` suppressing a template's value.
      ``GatewayConfig.from_file`` already applied the merge by the time it
      returns; the distinction is gone.
-  2. Raw ``rooms:`` groupings — by the time ``GatewayConfig.from_file``
-     returns, one raw watcher entry with ``rooms: [a, b, c]`` has already
-     been expanded into three independent ``WatcherConfig`` objects; the
-     group itself no longer exists as data.
+  2. Which entry each value was WRITTEN on. A rule and the template it
+     inherits from are one merged mapping by the time ``from_file`` returns,
+     so the editor could no longer tell which of the two to write an edit
+     back to — and ``rooms:`` is inheritable, which makes that true of the
+     matcher as well as of the scalar fields.
+
+     (This slot used to describe raw ``rooms: [a, b, c]`` groupings being
+     expanded into one ``WatcherConfig`` per room. That data shape is gone:
+     a ``watcher_rules:`` entry is a rule, a list-shaped ``rooms:`` is a load
+     error, and nothing is expanded at load time any more.)
 
 ``EditableConfig`` loads via plain ``yaml.safe_load`` — never via
-``GatewayConfig.from_file`` — for the two structural reasons above
-(provenance, raw ``rooms:`` groupings). Historically this also mattered for
+``GatewayConfig.from_file`` — for the two structural reasons above. Note that
+the raw document is what the editor WRITES; where a value came from is still
+computed on demand, and ``merged_entry()`` below is what screens use when they
+need the effective value to DISPLAY. Historically this also mattered for
 a third reason: ``from_file()`` used to expand ``$VAR``/``${VAR}``
 environment references, and loading through it would have written a
 resolved secret in plain text on save. That's no longer a live concern —
@@ -31,7 +39,6 @@ important for the two reasons that remain.
 
 from __future__ import annotations
 
-import copy
 import os
 import shutil
 import time
@@ -44,11 +51,8 @@ import yaml
 from ..config import (
     TEMPLATE_FORBIDDEN_KEYS,
     GatewayConfig,
-    WatcherConfig,
-    _parse_one_watcher_entry,
     _parse_templates_block,
     _resolve_inherits,
-    collect_config,
 )
 from ..config_validate import Finding, ValidationResult, validate_config
 
@@ -71,15 +75,22 @@ _TEMPLATES_FORBIDDEN_KEYS = TEMPLATE_FORBIDDEN_KEYS
 
 
 class Provenance(Enum):
-    """Where a top-level field's value on an entry actually comes from.
+    """Where one field's value on an entry actually comes from.
 
-    Computed at whole-field granularity (not per-nested-sub-key) — matches
-    how ``_resolve_inherits``/``_deep_merge`` treat nested dicts as a single
-    mergeable unit and lists/scalars as replaced wholesale. A field that is
-    itself a dict (e.g. ``permissions``) is EXPLICIT or INHERITED as a
-    whole; this does not (yet) distinguish "this one sub-key of permissions
-    is overridden while the rest is inherited" — that finer grain isn't
-    needed until a phase that edits nested fields individually exists.
+    Computed at the granularity the MERGE actually has, which for a nested
+    field is per-sub-key: ``_deep_merge`` recurses whenever both sides hold a
+    dict (``gateway/config.py``), so an entry setting ``rooms.direct`` over a
+    template's ``rooms.include`` leaves the include INHERITED and makes only
+    the flag EXPLICIT. Lists and scalars are still replaced wholesale, so
+    ``rooms.include`` is binary — a rule's list does not extend a template's.
+
+    This used to be computed per whole top-level field, justified as matching
+    "``_deep_merge`` treating nested dicts as a single mergeable unit" — which
+    was never true of the merge, and became visible once the nested sub-keys
+    became individually editable and resettable: every field under a `rooms:`
+    block an entry partly set read ``(explicit)``, including the sub-keys the
+    template supplied, and a ctrl+r on one of them could not change that while
+    any sibling remained.
 
     DEFAULT collapses two distinct cases into one enum member: the entry has
     no ``inherits:`` at all, and the entry has ``inherits:`` set but the
@@ -101,7 +112,7 @@ class EditableConfig:
     """The raw config.yaml document, kept in its pre-merge, as-authored form.
 
     ``document`` is the literal top-level mapping from ``yaml.safe_load`` —
-    keys like ``connectors``, ``agents``, ``watchers``, ``connector_templates``,
+    keys like ``connectors``, ``agents``, ``watcher_rules``, ``connector_templates``,
     ``tool_presets``, etc. Phase 1 only reads it; later phases mutate it and
     call ``save()``.
     """
@@ -303,8 +314,23 @@ class EditableConfig:
         return {k: v for k, v in agents.items() if isinstance(v, dict)}
 
     @property
+    def watcher_entries(self) -> list:
+        """The raw `watcher_rules:` document list ITSELF — the same object living
+        in `document` when it is a list (so callers can mutate it), [] when
+        it is anything else. Codex review of #129: `document.get("watcher_rules")
+        or []` scattered across callers let a malformed scalar through —
+        `watcher_rules: 5` crashed the overview repaint with a TypeError
+        mid-iteration, and a string produced one bogus row per character.
+        EditableConfig.load() deliberately accepts structurally invalid
+        documents (that's how the TUI can display their validation errors),
+        so the list-ness check has to live on every read — stated once,
+        here."""
+        watchers = self.document.get("watcher_rules")
+        return watchers if isinstance(watchers, list) else []
+
+    @property
     def watchers_raw(self) -> list[dict]:
-        return [w for w in (self.document.get("watchers") or []) if isinstance(w, dict)]
+        return [w for w in self.watcher_entries if isinstance(w, dict)]
 
     @property
     def tool_presets_raw(self) -> dict[str, list]:
@@ -384,16 +410,49 @@ class EditableConfig:
 
         kind: 'connector' | 'agent' | 'watcher' (selects which `*_templates:`
         block the entry's own `inherits:` name is looked up against).
+
+        `field` may be a one-level-nested dotted key (`rooms.direct`,
+        `server.team`, `permissions.timeout`), answered per sub-key because
+        that is how `_deep_merge` merges it — see `Provenance`. Decided by
+        MEMBERSHIP, not by reading the value: a sub-key present with the value
+        `null` suppresses the template's, and a sub-key that is simply absent
+        inherits it, and both read as `None`.
         """
         template_name = self.entry_template_name(entry_raw)
         template = self.templates(kind).get(template_name, {}) if template_name else {}
-        if field in entry_raw:
-            if entry_raw[field] is None and field in template:
+        if "." not in field:
+            if field in entry_raw:
+                if entry_raw[field] is None and field in template:
+                    return Provenance.EXPLICIT_SUPPRESSING
+                return Provenance.EXPLICIT
+            if field in template:
+                return Provenance.INHERITED
+            return Provenance.DEFAULT
+
+        parent_key, sub_key = field.split(".", 1)
+        entry_parent = entry_raw.get(parent_key)
+        template_parent = template.get(parent_key)
+        # `isinstance` on both sides: a hand-edited config (or template) can
+        # hold anything here, and this runs while rendering it.
+        template_has = isinstance(template_parent, dict) and sub_key in template_parent
+
+        if parent_key in entry_raw and not isinstance(entry_parent, dict):
+            # The entry states a non-dict for the whole block — `null`, or a
+            # malformed list. `_deep_merge` only recurses when BOTH sides are
+            # dicts, so this replaces the template's block verbatim and every
+            # sub-key under it is the entry's doing.
+            if entry_parent is None and template_has:
+                return Provenance.EXPLICIT_SUPPRESSING
+            # An explicit `null` over a block the template never set suppresses
+            # nothing, but the entry did write it — reported EXPLICIT, matching
+            # how a top-level `null` with no template value is reported.
+            return Provenance.EXPLICIT
+
+        if isinstance(entry_parent, dict) and sub_key in entry_parent:
+            if entry_parent[sub_key] is None and template_has:
                 return Provenance.EXPLICIT_SUPPRESSING
             return Provenance.EXPLICIT
-        if field in template:
-            return Provenance.INHERITED
-        return Provenance.DEFAULT
+        return Provenance.INHERITED if template_has else Provenance.DEFAULT
 
     # ── Read-only validated view ─────────────────────────────────────────────
 
@@ -404,336 +463,40 @@ class EditableConfig:
         returns — only `document` is ever written back to disk."""
         return GatewayConfig.from_file(self.path)
 
-    def expanded_watchers(self) -> list["ExpandedWatcher"]:
-        """Pair each expanded WatcherConfig with the raw `watchers:` entry
-        (and sibling-room count) it came from.
-
-        Per docs/design/config-tool.md, the Watchers table shows EXPANDED
-        rows (what `agent-chat-gateway list/pause/resume/reset` operate on),
-        but a watcher's detail screen still needs to know whether it's part
-        of a shared `rooms:` group.
-
-        Uses `collect_config()` (the fault-tolerant counterpart to
-        `GatewayConfig.from_file()`, gateway/config.py) for connectors/agents,
-        then calls `_parse_one_watcher_entry()` — the SAME per-entity
-        function `collect_config()` itself uses, never a second
-        implementation — directly, once per raw `watchers:` entry, so ONE
-        broken entry (or one whose `agent:`/`connector:` reference failed to
-        parse) only drops THAT entry's rows from the table; every other
-        watcher still expands and displays normally. (A broken entry's own
-        explanation is still available — as a `Finding` — via
-        `gateway/config_validate.py`'s `validate_config()`, which the config
-        TUI's Overview banner's 'v' details view already surfaces.)
-
-        Re-reads config.yaml fresh from disk (both for `collect_config()`
-        and for the entry-by-entry comparison below) and cross-checks it
-        against `self.watchers_raw` (the in-memory `document`, only
-        refreshed by `load()`/`reload()`): if the file changed on disk
-        without an intervening `reload()` on this instance, this raises
-        ValueError (never silently using the wrong raw entry, or a stale
-        one) so callers' existing `except (ValueError, FileNotFoundError)`
-        guards catch it like any other "can't compute this right now" case.
-
-        Known, narrow race (PR review, accepted): `collect_config()` reads
-        the file once internally, then this method does a SECOND,
-        independent read for the entry-by-entry comparison — if some OTHER
-        process rewrites config.yaml in the gap between those two reads,
-        in a way that happens to leave `watchers:` looking identical but
-        changes something else (e.g. `agents:`), this could mix connectors/
-        agents from the first read with `watcher_templates` from the
-        second. Requires a real concurrent external writer racing the TUI
-        on the same file — narrow, and this is a read-only display
-        computation (nothing is ever written incorrectly as a result) —
-        not addressed here.
-        """
-        config, issues = collect_config(str(self.path))
-        if config is None:
-            raise ValueError(
-                "expanded_watchers(): config does not currently load: "
-                + "; ".join(i.message for i in issues)
-            )
-
-        with open(self.path) as f:
-            disk_raw = yaml.safe_load(f) or {}
-        disk_watchers_raw = [w for w in (disk_raw.get("watchers") or []) if isinstance(w, dict)]
-        mem_watchers_raw = self.watchers_raw
-
-        # Desync guard: a raw entry added/removed OR edited in place (e.g. a
-        # room added to/removed from `rooms:`) on disk without an
-        # intervening reload() must be caught loudly here — never silently
-        # expanded against the WRONG (stale, in-memory) entry.
-        if len(disk_watchers_raw) != len(mem_watchers_raw) or any(
-            mem_entry != disk_entry
-            for mem_entry, disk_entry in zip(mem_watchers_raw, disk_watchers_raw)
-        ):
-            raise ValueError(
-                "expanded_watchers(): the in-memory document and the "
-                "freshly-loaded config disagree on watcher count — "
-                "config.yaml likely changed on disk since this was last "
-                "loaded; call reload() first."
-            )
-
-        connector_names = {c.name for c in config.connectors}
-        try:
-            watcher_templates = _parse_templates_block(
-                disk_raw, "watcher_templates",
-                TEMPLATE_FORBIDDEN_KEYS["watcher"],
-            )
-        except ValueError:
-            # PR review finding: a malformed `watcher_templates:` block is
-            # exactly the kind of unrelated, independent problem this whole
-            # method exists to NOT let take down every other watcher's row
-            # (collect_config() above already tolerates this internally,
-            # returning watchers=[] plus its own ConfigIssue — but this is a
-            # SEPARATE re-parse, straight off disk, with no fallback of its
-            # own). Falling back to {} — same "record the issue once
-            # elsewhere, keep going with a safe default" idiom
-            # gateway/config_validate.py's _lint_config() uses for the
-            # identical situation — means a watcher with no `inherits:` of
-            # its own still expands and displays normally; only an entry
-            # that actually needed this block (fails inside
-            # _parse_one_watcher_entry() below) drops its own row, exactly
-            # as already happens for any other independent per-entry
-            # failure.
-            watcher_templates = {}
-        seen_watcher_names: set[str] = set()
-        result: list[ExpandedWatcher] = []
-        for entry in mem_watchers_raw:
-            try:
-                expanded = _parse_one_watcher_entry(
-                    entry, 0, watcher_templates, connector_names, config.connectors,
-                    config.agents, config.default_agent, self.path.parent,
-                    seen_watcher_names,
-                )
-            except ValueError:
-                continue  # this entry's own Finding (via validate_config()) explains why
-            count = len(expanded)
-            for wc in expanded:
-                result.append(ExpandedWatcher(watcher=wc, raw_entry=entry, group_size=count))
-        return result
-
-    # ── Watcher CRUD (Phase 3) — merge-on-add / split-on-edit primitives ────
+    # ── Watcher rules (design §5.5's Rules tab) ──────────────────────────────
     #
-    # Everything below composes from exactly two primitives:
-    #   add_watcher_rooms()    — merge a room into a matching existing entry,
-    #                             or create a new one
-    #   remove_watcher_room()  — remove a room from whichever entry has it
-    #
-    # A "rename/move" is remove + add; a "split one per-room field out of a
-    # shared group" is remove + add (with the new field value folded into
-    # `shared`); a "delete" is remove alone. No separate code path for any
-    # of those — see WatcherDetailScreen.action_save()/action_delete() for
-    # how they're actually composed. This mirrors gateway/config.py's own
-    # "one implementation, reused everywhere" principle: _watcher_shared_fields()
-    # here is the SAME grouping _parse_one_watcher_entry() uses (entry-level
-    # vs per-room), just expressed as a set of dict keys instead of parse
-    # logic, since this operates on the raw pre-load document, not a parsed
-    # WatcherConfig.
+    # A `watcher_rules:` entry is a RULE (name + connector + agent + a `rooms:`
+    # matcher), not a room — which rooms it claims is only known at runtime,
+    # so there is nothing to "expand" here any more. The Watcher Rules tab shows one
+    # row per raw entry, keyed by LIST INDEX: order within `watcher_rules:` is
+    # load-bearing (first match wins, design §2.1), which is also why rules
+    # are displayed in document order and why reordering is a first-class
+    # mutation (`move_watcher_rule()` below) rather than an $EDITOR-only
+    # operation. Add/edit/delete need no primitives of their own: a rule is
+    # one entry in one list, so RuleDetailScreen uses the same
+    # trial-entry/install/rollback pattern ConnectorDetailScreen already
+    # uses on `document["connectors"]`.
 
-    def find_mergeable_watcher_entry(self, connector: str, agent: str, shared: dict) -> dict | None:
-        """Find an existing raw `watchers:` entry whose OWN `connector`/
-        `agent` match exactly (not the resolved/defaulted value — an entry
-        relying on the implicit "first connector"/"default agent" fallback
-        is deliberately never a merge candidate, since that fallback can
-        shift if connectors/agents are later added or reordered) and whose
-        `_watcher_shared_fields()` deep-equal `shared`, AND that has no
-        explicit `name:`/`session_id:` of its own (those are only legal on
-        a single-room entry — gateway/config.py forbids them the moment an
-        entry becomes multi-room, so an entry that already has one can
-        never legally accept another room). Returns the matching raw dict
-        (by identity, live in `self.document["watchers"]`), or None."""
-        for entry in self.watchers_raw:
-            # An entry with no room of its own is never a merge target.  It
-            # cannot be one: gateway/config.py rejects an entry that has neither
-            # a non-empty `room` nor a non-empty `rooms`, so merging into it
-            # would be adopting whatever other keys it happens to carry.
-            #
-            # Worth spelling out why this needs an explicit guard rather than
-            # being caught downstream.  Such an entry is *invisible* here —
-            # expanded_watchers() swallows its ValueError, so it produces no row
-            # in the Watchers table and cannot be opened, edited or deleted
-            # through the TUI — yet it still appears in watchers_raw, and with
-            # none of the six shared keys `_watcher_shared_fields()` returns {},
-            # which compares equal to a fresh add's `shared={}`.  So it matched.
-            #
-            # And the resulting write was not merely permitted but actively so:
-            # save()'s gate blocks only errors this save *introduces*, and
-            # merging a room into a roomless entry REMOVES its pre-existing
-            # error, leaving an empty diff.  The corrupted document therefore
-            # reached disk, where it reads as a legal single-room entry — and
-            # every other room that should have been its own watcher is simply
-            # gone at the next daemon start.
-            if not (entry.get("room") or entry.get("rooms")):
-                continue
-            if entry.get("name") or entry.get("session_id"):
-                continue
-            if entry.get("connector") != connector or entry.get("agent") != agent:
-                continue
-            if _watcher_shared_fields(entry) == shared:
-                return entry
-        return None
+    def move_watcher_rule(self, index: int, delta: int) -> int | None:
+        """Swap the rule at `index` with its neighbour `delta` (+1/-1) away.
 
-    def add_watcher_rooms(
-        self, connector: str, agent: str, rooms: list[str], shared: dict,
-        insert_at: int | None = None,
-    ) -> list[str]:
-        """Add each room in `rooms` under `connector`/`agent`, merging into
-        an existing matching entry (same connector/agent plus `shared`
-        fields) when one exists, creating a new single-room entry otherwise.
-        A room already present in the entry it would merge into is skipped
-        — silently, not an error — since the end state is identical either
-        way (user-requested: typing a room that's already in the group
-        you're cloning FROM shouldn't require editing your input first).
-        Rooms are added one at a time (re-searching for a merge target each
-        time), so a multi-room call — e.g. creating 3 rooms at once — makes
-        the SECOND and later rooms merge into whatever the first one just
-        created, ending up as a single `rooms:` group rather than 3
-        separate entries.
-
-        `insert_at`: when a genuinely NEW entry is created (no merge
-        target), insert it at this document index instead of appending to
-        the end — used by a split-on-edit caller that wants the new,
-        smaller entry to land where the room's old group used to be
-        (docs/design/config-tool.md decision 3: "inserted adjacent to the
-        source group"), rather than silently reordering it to the bottom
-        of the file. Ignored once a first room in this same call has
-        already created (and is now being merged into) a new entry, and
-        clamped to the current list length if the document has since
-        shrunk (e.g. this same call already removed the source entry).
-
-        Returns the rooms actually newly added (a subset of `rooms`, in
-        order) — callers use this to report "N added, M already present"
-        rather than a flat count. Calls `mark_dirty()` if anything changed;
-        callers still own calling `save()`."""
-        added: list[str] = []
-        for room in rooms:
-            target = self.find_mergeable_watcher_entry(connector, agent, shared)
-            if target is not None:
-                existing_rooms = (
-                    list(target["rooms"]) if "rooms" in target
-                    else [target["room"]] if "room" in target
-                    else []
-                )
-                if room in existing_rooms:
-                    continue  # already present — no-op, not an error
-                existing_rooms.append(room)
-                target.pop("room", None)
-                target["rooms"] = existing_rooms
-            else:
-                # deepcopy: `shared`'s values (e.g. context_inject_files,
-                # history_handoff) may be the SAME nested list/dict object
-                # `_watcher_shared_fields()` read straight off some other
-                # entry — without this, mutating one entry's nested value
-                # later would silently alias into this brand-new one too
-                # (the same class of bug _deep_merge() was once fixed for).
-                new_entry = {
-                    "connector": connector, "agent": agent, "room": room,
-                    **copy.deepcopy(shared),
-                }
-                # `setdefault("watchers", [])` alone isn't enough: a
-                # present-but-empty `watchers:` key parses to `None` (a key
-                # that EXISTS with value None isn't touched by setdefault,
-                # which only fills in a default for a key that's fully
-                # ABSENT), not an empty list.
-                if self.document.get("watchers") is None:
-                    self.document["watchers"] = []
-                watchers_list = self.document["watchers"]
-                if insert_at is not None and insert_at <= len(watchers_list):
-                    watchers_list.insert(insert_at, new_entry)
-                else:
-                    watchers_list.append(new_entry)
-                insert_at = None  # only the FIRST newly-created entry gets the hint
-            added.append(room)
-        if added:
-            self.mark_dirty()
-        return added
-
-    def remove_watcher_room(self, raw_entry: dict, room: str) -> int | None:
-        """Remove `room` from `raw_entry` (found by identity in
-        `self.document["watchers"]`) — normalizing `rooms: [x]` back to
-        `room: x`, or removing the whole entry if it has no rooms left.
-        Calls `mark_dirty()`. Returns the document index `raw_entry`
-        occupied (whether it shrank in place or was removed outright), or
-        None if `room` wasn't actually a member of it — callers that want
-        to reinsert a replacement near the same position (split-on-edit)
-        pass this straight through to `add_watcher_rooms(insert_at=...)`."""
-        watchers = self.document.get("watchers") or []
-        try:
-            index = next(i for i, w in enumerate(watchers) if w is raw_entry)
-        except StopIteration:
-            return None  # already gone — nothing to do
-        if "rooms" in raw_entry:
-            if room not in raw_entry["rooms"]:
-                remaining = None  # not actually in this entry — no-op
-            else:
-                remaining = [r for r in raw_entry["rooms"] if r != room]
-        elif raw_entry.get("room") == room:
-            remaining = []
-        else:
-            remaining = None  # this entry never had `room` to begin with
-        if remaining is None:
+        Returns the rule's new index, or None if the move is a no-op
+        (index out of range, already at the edge it would move past, or
+        `watcher_rules:` is not a list at all — see `watcher_entries`).
+        Calls `mark_dirty()` on an actual move; callers own `save()` —
+        same contract as every other document mutation here."""
+        watchers = self.watcher_entries
+        target = index + delta
+        if not (0 <= index < len(watchers)) or not (0 <= target < len(watchers)):
             return None
-        if not remaining:
-            watchers.pop(index)
-        elif len(remaining) == 1:
-            raw_entry.pop("rooms", None)
-            raw_entry["room"] = remaining[0]
-        else:
-            raw_entry["rooms"] = remaining
+        watchers[index], watchers[target] = watchers[target], watchers[index]
         self.mark_dirty()
-        return index
-
-
-def _watcher_shared_fields(entry: dict) -> dict:
-    """The subset of a raw watcher entry that `_parse_one_watcher_entry()`
-    (gateway/config.py) treats as entry-level — shared across every
-    expanded room in a `rooms:` group, never per-room. Two entries with
-    equal `_watcher_shared_fields()` (plus equal connector/agent) can
-    legally be merged into one `rooms:` group. Deliberately does NOT
-    include `name`/`session_id` — those are per-room, single-room-only,
-    and already excluded from merge-eligibility by
-    `find_mergeable_watcher_entry()`'s own separate check."""
-    return {
-        key: entry[key]
-        for key in (
-            "inherits", "context_inject_files", "online_notification",
-            "offline_notification", "history_handoff", "description",
-        )
-        if key in entry
-    }
-
-
-@dataclass
-class ExpandedWatcher:
-    """One expanded WatcherConfig plus the raw `watchers:` entry it came
-    from. `group_size > 1` means this watcher shares a `rooms:` list with
-    `group_size - 1` sibling watchers."""
-
-    watcher: WatcherConfig
-    raw_entry: dict
-    group_size: int
-
-    @property
-    def sibling_rooms(self) -> list[str]:
-        if self.group_size <= 1:
-            return []
-        rooms = list(self.raw_entry.get("rooms") or [])
-        return [r for r in rooms if r != self.watcher.room]
+        return target
 
 
 class StatusIndex:
     """Groups a ValidationResult's structured `findings` by (entity_kind,
     entity_name) for cheap per-row lookup in the TUI's tables.
-
-    Known gap (documented, not silently papered over): `_lint_config`'s
-    per-watcher findings are attributed to the RAW entry's own `name` (or a
-    `watchers[i]` placeholder when unnamed) — for a multi-room `rooms:`
-    group with no explicit name, that placeholder matches none of the
-    group's expanded watcher names, so those specific lint findings won't
-    surface on any single row. They are never dropped from
-    `result.lint_findings`/`result.findings` overall — only from this
-    per-row index — so a global lint count elsewhere always accounts for
-    them.
     """
 
     _SEVERITY_RANK = {"error": 3, "warning": 2, "lint": 1}
@@ -750,6 +513,53 @@ class StatusIndex:
     def status_for(self, kind: str, name: str) -> str:
         """'error' | 'warning' | 'lint' | 'ok', highest severity present."""
         items = self.findings_for(kind, name)
+        if not items:
+            return "ok"
+        return max(items, key=lambda f: self._SEVERITY_RANK.get(f.severity, 0)).severity
+
+    # ── Rule rows (index-keyed) ──────────────────────────────────────────────
+    #
+    # Rules tab rows are keyed by LIST INDEX (order is load-bearing), but a
+    # rule's findings are filed under THREE different entity_name spellings,
+    # one per producer:
+    #   - the rule's own `name` (shadowing/DM-overlap warnings, and
+    #     collect_config() errors on a NAMED entry)
+    #   - `(index {i})` (collect_config() errors on an entry with no usable
+    #     `name` — gateway/config.py's watcher loop)
+    #   - `watchers[{i}]` (_lint_config()'s placeholder for the same case)
+    # A row lookup that consulted only the name is exactly how the previous
+    # Watchers tab displayed OK on broken rows (a key mismatch, not a
+    # missing finding) — so the bridge is stated once, here, and every rule
+    # row goes through it.
+
+    @staticmethod
+    def _rule_keys(index: int, raw_entry: dict) -> list[str]:
+        keys: list[str] = []
+        name = raw_entry.get("name")
+        if isinstance(name, str) and name:
+            keys.append(name)
+            # The parser CANONICALIZES the name (strips whitespace) before
+            # attributing findings to it — an externally-authored
+            # `name: " padded "` would otherwise show OK on its row while
+            # the banner reports its warning (Codex review of #129, round 3;
+            # same canonicalization the stranded-count lookup applies).
+            stripped = name.strip()
+            if stripped and stripped != name:
+                keys.append(stripped)
+        keys.append(f"(index {index})")
+        keys.append(f"watchers[{index}]")
+        return keys
+
+    def findings_for_rule(self, index: int, raw_entry: dict) -> list[Finding]:
+        found: list[Finding] = []
+        for key in self._rule_keys(index, raw_entry):
+            found.extend(self.findings_for("watcher", key))
+        return found
+
+    def status_for_rule(self, index: int, raw_entry: dict) -> str:
+        """'error' | 'warning' | 'lint' | 'ok', highest severity present
+        across every entity_name spelling this rule's findings can carry."""
+        items = self.findings_for_rule(index, raw_entry)
         if not items:
             return "ok"
         return max(items, key=lambda f: self._SEVERITY_RANK.get(f.severity, 0)).severity

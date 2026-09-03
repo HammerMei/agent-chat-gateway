@@ -511,7 +511,7 @@ class TestClaudeBackendEnsureDurableInstructions(unittest.IsolatedAsyncioTestCas
             with patch("gateway.agents.claude.adapter.RUNTIME_DIR", Path(tmp)):
                 path = await backend.ensure_durable_instructions(
                     "sess-1", "/unused", 10, "## ACG Session Identity\nhello",
-                    watcher_name="my-watcher", already_delivered=False,
+                    path_key="my-watcher", already_delivered=False,
                 )
 
             self.assertEqual(path, str(Path(tmp) / "system-prompts" / "my-watcher.md"))
@@ -527,7 +527,7 @@ class TestClaudeBackendEnsureDurableInstructions(unittest.IsolatedAsyncioTestCas
                 content = "## ACG Session Identity\nhello world"
                 path = await backend.ensure_durable_instructions(
                     "sess-1", "/unused", 10, content,
-                    watcher_name="my-watcher", already_delivered=False,
+                    path_key="my-watcher", already_delivered=False,
                 )
                 self.assertEqual(Path(path).read_text(), content)
                 self.assertEqual(Path(path), Path(tmp) / "system-prompts" / "my-watcher.md")
@@ -543,7 +543,7 @@ class TestClaudeBackendEnsureDurableInstructions(unittest.IsolatedAsyncioTestCas
             with patch("gateway.agents.claude.adapter.RUNTIME_DIR", Path(tmp)):
                 path = await backend.ensure_durable_instructions(
                     "sess-1", "/unused", 10, "content",
-                    watcher_name="my-watcher", already_delivered=True,
+                    path_key="my-watcher", already_delivered=True,
                 )
 
             self.assertIsNotNone(path)
@@ -558,7 +558,7 @@ class TestClaudeBackendEnsureDurableInstructions(unittest.IsolatedAsyncioTestCas
             with patch("gateway.agents.claude.adapter.RUNTIME_DIR", Path(tmp)):
                 path = await backend.ensure_durable_instructions(
                     "sess-1", "/unused", 10, "content",
-                    watcher_name="my-watcher", already_delivered=False,
+                    path_key="my-watcher", already_delivered=False,
                 )
 
             self.assertIsNotNone(path)
@@ -574,11 +574,11 @@ class TestClaudeBackendEnsureDurableInstructions(unittest.IsolatedAsyncioTestCas
             with patch("gateway.agents.claude.adapter.RUNTIME_DIR", Path(tmp)):
                 await backend.ensure_durable_instructions(
                     "sess-1", "/unused", 10, "old content",
-                    watcher_name="my-watcher", already_delivered=False,
+                    path_key="my-watcher", already_delivered=False,
                 )
                 path = await backend.ensure_durable_instructions(
                     "sess-1", "/unused", 10, "new content",
-                    watcher_name="my-watcher", already_delivered=True,
+                    path_key="my-watcher", already_delivered=True,
                 )
                 self.assertEqual(Path(path).read_text(), "new content")
 
@@ -595,7 +595,7 @@ class TestClaudeBackendEnsureDurableInstructions(unittest.IsolatedAsyncioTestCas
             with patch("gateway.agents.claude.adapter.RUNTIME_DIR", Path(tmp)):
                 path = await backend.ensure_durable_instructions(
                     "sess-1", "/unused", 10, "content",
-                    watcher_name="my-watcher", already_delivered=False,
+                    path_key="my-watcher", already_delivered=False,
                 )
                 acg_dir = Path(tmp) / "system-prompts"
                 entries = list(acg_dir.iterdir())
@@ -617,7 +617,7 @@ class TestClaudeBackendEnsureDurableInstructions(unittest.IsolatedAsyncioTestCas
             with patch("gateway.agents.claude.adapter.RUNTIME_DIR", Path(runtime_dir)):
                 path = await backend.ensure_durable_instructions(
                     "sess-1", fake_project, 10, "content",
-                    watcher_name="my-watcher", already_delivered=False,
+                    path_key="my-watcher", already_delivered=False,
                 )
 
             self.assertFalse(

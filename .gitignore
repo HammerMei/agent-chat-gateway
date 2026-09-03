@@ -26,3 +26,6 @@ example-agents/**/node_modules/
 docker_env/
 *.tar.gz
 .tamago
+
+# Local E2E diagnostics (make e2e-dump) — same set CI uploads as an artifact
+e2e-logs/

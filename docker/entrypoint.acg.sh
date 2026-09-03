@@ -123,8 +123,15 @@ owner_users = [u.strip() for u in os.environ["ACG_OWNER_USERS"].split(",") if u.
 agent_type  = os.environ.get("AGENT_TYPE", "claude")
 runtime_dir = os.path.expanduser("~/.agent-chat-gateway")
 
-default_room = f"@{owner_users[0]}" if owner_users else "@owner"
-watcher_room = os.environ.get("ACG_WATCHER_ROOM", default_room)
+# ACG_WATCHER_ROOM: a channel name to watch. Unset (the default) means the
+# rule claims 1:1 DMs instead — a DM has no room name for a pattern to match,
+# so an "@user" value also falls back to the DM opt-in.
+watcher_room = os.environ.get("ACG_WATCHER_ROOM", "")
+if watcher_room.startswith("@"):
+    watcher_room = ""
+watcher_rooms = (
+    {"include": [watcher_room]} if watcher_room else {"direct": True}
+)
 
 config = {
     "connectors": [{
@@ -175,15 +182,12 @@ config = {
             },
         }
     },
-    "watchers": [{
+    "watcher_rules": [{
         "name":               "e2e-watcher",
         "connector":          "rocketchat",
-        "room":               watcher_room,
+        "rooms":              watcher_rooms,
         "agent":              "default-agent",
-        "session_id":         None,
         "context_inject_files": [],
-        "online_notification":  "✅ _Agent online_",
-        "offline_notification": "❌ _Agent offline_",
     }],
 }
 
@@ -193,7 +197,7 @@ with open(config_path, "w") as f:
 os.chmod(config_path, 0o600)  # holds a plaintext secret now — same as .env always was
 
 print(f"[ACG] Written: {config_path}")
-print(f"[ACG]   agent={agent_type}, room={watcher_room}, owners={owner_users}")
+print(f"[ACG]   agent={agent_type}, rooms={watcher_rooms}, owners={owner_users}")
 PYEOF
 
     success "Config generated."

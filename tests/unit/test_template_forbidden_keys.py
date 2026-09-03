@@ -47,12 +47,12 @@ class TestSingleSource(unittest.TestCase):
 
         self.assertEqual(set(TEMPLATE_FORBIDDEN_KEYS), set(_TEMPLATES_KEY))
 
-    def test_a_watcher_template_may_not_set_identity_or_room_keys(self):
+    def test_a_watcher_template_may_not_set_the_entry_name(self):
         """Pins intent, not just structure: these four are what make an entry
         one specific watcher, so a shared block cannot carry them."""
         self.assertEqual(
             TEMPLATE_FORBIDDEN_KEYS["watcher"],
-            frozenset({"name", "room", "rooms", "session_id"}),
+            frozenset({"name"}),
         )
 
     def test_a_connector_template_may_not_set_its_name(self):

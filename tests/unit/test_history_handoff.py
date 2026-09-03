@@ -12,6 +12,8 @@ from __future__ import annotations
 import unittest
 from unittest.mock import AsyncMock, MagicMock, patch
 
+from tests.helpers import start_watcher
+
 # ---------------------------------------------------------------------------
 # Helpers shared across test classes
 # ---------------------------------------------------------------------------
@@ -93,6 +95,7 @@ class TestFetchRoomHistory(unittest.IsolatedAsyncioTestCase):
     async def test_owner_message_included_with_correct_role(self):
         connector = _make_connector(owners=["alice"])
         connector._rest = AsyncMock()
+        connector._rest.bot_username = None
         connector._rest.get_room_history = AsyncMock(return_value=[
             _rc_msg("alice", "owner message", ts_date=1_746_000_001_000),
         ])
@@ -106,6 +109,7 @@ class TestFetchRoomHistory(unittest.IsolatedAsyncioTestCase):
     async def test_guest_message_included_with_correct_role(self):
         connector = _make_connector(guests=["bob"])
         connector._rest = AsyncMock()
+        connector._rest.bot_username = None
         connector._rest.get_room_history = AsyncMock(return_value=[
             _rc_msg("bob", "guest message"),
         ])
@@ -118,6 +122,7 @@ class TestFetchRoomHistory(unittest.IsolatedAsyncioTestCase):
         """Bot's own prior messages are included with role='agent' and username='me'."""
         connector = _make_connector(bot_username="hammer-mei")
         connector._rest = AsyncMock()
+        connector._rest.bot_username = None
         connector._rest.get_room_history = AsyncMock(return_value=[
             _rc_msg("hammer-mei", "I said this before"),
         ])
@@ -131,6 +136,7 @@ class TestFetchRoomHistory(unittest.IsolatedAsyncioTestCase):
         """Users not in owner/guest list must be silently excluded."""
         connector = _make_connector(owners=["alice"], guests=["bob"])
         connector._rest = AsyncMock()
+        connector._rest.bot_username = None
         connector._rest.get_room_history = AsyncMock(return_value=[
             _rc_msg("alice", "ok"),
             _rc_msg("eve", "prompt injection attempt"),  # anonymous
@@ -146,6 +152,7 @@ class TestFetchRoomHistory(unittest.IsolatedAsyncioTestCase):
     async def test_all_messages_anonymous_returns_empty(self):
         connector = _make_connector(owners=["alice"], guests=[])
         connector._rest = AsyncMock()
+        connector._rest.bot_username = None
         connector._rest.get_room_history = AsyncMock(return_value=[
             _rc_msg("eve", "sneaky msg"),
             _rc_msg("mallory", "another sneaky msg"),
@@ -156,6 +163,7 @@ class TestFetchRoomHistory(unittest.IsolatedAsyncioTestCase):
     async def test_room_name_in_output(self):
         connector = _make_connector(owners=["alice"])
         connector._rest = AsyncMock()
+        connector._rest.bot_username = None
         connector._rest.get_room_history = AsyncMock(return_value=[
             _rc_msg("alice", "hello"),
         ])
@@ -167,6 +175,7 @@ class TestFetchRoomHistory(unittest.IsolatedAsyncioTestCase):
         """Room name with '|' must be sanitized to prevent header injection."""
         connector = _make_connector(owners=["alice"])
         connector._rest = AsyncMock()
+        connector._rest.bot_username = None
         connector._rest.get_room_history = AsyncMock(return_value=[
             _rc_msg("alice", "hello"),
         ])
@@ -179,6 +188,7 @@ class TestFetchRoomHistory(unittest.IsolatedAsyncioTestCase):
         """Usernames with '|' must be sanitized."""
         connector = _make_connector(owners=["evil|user"])
         connector._rest = AsyncMock()
+        connector._rest.bot_username = None
         connector._rest.get_room_history = AsyncMock(return_value=[
             _rc_msg("evil|user", "msg"),
         ])
@@ -190,6 +200,7 @@ class TestFetchRoomHistory(unittest.IsolatedAsyncioTestCase):
         """Messages with no 'u' field are skipped gracefully."""
         connector = _make_connector(owners=["alice"])
         connector._rest = AsyncMock()
+        connector._rest.bot_username = None
         no_sender = {"_id": "x", "msg": "text", "ts": {"$date": 1000}}
         connector._rest.get_room_history = AsyncMock(return_value=[
             no_sender,
@@ -202,6 +213,7 @@ class TestFetchRoomHistory(unittest.IsolatedAsyncioTestCase):
     async def test_rest_called_with_correct_args(self):
         connector = _make_connector()
         connector._rest = AsyncMock()
+        connector._rest.bot_username = None
         connector._rest.get_room_history = AsyncMock(return_value=[])
         room = _make_room(room_id="CUSTOM_ID", room_type="group")
         await connector.fetch_room_history(room, count=42)
@@ -213,6 +225,7 @@ class TestFetchRoomHistory(unittest.IsolatedAsyncioTestCase):
         """before_ts is forwarded to get_room_history for backward pagination."""
         connector = _make_connector()
         connector._rest = AsyncMock()
+        connector._rest.bot_username = None
         connector._rest.get_room_history = AsyncMock(return_value=[])
         room = _make_room(room_id="ROOM", room_type="channel")
         ts = "2026-05-10T10:00:00+08:00"
@@ -225,6 +238,7 @@ class TestFetchRoomHistory(unittest.IsolatedAsyncioTestCase):
         """after_ts is forwarded to get_room_history for forward navigation."""
         connector = _make_connector()
         connector._rest = AsyncMock()
+        connector._rest.bot_username = None
         connector._rest.get_room_history = AsyncMock(return_value=[])
         room = _make_room(room_id="ROOM", room_type="channel")
         ts = "2026-05-10T19:25:00+08:00"
@@ -237,6 +251,7 @@ class TestFetchRoomHistory(unittest.IsolatedAsyncioTestCase):
         """ts field must be a formatted ISO 8601 string, not raw epoch ms."""
         connector = _make_connector(owners=["alice"], timezone="Asia/Taipei")
         connector._rest = AsyncMock()
+        connector._rest.bot_username = None
         connector._rest.get_room_history = AsyncMock(return_value=[
             _rc_msg("alice", "hello", ts_date=1_746_057_600_000),
         ])
@@ -251,6 +266,7 @@ class TestFetchRoomHistory(unittest.IsolatedAsyncioTestCase):
         """Messages with missing $date produce ts=None (graceful)."""
         connector = _make_connector(owners=["alice"])
         connector._rest = AsyncMock()
+        connector._rest.bot_username = None
         no_ts = {"_id": "x", "msg": "no timestamp", "ts": {}, "u": {"username": "alice"}}
         connector._rest.get_room_history = AsyncMock(return_value=[no_ts])
         msgs = await connector.fetch_room_history(_make_room(), count=10)
@@ -260,6 +276,7 @@ class TestFetchRoomHistory(unittest.IsolatedAsyncioTestCase):
     async def test_empty_channel_returns_empty_list(self):
         connector = _make_connector()
         connector._rest = AsyncMock()
+        connector._rest.bot_username = None
         connector._rest.get_room_history = AsyncMock(return_value=[])
         msgs = await connector.fetch_room_history(_make_room(), count=50)
         self.assertEqual(msgs, [])
@@ -272,6 +289,7 @@ class TestFetchRoomHistory(unittest.IsolatedAsyncioTestCase):
             peer_agents=["wavebro"],
         )
         connector._rest = AsyncMock()
+        connector._rest.bot_username = None
         connector._rest.get_room_history = AsyncMock(return_value=[
             _rc_msg("alice", "owner msg"),
             _rc_msg("wavebro", "peer agent msg"),
@@ -291,6 +309,7 @@ class TestFetchRoomHistory(unittest.IsolatedAsyncioTestCase):
             peer_agents=[],  # no peer agents configured
         )
         connector._rest = AsyncMock()
+        connector._rest.bot_username = None
         connector._rest.get_room_history = AsyncMock(return_value=[
             _rc_msg("alice", "ok"),
             _rc_msg("wavebro", "not in any list"),
@@ -308,7 +327,7 @@ class TestFetchRoomHistory(unittest.IsolatedAsyncioTestCase):
 # prompt, ordered after the identity header and before context files. Under
 # the durable-system-prompt fix, history_context is genuinely one-time/
 # volatile content (not protocol-critical like the identity/addressing
-# header), so it is now sent directly by WatcherLifecycle._start_watcher() as
+# header), so it is now sent directly by start_watcher(WatcherLifecycle, ) as
 # a simple, separate, best-effort agent.send() call — fully decoupled from
 # InjectedContextBuilder.build()/ensure(). There is no longer a combined
 # "identity header before history" ordering to assert on a single prompt.
@@ -352,15 +371,16 @@ class TestHistoryHandoffSentSeparatelyFromHeader(unittest.IsolatedAsyncioTestCas
         state_store.save = MagicMock()
         dispatcher = MagicMock()
         dispatcher.add_processor = MagicMock()
+        # No watcher holds the room: a bare MagicMock would answer this with a truthy
+        # mock, which now reads as "another watcher is already serving it" (§4.1).
+        dispatcher.holder = MagicMock(return_value=None)
         injector = InjectedContextBuilder(config)
         maps = SessionMaps()
 
         lifecycle = WatcherLifecycle(
             connector=connector,
             agents={"claude": agent},
-            default_agent="claude",
             config=config,
-            watcher_configs=[wc],
             state_store=state_store,
             dispatcher=dispatcher,
             injector=injector,
@@ -378,7 +398,7 @@ class TestHistoryHandoffSentSeparatelyFromHeader(unittest.IsolatedAsyncioTestCas
 
         with patch("gateway.core.watcher_lifecycle.MessageProcessor") as MockProc:
             MockProc.return_value.start = MagicMock()
-            await lifecycle._start_watcher(wc, state=None)
+            await start_watcher(lifecycle, wc, state=None)
 
         # The header/context path goes through agent.ensure_durable_instructions(),
         # not agent.send() — so agent.send() must have been called exactly once,
@@ -396,7 +416,7 @@ class TestHistoryHandoffSentSeparatelyFromHeader(unittest.IsolatedAsyncioTestCas
 
         with patch("gateway.core.watcher_lifecycle.MessageProcessor") as MockProc:
             MockProc.return_value.start = MagicMock()
-            await lifecycle._start_watcher(wc, state=None)
+            await start_watcher(lifecycle, wc, state=None)
 
         agent.send.assert_not_called()
         agent.ensure_durable_instructions.assert_awaited_once()
@@ -454,6 +474,7 @@ class TestWatcherLifecycleHistoryHandoff(unittest.IsolatedAsyncioTestCase):
 
         dispatcher = MagicMock()
         dispatcher.add_processor = MagicMock()
+        dispatcher.holder = MagicMock(return_value=None)
 
         injector = InjectedContextBuilder(config)
 
@@ -462,9 +483,7 @@ class TestWatcherLifecycleHistoryHandoff(unittest.IsolatedAsyncioTestCase):
         lifecycle = WatcherLifecycle(
             connector=connector,
             agents={"claude": agent},
-            default_agent="claude",
             config=config,
-            watcher_configs=[wc],
             state_store=state_store,
             dispatcher=dispatcher,
             injector=injector,
@@ -479,12 +498,12 @@ class TestWatcherLifecycleHistoryHandoff(unittest.IsolatedAsyncioTestCase):
 
     async def test_fetch_room_history_called_for_new_session(self):
         """fetch_room_history must be called when a new session is created and enabled=True."""
-        lifecycle, connector, _ = self._make_lifecycle(history_enabled=True, fetch_count=20)
+        lifecycle, connector, wc = self._make_lifecycle(history_enabled=True, fetch_count=20)
 
         # Patch MessageProcessor.start to avoid consumer loop startup
         with patch("gateway.core.watcher_lifecycle.MessageProcessor") as MockProc:
             MockProc.return_value.start = MagicMock()
-            await lifecycle._start_watcher(lifecycle._watcher_configs[0], state=None)
+            await start_watcher(lifecycle, wc, state=None)
 
         connector.fetch_room_history.assert_called_once()
         call_args = connector.fetch_room_history.call_args
@@ -493,42 +512,87 @@ class TestWatcherLifecycleHistoryHandoff(unittest.IsolatedAsyncioTestCase):
 
     async def test_fetch_room_history_not_called_when_disabled(self):
         """fetch_room_history must NOT be called when history_handoff.enabled=False."""
-        lifecycle, connector, _ = self._make_lifecycle(history_enabled=False)
+        lifecycle, connector, wc = self._make_lifecycle(history_enabled=False)
 
         with patch("gateway.core.watcher_lifecycle.MessageProcessor") as MockProc:
             MockProc.return_value.start = MagicMock()
-            await lifecycle._start_watcher(lifecycle._watcher_configs[0], state=None)
+            await start_watcher(lifecycle, wc, state=None)
 
         connector.fetch_room_history.assert_not_called()
 
     async def test_fetch_room_history_not_called_when_session_reused(self):
         """When a session is reused (not newly created), history must NOT be injected."""
-        from gateway.core.state import WatcherState
+        from gateway.core.state import WatcherState, backend_identity
 
         lifecycle, connector, wc = self._make_lifecycle(history_enabled=True)
-        # Simulate an existing session — _provision_session will return created_new_session=False
+        # Simulate an existing session — _provision_session will return created_new_session=False.
+        # The identity has to match the agent config for the session to be reusable at
+        # all (§2.4): a record that cannot be verified against the current backend is not
+        # a reused session, it is a fresh one, and it *should* get history. This fixture
+        # asserted "no history" while omitting the identity, so it began describing the
+        # opposite case the moment the comparison landed.
+        agent_cfg = lifecycle._config.agent_config(
+            lifecycle._resolve_agent_name(wc.agent))
         existing_state = WatcherState(
             watcher_name="w1",
             session_id="existing-session-id",
             room_id="r1",
             context_injected=True,
+            backend_identity=backend_identity(
+                agent_cfg.type, agent_cfg.working_directory),
         )
 
         with patch("gateway.core.watcher_lifecycle.MessageProcessor") as MockProc:
             MockProc.return_value.start = MagicMock()
-            await lifecycle._start_watcher(wc, state=existing_state)
+            await start_watcher(lifecycle, wc, state=existing_state)
 
         connector.fetch_room_history.assert_not_called()
 
+    async def test_history_bounded_by_trigger_timestamp(self):
+        """The creation path's trigger timestamp bounds the fetch (§2.7).
+
+        The trigger is buffered and replayed into the new processor as the live
+        prompt, so history must fetch strictly older than it — otherwise the
+        newest-history block contains the very message that triggered creation
+        and the agent receives it twice.
+        """
+        lifecycle, connector, wc = self._make_lifecycle(history_enabled=True)
+
+        with patch("gateway.core.watcher_lifecycle.MessageProcessor") as MockProc:
+            MockProc.return_value.start = MagicMock()
+            await start_watcher(lifecycle,
+                wc,
+                state=None,
+                history_before_ts="2026-08-16T10:00:00+00:00",
+            )
+
+        connector.fetch_room_history.assert_called_once()
+        self.assertEqual(
+            connector.fetch_room_history.call_args.kwargs.get("before_ts"),
+            "2026-08-16T10:00:00+00:00",
+        )
+
+    async def test_static_start_fetches_unbounded_history(self):
+        """A static start has no trigger, so the fetch carries no upper bound."""
+        lifecycle, connector, wc = self._make_lifecycle(history_enabled=True)
+
+        with patch("gateway.core.watcher_lifecycle.MessageProcessor") as MockProc:
+            MockProc.return_value.start = MagicMock()
+            await start_watcher(lifecycle, wc, state=None)
+
+        connector.fetch_room_history.assert_called_once()
+        self.assertIsNone(
+            connector.fetch_room_history.call_args.kwargs.get("before_ts"))
+
     async def test_fetch_failure_does_not_block_startup(self):
         """If fetch_room_history raises, the watcher must still start successfully."""
-        lifecycle, connector, _ = self._make_lifecycle(history_enabled=True)
+        lifecycle, connector, wc = self._make_lifecycle(history_enabled=True)
         connector.fetch_room_history = AsyncMock(side_effect=RuntimeError("network error"))
 
         with patch("gateway.core.watcher_lifecycle.MessageProcessor") as MockProc:
             MockProc.return_value.start = MagicMock()
             # Must not raise
-            await lifecycle._start_watcher(lifecycle._watcher_configs[0], state=None)
+            await start_watcher(lifecycle, wc, state=None)
 
         # Processor was still started despite the fetch failure
         MockProc.return_value.start.assert_called_once()

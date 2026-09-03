@@ -12,7 +12,6 @@ Run with:
 
 from __future__ import annotations
 
-import json
 import os
 import tempfile
 import textwrap
@@ -20,9 +19,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-import yaml
-
-from gateway.config import GatewayConfig
+from gateway.config import GatewayConfig, collect_config
 
 # ── Tests: working_directory validation ──────────────────────────────────────
 
@@ -41,9 +38,12 @@ class TestWorkingDirectoryValidation(unittest.TestCase):
                   password: pw
             agents:
 {textwrap.indent(agents_block, "              ")}
-            watchers:
+            watcher_rules:
               - name: w1
-                room: general
+                connector: rc
+                agent: default
+                rooms:
+                  include: [general]
         """)
         with tempfile.NamedTemporaryFile("w", suffix=".yaml", delete=False) as f:
             f.write(cfg)
@@ -152,13 +152,41 @@ class TestConfigValidationHardening(unittest.TestCase):
               default:
                 type: claude
                 working_directory: /tmp
-            watchers:
+            watcher_rules:
               - name: w1
-                room: general
+                connector: rc
+                agent: default
+                rooms:
+                  include: [general]
         """)
         with self.assertRaises(ValueError) as ctx:
             GatewayConfig.from_file(path)
         self.assertIn("Duplicate connector name 'rc'", str(ctx.exception))
+
+    def test_a_colon_in_a_connector_name_is_refused(self):
+        """':' is the watcher-handle divider (<connector>:<room label>) — the
+        boundary is only unforgeable because a connector name can never
+        carry one (Codex review of #121, round 7)."""
+        path = self._write_config("""\
+            connectors:
+              - name: rc:home
+                type: rocketchat
+                server: {url: http://localhost:3000, username: bot, password: pw}
+            agents:
+              default:
+                type: claude
+                working_directory: /tmp
+            watcher_rules:
+              - name: w1
+                connector: rc
+                agent: default
+                rooms:
+                  include: [general]
+        """)
+        with self.assertRaises(ValueError) as ctx:
+            GatewayConfig.from_file(path)
+        self.assertIn("reserved", str(ctx.exception))
+        self.assertIn("rc:home", str(ctx.exception))
 
     def test_duplicate_watcher_name_raises(self):
         path = self._write_config("""\
@@ -170,36 +198,21 @@ class TestConfigValidationHardening(unittest.TestCase):
               default:
                 type: claude
                 working_directory: /tmp
-            watchers:
+            watcher_rules:
               - name: same
-                room: general
+                connector: rc
+                agent: default
+                rooms:
+                  include: [general]
               - name: same
-                room: lobby
+                connector: rc
+                agent: default
+                rooms:
+                  include: [lobby]
         """)
         with self.assertRaises(ValueError) as ctx:
             GatewayConfig.from_file(path)
-        self.assertIn("Duplicate watcher name 'same'", str(ctx.exception))
-
-    def test_watcher_name_with_slash_raises(self):
-        """Watcher names become filesystem path components (.acg-attachments/<name>
-        under working_directory, system-prompts/<name>.md under RUNTIME_DIR) — a
-        '/' could escape the intended directory."""
-        path = self._write_config("""\
-            connectors:
-              - name: rc
-                type: rocketchat
-                server: {url: http://localhost:3000, username: bot, password: pw}
-            agents:
-              default:
-                type: claude
-                working_directory: /tmp
-            watchers:
-              - name: evil/../escape
-                room: general
-        """)
-        with self.assertRaises(ValueError) as ctx:
-            GatewayConfig.from_file(path)
-        self.assertIn("must not contain '/'", str(ctx.exception))
+        self.assertIn("Duplicate watcher rule name 'same'", str(ctx.exception))
 
     def test_empty_watcher_room_raises(self):
         path = self._write_config("""\
@@ -211,13 +224,16 @@ class TestConfigValidationHardening(unittest.TestCase):
               default:
                 type: claude
                 working_directory: /tmp
-            watchers:
+            watcher_rules:
               - name: w1
-                room: ""
+                connector: rc
+                agent: default
+                rooms:
+                  include: [""]
         """)
         with self.assertRaises(ValueError) as ctx:
             GatewayConfig.from_file(path)
-        self.assertIn("must have a non-empty 'room' or 'rooms' field", str(ctx.exception))
+        self.assertIn("'rooms.include' entries must be non-empty strings", str(ctx.exception))
 
     def test_negative_max_queue_depth_raises(self):
         path = self._write_config("""\
@@ -230,9 +246,12 @@ class TestConfigValidationHardening(unittest.TestCase):
                 type: claude
                 working_directory: /tmp
             max_queue_depth: -1
-            watchers:
+            watcher_rules:
               - name: w1
-                room: general
+                connector: rc
+                agent: default
+                rooms:
+                  include: [general]
         """)
         with self.assertRaises(ValueError) as ctx:
             GatewayConfig.from_file(path)
@@ -246,9 +265,12 @@ class TestConfigValidationHardening(unittest.TestCase):
                 server: {url: http://localhost:3000, username: bot, password: pw}
             agents:
               default: claude
-            watchers:
+            watcher_rules:
               - name: w1
-                room: general
+                connector: rc
+                agent: default
+                rooms:
+                  include: [general]
         """)
         with self.assertRaises(ValueError) as ctx:
             GatewayConfig.from_file(path)
@@ -264,12 +286,12 @@ class TestConfigValidationHardening(unittest.TestCase):
               default:
                 type: claude
                 working_directory: /tmp
-            watchers:
+            watcher_rules:
               - just-a-string
         """)
         with self.assertRaises(ValueError) as ctx:
             GatewayConfig.from_file(path)
-        self.assertIn("Watcher entry at index 0 must be a mapping", str(ctx.exception))
+        self.assertIn("watcher_rules[0] must be a mapping", str(ctx.exception))
 
     def test_non_string_connector_type_raises_value_error_not_type_error(self):
         """PR review finding: a truthy-but-non-string 'type' (e.g. a YAML
@@ -287,9 +309,12 @@ class TestConfigValidationHardening(unittest.TestCase):
               default:
                 type: claude
                 working_directory: /tmp
-            watchers:
+            watcher_rules:
               - name: w1
-                room: general
+                connector: rc
+                agent: default
+                rooms:
+                  include: [general]
         """)
         with self.assertRaisesRegex(ValueError, "'type' must be a string"):
             GatewayConfig.from_file(path)
@@ -304,8 +329,11 @@ class TestConfigValidationHardening(unittest.TestCase):
               default:
                 type: claude
                 working_directory: /tmp
-            watchers:
-              - room: general
+            watcher_rules:
+              - name: w1
+                agent: default
+                rooms:
+                  include: [general]
                 connector: [rc]
         """)
         with self.assertRaisesRegex(ValueError, "'connector' must be a string"):
@@ -321,8 +349,10 @@ class TestConfigValidationHardening(unittest.TestCase):
               default:
                 type: claude
                 working_directory: /tmp
-            watchers:
-              - room: general
+            watcher_rules:
+              - name: w1
+                rooms:
+                  include: [general]
                 connector: rc
                 agent: [default]
         """)
@@ -330,9 +360,11 @@ class TestConfigValidationHardening(unittest.TestCase):
             GatewayConfig.from_file(path)
 
     def test_non_string_watcher_room_raises_value_error_not_attribute_error(self):
-        """The plural 'rooms:' form validates each element already; this
-        singular alias didn't — a non-string 'room' (e.g. an int) reached
-        _sanitize_room_for_name()'s `room.startswith("@")` unchecked."""
+        """A non-string rooms.include element (e.g. an int) must be refused
+        as a clean ValueError, never an AttributeError/TypeError escaping
+        into the loader. (Originally pinned against the deleted static
+        parser's `room:` alias; kept because the rule shape's pattern
+        parsing owes the same contract.)"""
         path = self._write_config("""\
             connectors:
               - name: rc
@@ -342,51 +374,45 @@ class TestConfigValidationHardening(unittest.TestCase):
               default:
                 type: claude
                 working_directory: /tmp
-            watchers:
-              - room: 12345
-                connector: rc
-        """)
-        with self.assertRaisesRegex(ValueError, "'room' must be a string"):
-            GatewayConfig.from_file(path)
-
-    def test_non_string_watcher_session_id_raises_value_error_not_type_error(self):
-        path = self._write_config("""\
-            connectors:
-              - name: rc
-                type: rocketchat
-                server: {url: http://localhost:3000, username: bot, password: pw}
-            agents:
-              default:
-                type: claude
-                working_directory: /tmp
-            watchers:
-              - room: general
-                connector: rc
-                session_id: [abc]
-        """)
-        with self.assertRaisesRegex(ValueError, "'session_id' must be a string"):
-            GatewayConfig.from_file(path)
-
-    def test_non_string_default_agent_raises_value_error_not_type_error(self):
-        path = self._write_config("""\
-            connectors:
-              - name: rc
-                type: rocketchat
-                server: {url: http://localhost:3000, username: bot, password: pw}
-            agents:
-              default:
-                type: claude
-                working_directory: /tmp
-            default_agent: [prod]
-            watchers:
+            watcher_rules:
               - name: w1
-                room: general
+                agent: default
+                rooms:
+                  include: [12345]
+                connector: rc
         """)
-        with self.assertRaisesRegex(ValueError, "'default_agent' must be a string"):
+        with self.assertRaisesRegex(
+            ValueError, "'rooms.include' entries must be non-empty strings"
+        ):
             GatewayConfig.from_file(path)
 
-
-# ── Tests: cache_dir_global path resolution ───────────────────────────────────
+    def test_any_watcher_session_id_is_refused_since_the_field_is_removed(self):
+        """Still refused whatever its value — but by the rule shape's closed key
+        set, not by a branch of its own. The dedicated check existed because the
+        OLD static parser ignored unknown keys, so a plain deletion would have
+        made a released key silently ineffective. A closed key set removes that
+        risk, so the special case went (see test_session_id_removed.py)."""
+        for value in ("[abc]", "'ses_abc123'", "null", "false", "0"):
+            with self.subTest(value=value):
+                path = self._write_config(f"""\
+                    connectors:
+                      - name: rc
+                        type: rocketchat
+                        server: {{url: http://localhost:3000, username: bot, password: pw}}
+                    agents:
+                      default:
+                        type: claude
+                        working_directory: /tmp
+                    watcher_rules:
+                      - name: w1
+                        agent: default
+                        rooms:
+                          include: [general]
+                        connector: rc
+                        session_id: {value}
+                """)
+                with self.assertRaisesRegex(ValueError, "unknown key\\(s\\).*session_id"):
+                    GatewayConfig.from_file(path)
 
 
 class TestCacheDirGlobalResolution(unittest.TestCase):
@@ -407,9 +433,12 @@ class TestCacheDirGlobalResolution(unittest.TestCase):
               default:
                 type: claude
                 working_directory: /tmp
-            watchers:
+            watcher_rules:
               - name: w1
-                room: general
+                connector: rc
+                agent: default
+                rooms:
+                  include: [general]
         """)
         with tempfile.NamedTemporaryFile("w", suffix=".yaml", delete=False) as f:
             f.write(cfg)
@@ -463,9 +492,12 @@ class TestDollarVarIsALiteralString(unittest.TestCase):
               default:
                 type: claude
                 working_directory: /tmp
-            watchers:
+            watcher_rules:
               - name: w1
-                room: general
+                connector: rc
+                agent: default
+                rooms:
+                  include: [general]
         """)
         with tempfile.NamedTemporaryFile("w", suffix=".yaml", delete=False) as f:
             f.write(cfg)
@@ -533,9 +565,12 @@ class TestToolRuleRegexValidation(unittest.TestCase):
                 working_directory: /tmp
                 owner_allowed_tools:
 {textwrap.indent(rule_block, "                  ")}
-            watchers:
+            watcher_rules:
               - name: w1
-                room: general
+                connector: rc
+                agent: default
+                rooms:
+                  include: [general]
         """)
         with tempfile.NamedTemporaryFile("w", suffix=".yaml", delete=False) as f:
             f.write(cfg)
@@ -571,49 +606,6 @@ class TestToolRuleRegexValidation(unittest.TestCase):
 # ── Tests: GatewayConfig.agent raises KeyError on misconfiguration (Q2) ──────
 
 
-class TestGatewayConfigAgentProperty(unittest.TestCase):
-    """Q2: GatewayConfig.agent must raise KeyError instead of silently
-    falling back to the first agent when default_agent is mismatched."""
-
-    def test_agent_returns_correct_default(self):
-        """When default_agent is valid, .agent returns the right config."""
-        from gateway.core.config import AgentConfig
-        cfg = GatewayConfig(
-            connectors=[],
-            agents={"main": AgentConfig(name="main"), "other": AgentConfig(name="other")},
-            default_agent="main",
-        )
-        self.assertEqual(cfg.agent.name, "main")
-
-    def test_agent_raises_on_missing_default(self):
-        """When default_agent is not in agents, .agent must raise KeyError."""
-        from gateway.core.config import AgentConfig
-        cfg = GatewayConfig(
-            connectors=[],
-            agents={"main": AgentConfig(name="main")},
-            default_agent="nonexistent",
-        )
-        with self.assertRaises(KeyError) as ctx:
-            _ = cfg.agent
-        self.assertIn("nonexistent", str(ctx.exception))
-
-    def test_agent_error_message_lists_available_agents(self):
-        """KeyError message must include available agent names for diagnosis."""
-        from gateway.core.config import AgentConfig
-        cfg = GatewayConfig(
-            connectors=[],
-            agents={"alpha": AgentConfig(name="alpha"), "beta": AgentConfig(name="beta")},
-            default_agent="gamma",
-        )
-        with self.assertRaises(KeyError) as ctx:
-            _ = cfg.agent
-        error_str = str(ctx.exception)
-        self.assertIn("gamma", error_str)
-
-
-# ── Tests: built-in context auto-injection ────────────────────────────────────
-
-
 class TestBuiltinContextAutoInjection(unittest.TestCase):
     """Built-in system context files are auto-prepended in context_inject_files_for().
 
@@ -634,7 +626,6 @@ class TestBuiltinContextAutoInjection(unittest.TestCase):
         return CoreConfig(
             connector_configs={"rc": connector},
             agents={"default": agent},
-            default_agent="default",
         )
 
     def test_rc_connector_gets_core_and_tool_index_by_default(self):
@@ -697,9 +688,12 @@ class TestBuiltinContextAutoInjection(unittest.TestCase):
                 type: claude
                 working_directory: /tmp
                 lazy_instruction_loading: false
-            watchers:
+            watcher_rules:
               - name: w1
-                room: general
+                connector: rc
+                agent: default
+                rooms:
+                  include: [general]
         """)
         with tempfile.NamedTemporaryFile("w", suffix=".yaml", delete=False) as f:
             f.write(cfg_text)
@@ -743,7 +737,7 @@ class TestBuiltinContextAutoInjection(unittest.TestCase):
     def test_no_connector_config_skips_builtin_injection(self):
         """When ConnectorConfig is absent (e.g. tests), no built-in files are prepended."""
         from gateway.core.config import AgentConfig, CoreConfig
-        config = CoreConfig(agents={"default": AgentConfig(timeout=10)}, default_agent="default")
+        config = CoreConfig(agents={"default": AgentConfig(timeout=10)})
         files = config.context_inject_files_for("unknown-connector", "default", [])
         basenames = [Path(f).name for f in files]
         self.assertNotIn("rc-gateway-context.md", basenames)
@@ -1192,9 +1186,12 @@ class TestConnectorTemplates(unittest.TestCase):
               default:
                 type: claude
                 working_directory: /tmp
-            watchers:
+            watcher_rules:
               - name: w1
-                room: general
+                connector: rc1
+                agent: default
+                rooms:
+                  include: [general]
         """)
         config = GatewayConfig.from_file(path)
         rc1, rc2 = config.connectors[0], config.connectors[1]
@@ -1218,9 +1215,12 @@ class TestConnectorTemplates(unittest.TestCase):
               default:
                 type: claude
                 working_directory: /tmp
-            watchers:
+            watcher_rules:
               - name: w1
-                room: general
+                connector: rc1
+                agent: default
+                rooms:
+                  include: [general]
         """)
         with self.assertRaises(ValueError) as ctx:
             GatewayConfig.from_file(path)
@@ -1238,9 +1238,12 @@ class TestConnectorTemplates(unittest.TestCase):
               default:
                 type: claude
                 working_directory: /tmp
-            watchers:
+            watcher_rules:
               - name: w1
-                room: general
+                connector: rc1
+                agent: default
+                rooms:
+                  include: [general]
         """)
         with self.assertRaises(ValueError) as ctx:
             GatewayConfig.from_file(path)
@@ -1267,9 +1270,12 @@ class TestConnectorTemplates(unittest.TestCase):
               default:
                 type: claude
                 working_directory: /tmp
-            watchers:
+            watcher_rules:
               - name: w1
-                room: general
+                connector: rc1
+                agent: default
+                rooms:
+                  include: [general]
         """)
         with self.assertRaises(ValueError) as ctx:
             GatewayConfig.from_file(path)
@@ -1293,9 +1299,12 @@ class TestConnectorTemplates(unittest.TestCase):
               default:
                 type: claude
                 working_directory: /tmp
-            watchers:
+            watcher_rules:
               - name: w1
-                room: general
+                connector: rc1
+                agent: default
+                rooms:
+                  include: [general]
         """)
         config = GatewayConfig.from_file(path)
         self.assertEqual(config.connectors[0].type, "rocketchat")
@@ -1321,9 +1330,12 @@ class TestConnectorTemplates(unittest.TestCase):
               default:
                 type: claude
                 working_directory: /tmp
-            watchers:
+            watcher_rules:
               - name: w1
-                room: general
+                connector: rc1
+                agent: default
+                rooms:
+                  include: [general]
         """)
         config = GatewayConfig.from_file(path)
         a = config.connectors[0].raw["attachments"]
@@ -1356,9 +1368,12 @@ class TestAgentTemplates(unittest.TestCase):
               other:
                 inherits: standard
                 timeout: 42
-            watchers:
+            watcher_rules:
               - name: w1
-                room: general
+                connector: rc
+                agent: default
+                rooms:
+                  include: [general]
         """)
         config = GatewayConfig.from_file(path)
         self.assertEqual(config.agents["default"].working_directory, "/tmp")
@@ -1388,10 +1403,12 @@ class TestAgentTemplates(unittest.TestCase):
                 type: claude
                 inherits: opencode-standard
                 working_directory: /tmp
-            watchers:
+            watcher_rules:
               - name: w1
+                connector: rc
                 agent: agent-a
-                room: general
+                rooms:
+                  include: [general]
         """)
         with self.assertRaises(ValueError) as ctx:
             GatewayConfig.from_file(path)
@@ -1426,10 +1443,12 @@ class TestAgentTemplates(unittest.TestCase):
               agent-b:
                 inherits: opencode-standard
                 working_directory: /tmp
-            watchers:
+            watcher_rules:
               - name: w1
+                connector: rc
                 agent: agent-a
-                room: general
+                rooms:
+                  include: [general]
         """)
         config = GatewayConfig.from_file(path)
         self.assertEqual(config.agents["agent-a"].type, "claude")
@@ -1456,9 +1475,11 @@ class TestAgentTemplates(unittest.TestCase):
             agents:
               forgot-inherits:
                 working_directory: /tmp
-            watchers:
+            watcher_rules:
               - name: w1
-                room: general
+                connector: rc
+                rooms:
+                  include: [general]
                 agent: forgot-inherits
         """)
         with self.assertRaisesRegex(
@@ -1483,9 +1504,11 @@ class TestAgentTemplates(unittest.TestCase):
               bad-agent:
                 type: [claude]
                 working_directory: /tmp
-            watchers:
+            watcher_rules:
               - name: w1
-                room: general
+                connector: rc
+                rooms:
+                  include: [general]
                 agent: bad-agent
         """)
         with self.assertRaisesRegex(
@@ -1513,9 +1536,11 @@ class TestAgentTemplates(unittest.TestCase):
               opencode-agent:
                 type: opencode
                 working_directory: /tmp
-            watchers:
+            watcher_rules:
               - name: w1
-                room: general
+                connector: rc
+                rooms:
+                  include: [general]
                 agent: claude-agent
         """)
         config = GatewayConfig.from_file(path)
@@ -1538,9 +1563,12 @@ class TestAgentTemplates(unittest.TestCase):
               default:
                 inherits: standard
                 permissions: {timeout: 100}
-            watchers:
+            watcher_rules:
               - name: w1
-                room: general
+                connector: rc
+                agent: default
+                rooms:
+                  include: [general]
         """)
         config = GatewayConfig.from_file(path)
         perms = config.agents["default"].permissions
@@ -1566,9 +1594,12 @@ class TestAgentTemplates(unittest.TestCase):
                 inherits: standard
                 owner_allowed_tools:
                   - tool: Write
-            watchers:
+            watcher_rules:
               - name: w1
-                room: general
+                connector: rc
+                agent: default
+                rooms:
+                  include: [general]
         """)
         config = GatewayConfig.from_file(path)
         tools = [r.tool for r in config.agents["default"].owner_allowed_tools]
@@ -1586,9 +1617,12 @@ class TestAgentTemplates(unittest.TestCase):
               default:
                 inherits: nope
                 working_directory: /tmp
-            watchers:
+            watcher_rules:
               - name: w1
-                room: general
+                connector: rc
+                agent: default
+                rooms:
+                  include: [general]
         """)
         with self.assertRaises(ValueError) as ctx:
             GatewayConfig.from_file(path)
@@ -1612,9 +1646,12 @@ class TestAgentTemplates(unittest.TestCase):
               default:
                 inherits: bad
                 working_directory: /tmp
-            watchers:
+            watcher_rules:
               - name: w1
-                room: general
+                connector: rc
+                agent: default
+                rooms:
+                  include: [general]
         """)
         with self.assertRaises(ValueError) as ctx:
             GatewayConfig.from_file(path)
@@ -1623,8 +1660,18 @@ class TestAgentTemplates(unittest.TestCase):
         self.assertIn("must not set 'inherits'", msg)
 
 
-class TestAgentSessionLifecycleConfig(unittest.TestCase):
-    """session_idle_days / session_expire_days (docs/design/dynamic-watcher-design.md)."""
+class TestAgentSessionLifecycleKeysAreRejected(unittest.TestCase):
+    """The TTLs moved from the agent to the watcher rule (design §5.4).
+
+    Removing them silently was the wrong option: the value would be read, ignored,
+    and the lifecycle the operator asked for would simply never happen — the exact
+    shape of failure this loader has produced repeatedly. So a leftover key is a
+    hard error naming the new home, the same treatment `_REMOVED_DEFAULTS_KEYS`
+    gives a retired top-level block.
+
+    Both keys were added after v0.5.1 and never released, so this breaks no deployed
+    config; it only catches someone following the pre-release design doc.
+    """
 
     def _write_config(self, agent_block: str) -> str:
         cfg = textwrap.dedent(f"""\
@@ -1637,85 +1684,44 @@ class TestAgentSessionLifecycleConfig(unittest.TestCase):
                 type: claude
                 working_directory: /tmp
 {textwrap.indent(textwrap.dedent(agent_block), "                ")}
-            watchers:
+            watcher_rules:
               - name: w1
-                room: general
+                connector: rc
+                agent: default
+                rooms:
+                  include: [general]
         """)
         with tempfile.NamedTemporaryFile("w", suffix=".yaml", delete=False) as f:
             f.write(cfg)
             return f.name
 
-    def test_defaults_are_none(self):
-        path = self._write_config("")
-        config = GatewayConfig.from_file(path)
-        self.assertIsNone(config.agents["default"].session_idle_days)
-        self.assertIsNone(config.agents["default"].session_expire_days)
+    def test_an_agent_no_longer_carries_the_fields_at_all(self):
+        config = GatewayConfig.from_file(self._write_config(""))
+        agent = config.agents["default"]
+        self.assertFalse(hasattr(agent, "session_idle_days"))
+        self.assertFalse(hasattr(agent, "session_expire_days"))
 
-    def test_both_set_and_valid(self):
-        path = self._write_config("""\
-            session_idle_days: 7
-            session_expire_days: 30
-        """)
-        config = GatewayConfig.from_file(path)
-        self.assertEqual(config.agents["default"].session_idle_days, 7)
-        self.assertEqual(config.agents["default"].session_expire_days, 30)
+    def test_either_key_on_an_agent_is_a_load_error_naming_the_rule(self):
+        for key in ("session_idle_days", "session_expire_days"):
+            with self.subTest(key=key):
+                path = self._write_config(f"{key}: 7\n")
+                with self.assertRaises(ValueError) as ctx:
+                    GatewayConfig.from_file(path)
+                msg = str(ctx.exception)
+                self.assertIn(key, msg)
+                self.assertIn("'watcher_rules:'", msg)  # contract: says where it goes now
 
-    def test_only_idle_set_is_valid(self):
-        path = self._write_config("session_idle_days: 7\n")
-        config = GatewayConfig.from_file(path)
-        self.assertEqual(config.agents["default"].session_idle_days, 7)
-        self.assertIsNone(config.agents["default"].session_expire_days)
-
-    def test_idle_must_be_strictly_less_than_expire(self):
-        path = self._write_config("""\
-            session_idle_days: 30
-            session_expire_days: 30
-        """)
+    def test_an_explicit_null_is_rejected_too(self):
+        """`null` is not a way to keep the key: the field is gone, so writing it at
+        all means the operator believes an agent-level lifecycle exists."""
+        path = self._write_config("session_idle_days: null\n")
         with self.assertRaises(ValueError) as ctx:
             GatewayConfig.from_file(path)
-        msg = str(ctx.exception)
-        self.assertIn("session_idle_days (30) must be strictly less than session_expire_days (30)", msg)
+        self.assertIn("'watcher_rules:'", str(ctx.exception))
 
-    def test_idle_greater_than_expire_raises(self):
-        path = self._write_config("""\
-            session_idle_days: 45
-            session_expire_days: 30
-        """)
-        with self.assertRaises(ValueError) as ctx:
-            GatewayConfig.from_file(path)
-        self.assertIn("must be strictly less than", str(ctx.exception))
-
-    def test_non_integer_idle_days_raises(self):
-        path = self._write_config("session_idle_days: 'soon'\n")
-        with self.assertRaises(ValueError) as ctx:
-            GatewayConfig.from_file(path)
-        self.assertIn("session_idle_days must be an integer", str(ctx.exception))
-
-    def test_non_integer_expire_days_raises(self):
-        path = self._write_config("session_expire_days: 3.5\n")
-        with self.assertRaises(ValueError) as ctx:
-            GatewayConfig.from_file(path)
-        self.assertIn("session_expire_days must be an integer", str(ctx.exception))
-
-    def test_boolean_is_rejected_even_though_bool_is_an_int_subclass(self):
-        path = self._write_config("session_idle_days: true\n")
-        with self.assertRaises(ValueError) as ctx:
-            GatewayConfig.from_file(path)
-        self.assertIn("session_idle_days must be an integer", str(ctx.exception))
-
-    def test_zero_idle_days_raises(self):
-        path = self._write_config("session_idle_days: 0\n")
-        with self.assertRaises(ValueError) as ctx:
-            GatewayConfig.from_file(path)
-        self.assertIn("must be a positive integer", str(ctx.exception))
-
-    def test_negative_expire_days_raises(self):
-        path = self._write_config("session_expire_days: -1\n")
-        with self.assertRaises(ValueError) as ctx:
-            GatewayConfig.from_file(path)
-        self.assertIn("must be a positive integer", str(ctx.exception))
-
-    def test_inherited_via_agent_templates(self):
+    def test_a_value_inherited_from_an_agent_template_is_rejected(self):
+        """The check reads the already-merged entry, so a template cannot smuggle
+        one in — the case a key-presence check on the raw entry would have missed."""
         cfg = textwrap.dedent("""\
             connectors:
               - name: rc
@@ -1726,25 +1732,64 @@ class TestAgentSessionLifecycleConfig(unittest.TestCase):
                 type: claude
                 working_directory: /tmp
                 session_idle_days: 7
-                session_expire_days: 30
             agents:
               default: {inherits: standard}
-              custom:
-                inherits: standard
-                session_expire_days: 14
-            watchers:
+            watcher_rules:
               - name: w1
-                room: general
+                connector: rc
+                agent: default
+                rooms:
+                  include: [general]
         """)
         with tempfile.NamedTemporaryFile("w", suffix=".yaml", delete=False) as f:
             f.write(cfg)
             path = f.name
-        config = GatewayConfig.from_file(path)
-        self.assertEqual(config.agents["default"].session_idle_days, 7)
-        self.assertEqual(config.agents["default"].session_expire_days, 30)
-        # 'custom' overrides just session_expire_days, keeps inherited idle_days.
-        self.assertEqual(config.agents["custom"].session_idle_days, 7)
-        self.assertEqual(config.agents["custom"].session_expire_days, 14)
+        with self.assertRaises(ValueError) as ctx:
+            GatewayConfig.from_file(path)
+        self.assertIn("'watcher_rules:'", str(ctx.exception))
+
+    def test_collect_config_attributes_it_to_the_agent_and_keeps_going(self):
+        """A second, healthy agent isolates the attribution from the pre-existing
+        cascade: when the *only* agent fails, zero agents parse and
+        collect_config() adds its own "must define at least one agent" global issue
+        on top. That cascade is existing behaviour, asserted separately below."""
+        cfg = textwrap.dedent("""\
+            connectors:
+              - name: rc
+                type: rocketchat
+                server: {url: http://localhost:3000, username: bot, password: pw}
+            agents:
+              default:
+                type: claude
+                working_directory: /tmp
+              legacy:
+                type: claude
+                working_directory: /tmp
+                session_expire_days: 30
+            watcher_rules:
+              - name: w1
+                connector: rc
+                agent: default
+                rooms:
+                  include: [general]
+        """)
+        with tempfile.NamedTemporaryFile("w", suffix=".yaml", delete=False) as f:
+            f.write(cfg)
+            path = f.name
+        config, issues = collect_config(path)
+        self.assertEqual(len(issues), 1, [i.message for i in issues])
+        self.assertEqual(issues[0].entity_kind, "agent")
+        self.assertEqual(issues[0].entity_name, "legacy")
+        # The healthy agent and the watcher are unaffected.
+        self.assertEqual(sorted(config.agents), ["default"])
+        self.assertEqual([r.name for r in config.watcher_rules], ["w1"])
+
+    def test_the_only_agent_failing_still_reports_the_named_key_first(self):
+        """Pre-existing cascade, pinned so the attributed issue is not mistaken for
+        the whole story: the "at least one agent" global issue follows it."""
+        _, issues = collect_config(self._write_config("session_expire_days: 30\n"))
+        self.assertEqual([i.entity_kind for i in issues], ["agent", "global"])
+        self.assertIn("'watcher_rules:'", issues[0].message)
 
 
 class TestWatcherTemplates(unittest.TestCase):
@@ -1767,22 +1812,25 @@ class TestWatcherTemplates(unittest.TestCase):
               standard:
                 connector: rc
                 agent: default
-            watchers:
+            watcher_rules:
               - name: w1
                 inherits: standard
-                room: general
+                rooms:
+                  include: [general]
         """)
         config = GatewayConfig.from_file(path)
-        wc = config.watchers[0]
+        wc = config.watcher_rules[0]
         self.assertEqual(wc.connector, "rc")
         self.assertEqual(wc.agent, "default")
 
     def test_watcher_template_forbids_identity_fields(self):
+        # Only `name` is left. `session_id`, `room` and `rooms` all used to be
+        # here: the first two stopped being keys at all (the closed rule shape
+        # reports them, naming the entry rather than the template), and `rooms`
+        # became inheritable when the `watcher_rules:` rename removed the shape
+        # sniffing that depended on it.
         for key, value in (
             ("name", "shared-name"),
-            ("room", "general"),
-            ("rooms", ["general"]),
-            ("session_id", "sticky-1"),
         ):
             with self.subTest(key=key):
                 path = self._write_config(f"""\
@@ -1797,9 +1845,12 @@ class TestWatcherTemplates(unittest.TestCase):
                     watcher_templates:
                       standard:
                         {key}: {value!r}
-                    watchers:
+                    watcher_rules:
                       - name: w1
-                        room: general
+                        connector: rc
+                        agent: default
+                        rooms:
+                          include: [general]
                 """)
                 with self.assertRaises(ValueError) as ctx:
                     GatewayConfig.from_file(path)
@@ -1833,11 +1884,12 @@ class TestWatcherTemplates(unittest.TestCase):
                 connector: rc
                 agent: default
                 type: bar
-            watchers:
+            watcher_rules:
               - name: w1
                 inherits: standard
                 type: foo
-                room: general
+                rooms:
+                  include: [general]
         """)
         with self.assertRaises(ValueError) as ctx:
             GatewayConfig.from_file(path)
@@ -1860,17 +1912,18 @@ class TestWatcherTemplates(unittest.TestCase):
                 working_directory: /tmp
             watcher_templates:
               standard:
-                online_notification: "hi"
-            watchers:
-              - connector: rc
+                session_expire_days: 30
+            watcher_rules:
+              - name: w1
+                connector: rc
                 agent: default
                 inherits: standard
-                rooms: [a, b, c]
+                rooms:
+                  include: [a, b, c]
         """)
         config = GatewayConfig.from_file(path)
-        self.assertEqual(len(config.watchers), 3)
-        for wc in config.watchers:
-            self.assertEqual(wc.online_notification, "hi")
+        self.assertEqual(len(config.watcher_rules), 1)
+        self.assertEqual(config.watcher_rules[0].session_expire_days, 30)
 
 
 class TestRemovedDefaultsKeysRejected(unittest.TestCase):
@@ -1894,9 +1947,12 @@ class TestRemovedDefaultsKeysRejected(unittest.TestCase):
               default:
                 type: claude
                 working_directory: /tmp
-            watchers:
+            watcher_rules:
               - name: w1
-                room: general
+                connector: rc
+                agent: default
+                rooms:
+                  include: [general]
         """)
         with self.assertRaises(ValueError) as ctx:
             GatewayConfig.from_file(path)
@@ -1916,9 +1972,12 @@ class TestRemovedDefaultsKeysRejected(unittest.TestCase):
               default:
                 type: claude
                 working_directory: /tmp
-            watchers:
+            watcher_rules:
               - name: w1
-                room: general
+                connector: rc
+                agent: default
+                rooms:
+                  include: [general]
         """)
         with self.assertRaises(ValueError) as ctx:
             GatewayConfig.from_file(path)
@@ -1938,9 +1997,12 @@ class TestRemovedDefaultsKeysRejected(unittest.TestCase):
               default:
                 type: claude
                 working_directory: /tmp
-            watchers:
+            watcher_rules:
               - name: w1
-                room: general
+                connector: rc
+                agent: default
+                rooms:
+                  include: [general]
         """)
         with self.assertRaises(ValueError) as ctx:
             GatewayConfig.from_file(path)
@@ -1975,9 +2037,12 @@ class TestToolPresets(unittest.TestCase):
                 working_directory: /tmp
                 owner_allowed_tools:
                   - readonly
-            watchers:
+            watcher_rules:
               - name: w1
-                room: general
+                connector: rc
+                agent: default
+                rooms:
+                  include: [general]
         """)
         config = GatewayConfig.from_file(path)
         tools = [r.tool for r in config.agents["default"].owner_allowed_tools]
@@ -2001,9 +2066,12 @@ class TestToolPresets(unittest.TestCase):
                     params: "git .*"
                   - readonly
                   - tool: Write
-            watchers:
+            watcher_rules:
               - name: w1
-                room: general
+                connector: rc
+                agent: default
+                rooms:
+                  include: [general]
         """)
         config = GatewayConfig.from_file(path)
         tools = [r.tool for r in config.agents["default"].owner_allowed_tools]
@@ -2021,9 +2089,12 @@ class TestToolPresets(unittest.TestCase):
                 working_directory: /tmp
                 owner_allowed_tools:
                   - nonexistent
-            watchers:
+            watcher_rules:
               - name: w1
-                room: general
+                connector: rc
+                agent: default
+                rooms:
+                  include: [general]
         """)
         with self.assertRaises(ValueError) as ctx:
             GatewayConfig.from_file(path)
@@ -2044,9 +2115,12 @@ class TestToolPresets(unittest.TestCase):
               default:
                 type: claude
                 working_directory: /tmp
-            watchers:
+            watcher_rules:
               - name: w1
-                room: general
+                connector: rc
+                agent: default
+                rooms:
+                  include: [general]
         """)
         with self.assertRaises(ValueError) as ctx:
             GatewayConfig.from_file(path)
@@ -2066,9 +2140,12 @@ class TestToolPresets(unittest.TestCase):
               default:
                 type: claude
                 working_directory: /tmp
-            watchers:
+            watcher_rules:
               - name: w1
-                room: general
+                connector: rc
+                agent: default
+                rooms:
+                  include: [general]
         """)
         with self.assertRaises(ValueError) as ctx:
             GatewayConfig.from_file(path)
@@ -2086,9 +2163,12 @@ class TestToolPresets(unittest.TestCase):
                 working_directory: /tmp
                 guest_allowed_tools:
                   - tool: '[invalid'
-            watchers:
+            watcher_rules:
               - name: w1
-                room: general
+                connector: rc
+                agent: default
+                rooms:
+                  include: [general]
         """)
         with self.assertRaises(ValueError) as ctx:
             GatewayConfig.from_file(path)
@@ -2097,210 +2177,14 @@ class TestToolPresets(unittest.TestCase):
         self.assertIn("guest_allowed_tools", msg)
 
 
-# ── Tests: watcher rooms: expansion + auto-naming ─────────────────────────────
-
-
-class TestWatcherRoomsExpansion(unittest.TestCase):
-    def _write_config(self, watchers_block: str) -> str:
-        cfg = textwrap.dedent(f"""\
-            connectors:
-              - name: rc-home
-                type: rocketchat
-                server: {{url: http://localhost:3000, username: bot, password: pw}}
-            agents:
-              default:
-                type: claude
-                working_directory: /tmp
-            watchers:
-{textwrap.indent(textwrap.dedent(watchers_block), "              ")}
-        """)
-        with tempfile.NamedTemporaryFile("w", suffix=".yaml", delete=False) as f:
-            f.write(cfg)
-            return f.name
-
-    def test_rooms_list_expands_to_one_watcher_per_room(self):
-        path = self._write_config("""\
-            - connector: rc-home
-              rooms: [general, dev, '@alice']
-        """)
-        config = GatewayConfig.from_file(path)
-        names = {w.name: w.room for w in config.watchers}
-        self.assertEqual(
-            names,
-            {
-                "rc-home-general": "general",
-                "rc-home-dev": "dev",
-                "rc-home-dm-alice": "@alice",
-            },
-        )
-
-    def test_room_singular_is_alias_for_single_item_rooms(self):
-        path = self._write_config("""\
-            - connector: rc-home
-              room: general
-        """)
-        config = GatewayConfig.from_file(path)
-        self.assertEqual(len(config.watchers), 1)
-        self.assertEqual(config.watchers[0].name, "rc-home-general")
-        self.assertEqual(config.watchers[0].room, "general")
-
-    def test_room_and_rooms_both_set_raises(self):
-        path = self._write_config("""\
-            - connector: rc-home
-              room: general
-              rooms: [dev]
-        """)
-        with self.assertRaises(ValueError) as ctx:
-            GatewayConfig.from_file(path)
-        self.assertIn("set either 'room' or 'rooms', not both", str(ctx.exception))
-
-    def test_rooms_must_be_non_empty_list(self):
-        path = self._write_config("""\
-            - connector: rc-home
-              rooms: []
-        """)
-        with self.assertRaises(ValueError) as ctx:
-            GatewayConfig.from_file(path)
-        self.assertIn("'rooms' must be a non-empty list", str(ctx.exception))
-
-    def test_rooms_with_duplicate_room_raises(self):
-        path = self._write_config("""\
-            - connector: rc-home
-              rooms: [general, general]
-        """)
-        with self.assertRaises(ValueError) as ctx:
-            GatewayConfig.from_file(path)
-        self.assertIn("duplicate room(s)", str(ctx.exception))
-
-    def test_explicit_name_with_multiple_rooms_raises(self):
-        path = self._write_config("""\
-            - connector: rc-home
-              name: my-watcher
-              rooms: [general, dev]
-        """)
-        with self.assertRaises(ValueError) as ctx:
-            GatewayConfig.from_file(path)
-        self.assertIn("'name' can only be set when there is exactly one room", str(ctx.exception))
-
-    def test_explicit_session_id_with_multiple_rooms_raises(self):
-        path = self._write_config("""\
-            - connector: rc-home
-              session_id: sticky-1
-              rooms: [general, dev]
-        """)
-        with self.assertRaises(ValueError) as ctx:
-            GatewayConfig.from_file(path)
-        self.assertIn(
-            "'session_id' can only be set when there is exactly one room",
-            str(ctx.exception),
-        )
-
-    def test_explicit_name_preserved_on_single_room_entry(self):
-        path = self._write_config("""\
-            - connector: rc-home
-              name: general-room
-              room: ops
-        """)
-        config = GatewayConfig.from_file(path)
-        self.assertEqual(config.watchers[0].name, "general-room")
-
-    def test_auto_name_collision_across_entries_raises(self):
-        path = self._write_config("""\
-            - connector: rc-home
-              room: general
-            - connector: rc-home
-              room: general
-        """)
-        with self.assertRaises(ValueError) as ctx:
-            GatewayConfig.from_file(path)
-        msg = str(ctx.exception)
-        self.assertIn("Duplicate watcher name 'rc-home-general'", msg)
-        self.assertIn("set an explicit 'name:' to disambiguate", msg)
-
-    def test_room_sanitization_examples(self):
-        from gateway.config import _auto_watcher_name
-
-        for room, expected_fragment in (
-            ("general", "general"),
-            ("@alice", "dm-alice"),
-            ("team/town-square", "team-town-square"),
-        ):
-            with self.subTest(room=room):
-                self.assertEqual(
-                    _auto_watcher_name("mm", room), f"mm-{expected_fragment}"
-                )
-
-    def test_wildcard_room_is_rejected_as_not_implemented_yet(self):
-        """room: "*" (on-the-fly / rule-based room matching,
-        docs/design/dynamic-watcher-design.md) parses shape-wise but is
-        rejected today — the runtime has no way to act on it yet."""
-        path = self._write_config("""\
-            - connector: rc-home
-              room: "*"
-        """)
-        with self.assertRaises(ValueError) as ctx:
-            GatewayConfig.from_file(path)
-        msg = str(ctx.exception)
-        self.assertIn('room: "*"', msg)
-        self.assertIn("not implemented yet", msg)
-
-    def test_exclude_room_without_wildcard_room_raises(self):
-        path = self._write_config("""\
-            - connector: rc-home
-              room: general
-              exclude_room: [dev]
-        """)
-        with self.assertRaises(ValueError) as ctx:
-            GatewayConfig.from_file(path)
-        self.assertIn("'exclude_room' is only valid when 'room' is the wildcard", str(ctx.exception))
-
-    def test_exclude_room_alongside_rooms_list_raises(self):
-        path = self._write_config("""\
-            - connector: rc-home
-              rooms: [general, dev]
-              exclude_room: [ops]
-        """)
-        with self.assertRaises(ValueError) as ctx:
-            GatewayConfig.from_file(path)
-        self.assertIn("'exclude_room' is only valid when 'room' is the wildcard", str(ctx.exception))
-
-    def test_exclude_room_must_be_non_empty_list(self):
-        path = self._write_config("""\
-            - connector: rc-home
-              room: "*"
-              exclude_room: []
-        """)
-        with self.assertRaises(ValueError) as ctx:
-            GatewayConfig.from_file(path)
-        self.assertIn("'exclude_room' must be a non-empty list", str(ctx.exception))
-
-    def test_exclude_room_entries_must_be_strings(self):
-        path = self._write_config("""\
-            - connector: rc-home
-              room: "*"
-              exclude_room: [1, 2]
-        """)
-        with self.assertRaises(ValueError) as ctx:
-            GatewayConfig.from_file(path)
-        self.assertIn("'exclude_room' entries must be non-empty strings", str(ctx.exception))
-
-    def test_exclude_room_with_duplicates_raises(self):
-        path = self._write_config("""\
-            - connector: rc-home
-              room: "*"
-              exclude_room: [dev, dev]
-        """)
-        with self.assertRaises(ValueError) as ctx:
-            GatewayConfig.from_file(path)
-        self.assertIn("'exclude_room' contains duplicate room(s)", str(ctx.exception))
-
-
 # ── Tests: quiet notification defaults ────────────────────────────────────────
 
 
-class TestQuietNotificationDefaults(unittest.TestCase):
-    """Migration-0.2 behavior change: online/offline notifications default to
-    quiet (None) instead of posting '_Agent online_'/'_Agent offline_'."""
+class TestNotificationFieldsAreRemoved(unittest.TestCase):
+    """Owner decision (2026-08-02, executed with the runtime cutover): the
+    notification fields are gone — platform presence is the signal, and under
+    the idle/expire lifecycle a watcher starts and stops many times over its
+    life. A config still carrying them fails loudly, template or rule."""
 
     def _write_config(self, watcher_extra: str = "") -> str:
         cfg = textwrap.dedent(f"""\
@@ -2312,57 +2196,42 @@ class TestQuietNotificationDefaults(unittest.TestCase):
               default:
                 type: claude
                 working_directory: /tmp
-            watchers:
+            watcher_rules:
               - name: w1
-                room: general
+                connector: rc
+                agent: default
+                rooms:
+                  include: [general]
 {textwrap.indent(textwrap.dedent(watcher_extra), "                ")}
         """)
         with tempfile.NamedTemporaryFile("w", suffix=".yaml", delete=False) as f:
             f.write(cfg)
             return f.name
 
-    def test_notifications_default_to_none(self):
-        path = self._write_config()
-        config = GatewayConfig.from_file(path)
-        self.assertIsNone(config.watchers[0].online_notification)
-        self.assertIsNone(config.watchers[0].offline_notification)
+    def test_a_rule_carrying_the_field_is_refused(self):
+        path = self._write_config("online_notification: 'hi'")
+        with self.assertRaises(ValueError) as cm:
+            GatewayConfig.from_file(path)
+        self.assertIn("unknown key", str(cm.exception))
 
-    def test_watcher_template_can_restore_old_behavior_globally(self):
+    def test_a_template_carrying_the_field_is_refused_via_the_inheritor(self):
         path = self._write_config()
-        # Inject a watcher_templates: entry restoring the pre-0.2 notification
-        # text, and opt the one watcher into it via inherits:.
         with open(path) as f:
             body = f.read()
         body = body.replace(
             "connectors:",
             "watcher_templates:\n"
             "  standard:\n"
-            "    online_notification: '✅ _Agent online_'\n"
-            "    offline_notification: '❌ _Agent offline_'\n"
+            "    offline_notification: 'bye'\n"
             "connectors:",
             1,
         )
-        body = body.replace(
-            "- name: w1\n    room: general",
-            "- name: w1\n    inherits: standard\n    room: general",
-            1,
-        )
+        body = body.replace("- name: w1", "- name: w1\n    inherits: standard", 1)
         with open(path, "w") as f:
             f.write(body)
-        config = GatewayConfig.from_file(path)
-        self.assertEqual(config.watchers[0].online_notification, "✅ _Agent online_")
-        self.assertEqual(config.watchers[0].offline_notification, "❌ _Agent offline_")
-
-    def test_explicit_notification_overrides_default(self):
-        path = self._write_config(
-            "online_notification: 'hi there'\noffline_notification: 'bye'"
-        )
-        config = GatewayConfig.from_file(path)
-        self.assertEqual(config.watchers[0].online_notification, "hi there")
-        self.assertEqual(config.watchers[0].offline_notification, "bye")
-
-
-# ── Tests: description: field (informational only, ignored at runtime) ──────
+        with self.assertRaises(ValueError) as cm:
+            GatewayConfig.from_file(path)
+        self.assertIn("unknown key", str(cm.exception))
 
 
 class TestDescriptionField(unittest.TestCase):
@@ -2387,9 +2256,12 @@ class TestDescriptionField(unittest.TestCase):
               default:
                 type: claude
                 working_directory: /tmp
-            watchers:
+            watcher_rules:
               - name: w1
-                room: general
+                connector: rc
+                agent: default
+                rooms:
+                  include: [general]
         """)
         config = GatewayConfig.from_file(path)
         self.assertNotIn("description", config.connectors[0].raw)
@@ -2411,9 +2283,12 @@ class TestDescriptionField(unittest.TestCase):
               default:
                 type: claude
                 working_directory: /tmp
-            watchers:
+            watcher_rules:
               - name: w1
-                room: general
+                connector: rc1
+                agent: default
+                rooms:
+                  include: [general]
         """)
         config = GatewayConfig.from_file(path)
         # Neither connector's raw should carry a 'description' key — rc1 never
@@ -2443,258 +2318,109 @@ class TestDescriptionField(unittest.TestCase):
             watcher_templates:
               standard:
                 description: "Shared watcher settings"
-            watchers:
+            watcher_rules:
               - name: w1
-                room: general
+                connector: rc
+                agent: default
+                rooms:
+                  include: [general]
                 description: "General channel watcher"
         """)
         config = GatewayConfig.from_file(path)
         self.assertEqual(config.agents["default"].working_directory, "/tmp")
-        self.assertEqual(len(config.watchers), 1)
-        self.assertEqual(config.watchers[0].name, "w1")
+        self.assertEqual(len(config.watcher_rules), 1)
+        self.assertEqual(config.watcher_rules[0].name, "w1")
 
 
 if __name__ == "__main__":
     unittest.main()
 
 
-class TestWatcherEntryScalarValidation(unittest.TestCase):
-    """A malformed scalar on a watcher entry must be a load error, not a guess.
+# ── Tests: the static watcher shape is a hard load error (cutover, §5.4) ─────
 
-    Both cases here were silent: the value did not look like what it was, and the
-    loader picked a default instead of complaining. Silent beats loud for
-    severity, so both are now hard errors naming the field.
+
+class TestTheOldShapeIsReportedPerKey(unittest.TestCase):
+    """A half-migrated config is reported key by key, not by shape.
+
+    This class used to assert that an entry with `room:` (or `rooms:` as a list)
+    produced a dedicated "old format" error, because the loader decided which
+    parser an entry belonged to by looking for a `rooms:` MAPPING on the raw
+    entry. That test is gone with the mechanism: the shape sniffing is exactly
+    what stopped `rooms` being inheritable from a template, since a template is
+    merged only AFTER the shape has been decided.
+
+    What replaces it is narrower and general. The block name settles what an
+    entry is — everything under `watcher_rules:` is a rule — so a leftover
+    `room:` is just a key a rule does not have, and the old top-level
+    `watchers:` is just a key config.yaml does not have. Both are already loud,
+    by rules that were not written for this migration.
     """
 
-    def _write_config(self, watcher_body: str) -> str:
+    BASE = """\
+        connectors:
+          - name: rc
+            type: rocketchat
+            server: {url: http://localhost:3000, username: bot, password: pw}
+        agents:
+          default:
+            type: claude
+            working_directory: /tmp
+        watcher_rules:
+    """
+    def _write(self, watchers_block: str) -> str:
+        body = textwrap.dedent(self.BASE) + textwrap.indent(
+            textwrap.dedent(watchers_block), "  ")
         with tempfile.NamedTemporaryFile("w", suffix=".yaml", delete=False) as f:
-            f.write(textwrap.dedent(f"""\
-                connectors:
-                  - name: rc-first
-                    type: rocketchat
-                    server: {{url: http://localhost:3000, username: bot, password: pw}}
-                  - name: mm-second
-                    type: mattermost
-                    server: {{url: http://localhost:8065, token: t, team: lab}}
-                agents:
-                  default:
-                    type: claude
-                    working_directory: /tmp
-                watchers:
-                {textwrap.indent(textwrap.dedent(watcher_body), "                  ")}
-            """))
+            f.write(body)
             return f.name
-
-    def _load_one(self, watcher_body: str):
-        return GatewayConfig.from_file(self._write_config(watcher_body)).watchers[0]
-
-    def _rejects(self, watcher_body: str, needle: str) -> str:
+    def _msg(self, watchers_block: str) -> str:
         with self.assertRaises(ValueError) as ctx:
-            GatewayConfig.from_file(self._write_config(watcher_body))
-        self.assertIn(needle, str(ctx.exception))
+            GatewayConfig.from_file(self._write(watchers_block))
         return str(ctx.exception)
 
-    # ── connector ────────────────────────────────────────────────────────────
-    def test_omitted_connector_defaults_to_the_first(self):
-        self.assertEqual(self._load_one("- {room: general}").connector, "rc-first")
+    def test_a_leftover_room_key_is_an_unknown_key(self):
+        msg = self._msg("- name: w1\n  room: general\n")
+        self.assertIn("unknown key(s)", msg)
+        self.assertIn("'room'", msg)
+        self.assertIn("'rooms'", msg, "the valid-key list shows the replacement")
 
-    def test_explicit_null_connector_also_defaults(self):
-        """`connector:` is legal in a watcher_templates entry, so an explicit
-        null is how an entry declines an inherited one."""
-        self.assertEqual(self._load_one("- {room: general, connector: null}").connector, "rc-first")
+    def test_a_rooms_list_is_refused_by_the_rooms_parser(self):
+        msg = self._msg("- name: w1\n  rooms: [general, dev]\n")
+        self.assertIn("'rooms' must be a mapping", msg)
 
-    def test_a_falsy_non_string_connector_is_rejected_not_defaulted(self):
-        """The bug: these skipped the type check because it was guarded by
-        truthiness, then read as falsy and bound to connectors[0] — silently
-        attaching the watcher to the wrong account."""
-        for literal in ("false", "0", "[]", "{}"):
-            with self.subTest(literal=literal):
-                self._rejects(
-                    f"- {{room: general, connector: {literal}}}",
-                    "'connector' must be a string",
-                )
+    def test_a_non_mapping_entry_is_malformed(self):
+        msg = self._msg("- just-a-string\n")
+        self.assertIn("must be a mapping", msg)
 
-    def test_a_truthy_non_string_connector_is_still_rejected(self):
-        self._rejects("- {room: general, connector: [rc-first]}", "'connector' must be a string")
-
-    def test_a_valid_connector_is_honoured(self):
-        self.assertEqual(
-            self._load_one("- {room: general, connector: mm-second}").connector, "mm-second"
+    def test_the_old_top_level_key_names_its_replacement(self):
+        """The whole migration signal now, and it comes from the general
+        unknown-top-level-key check rather than a case written for it."""
+        path = self._write("- name: w1\n  rooms:\n    include: [general]\n").replace(
+            "watcher_rules:", "watchers:"
         )
+        # _write returns a path; rewrite the file itself with the old key.
+        import pathlib as _p
+        f = _p.Path(self._write("- name: w1\n  rooms:\n    include: [general]\n"))
+        f.write_text(f.read_text().replace("watcher_rules:", "watchers:"))
+        with self.assertRaises(ValueError) as ctx:
+            GatewayConfig.from_file(str(f))
+        msg = str(ctx.exception)
+        self.assertIn("'watchers'", msg)
+        self.assertIn("did you mean 'watcher_rules'?", msg)
+        del path
 
-    # ── history_handoff ──────────────────────────────────────────────────────
-    def test_omitted_history_handoff_uses_defaults(self):
-        self.assertTrue(self._load_one("- {room: general}").history_handoff.enabled)
-
-    def test_null_and_empty_mapping_use_defaults(self):
-        for literal in ("null", "{}"):
-            with self.subTest(literal=literal):
-                w = self._load_one(f"- {{room: general, history_handoff: {literal}}}")
-                self.assertTrue(w.history_handoff.enabled)
-
-    def test_a_non_mapping_history_handoff_is_rejected(self):
-        """`true`/a list raised AttributeError, which collect_config() does not
-        catch — so one bad entry aborted the whole validation pass."""
-        for literal in ("true", "[1]", "'yes'"):
-            with self.subTest(literal=literal):
-                msg = self._rejects(
-                    f"- {{room: general, history_handoff: {literal}}}",
-                    "'history_handoff' must be a mapping",
-                )
-                self.assertIn("enabled: false", msg)
-
-    def test_history_handoff_false_is_rejected_rather_than_silently_enabling(self):
-        """The nastiest of the pair: `false` was replaced by `{}`, which means the
-        defaults — and `enabled` defaults to True. Writing `false` to switch the
-        feature off switched it on."""
-        self._rejects(
-            "- {room: general, history_handoff: false}", "'history_handoff' must be a mapping"
+    def test_collect_config_reports_every_leftover_entry_in_one_pass(self):
+        """A half-migrated config lists all its remaining old entries at once,
+        and the rule entries beside them still parse."""
+        path = self._write(
+            "- name: a\n  agent: default\n  connector: rc\n  room: general\n"
+            "- name: ok\n  agent: default\n  connector: rc\n  rooms:\n    include: [dev]\n"
+            "- name: b\n  agent: default\n  connector: rc\n  room: ops\n"
         )
-
-    def test_enabled_false_is_the_supported_way_to_disable(self):
-        w = self._load_one("- {room: general, history_handoff: {enabled: false}}")
-        self.assertFalse(w.history_handoff.enabled)
-
-    def test_a_misspelled_inner_key_is_rejected_rather_than_ignored(self):
-        """`enable: false` — one letter short — was accepted and ignored, leaving
-        handoff ENABLED. Since `enabled` defaults to True, every typo in this block
-        fails in the direction the operator did not want: the same inversion
-        `history_handoff: false` produced before it became an error."""
-        msg = self._rejects(
-            "- {room: general, history_handoff: {enable: false}}",
-            "unknown key(s) in 'history_handoff'",
-        )
-        self.assertIn("enable", msg)
-        self.assertIn("enabled", msg)
-
-    def test_inner_values_are_type_checked(self):
-        """`enabled: "false"` is a truthy string, and a negative or non-integer
-        count reaches the handoff fetch unchallenged. bool subclasses int, so each
-        direction needs its own check."""
-        for literal, needle in (
-            ('{enabled: "false"}', "'history_handoff.enabled' must be true or false"),
-            ("{enabled: 1}", "'history_handoff.enabled' must be true or false"),
-            ('{fetch_count: "10"}', "'history_handoff.fetch_count' must be an integer"),
-            ("{fetch_count: true}", "'history_handoff.fetch_count' must be an integer"),
-            ("{fetch_count: -1}", "'history_handoff.fetch_count' must not be negative"),
-            ("{verbatim_tail: 1.5}", "'history_handoff.verbatim_tail' must be an integer"),
-        ):
-            with self.subTest(literal=literal):
-                self._rejects(f"- {{room: general, history_handoff: {literal}}}", needle)
-
-    def test_valid_inner_values_are_honoured(self):
-        w = self._load_one(
-            "- {room: general, history_handoff: {enabled: false, fetch_count: 5, verbatim_tail: 0}}"
-        )
-        self.assertFalse(w.history_handoff.enabled)
-        self.assertEqual(w.history_handoff.fetch_count, 5)
-        self.assertEqual(w.history_handoff.verbatim_tail, 0)
-
-    def test_a_non_string_inner_key_does_not_crash_the_error_path(self):
-        """A YAML mapping key need not be a string. `1: value` made the unknown-key
-        formatter compare int with str, raising TypeError out of the *error path* —
-        which escapes collect_config()'s `except ValueError` and aborts the whole
-        validation pass instead of reporting one bad entry."""
-        self._rejects(
-            "- {room: general, history_handoff: {1: value}}",
-            "unknown key(s) in 'history_handoff'",
-        )
-
-    # ── online_notification / offline_notification ───────────────────────────
-    def test_notifications_default_to_null(self):
-        w = self._load_one("- {room: general}")
-        self.assertIsNone(w.online_notification)
-        self.assertIsNone(w.offline_notification)
-
-    def test_a_non_string_notification_is_rejected(self):
-        """Copied through unchecked, a YAML boolean or number reaches the platform
-        REST client's message field, where the send fails and is only logged as a
-        warning — so the operator's status message silently never appears."""
-        for field in ("online_notification", "offline_notification"):
-            for literal in ("true", "3", "[hi]", "{a: b}"):
-                with self.subTest(field=field, literal=literal):
-                    self._rejects(
-                        f"- {{room: general, {field}: {literal}}}",
-                        f"'{field}' must be a string or null",
-                    )
-
-    def test_a_string_or_null_notification_is_honoured(self):
-        w = self._load_one("- {room: general, online_notification: 'up', offline_notification: null}")
-        self.assertEqual(w.online_notification, "up")
-        self.assertIsNone(w.offline_notification)
-
-
-class TestEveryStaticWatcherFieldIsTypeChecked(unittest.TestCase):
-    """The systematic guard, the static twin of the rule parser's.
-
-    Five separate review rounds each found another field this loader read and used
-    without checking it was the type the reader assumed — `connector` binding to
-    connectors[0], `history_handoff: false` inverting itself, `context_inject_files`
-    iterated per character, the unknown-key error path raising TypeError, and
-    `history_handoff: {enable: false}` ignored. Fixing them one at a time left no
-    reason to believe the next one was covered.
-
-    The field surface comes from the JSON schema's `$defs/watcher`, which sets
-    `additionalProperties: false` and so is the declared list — a field added there
-    without validation here fails locally instead of in a sixth review round.
-    """
-
-    # A wrong-typed value per field the parser reads.
-    WRONG_VALUE = {
-        "name": [],
-        "connector": False,
-        "agent": 3,
-        "room": 7,
-        "rooms": "general",
-        "exclude_room": "general",
-        "session_id": [],
-        "context_inject_files": "notes.md",
-        "online_notification": True,
-        "offline_notification": 3,
-        "history_handoff": True,
-    }
-    # `description` is annotation only and never read; `inherits` is resolved
-    # before this parser reads any field, and has its own tests.
-    NOT_READ_HERE = {"description", "inherits"}
-
-    def test_the_table_covers_every_declared_key(self):
-        schema = json.loads(
-            (Path(__file__).resolve().parents[2]
-             / "gateway" / "schema" / "config.schema.json").read_text()
-        )
-        watcher = schema["$defs"]["watcher"]
-        self.assertFalse(
-            watcher.get("additionalProperties", True),
-            "the schema no longer closes the watcher field set, so it is no longer "
-            "the declared list this test enumerates",
-        )
-        self.assertEqual(
-            set(self.WRONG_VALUE) | self.NOT_READ_HERE,
-            set(watcher["properties"]),
-            "a watcher field was added without a wrong-type case here",
-        )
-
-    def test_each_field_rejects_a_wrong_type(self):
-        for field, bad in self.WRONG_VALUE.items():
-            with self.subTest(field=field):
-                # `room` is required, so every entry carries one; the `room` case
-                # overwrites it rather than adding a second room key.
-                entry = {"room": "general", field: bad}
-                with tempfile.NamedTemporaryFile("w", suffix=".yaml", delete=False) as f:
-                    f.write(textwrap.dedent("""\
-                        connectors:
-                          - name: rc
-                            type: rocketchat
-                            server: {url: http://localhost:3000, username: bot, password: pw}
-                        agents:
-                          default:
-                            type: claude
-                            working_directory: /tmp
-                        watchers:
-                        """) + textwrap.indent(yaml.safe_dump([entry]), "  "))
-                    path = f.name
-                with self.assertRaises(ValueError, msg=f"{field} accepted {bad!r}"):
-                    GatewayConfig.from_file(path)
+        config, issues = collect_config(path)
+        leftover = [i for i in issues if "unknown key(s)" in i.message]
+        self.assertEqual(len(leftover), 2, [i.message for i in issues])
+        self.assertEqual([r.name for r in config.watcher_rules], ["ok"])
 
 
 class TestContextInjectFileListValidation(unittest.TestCase):
@@ -2717,8 +2443,12 @@ class TestContextInjectFileListValidation(unittest.TestCase):
             type: claude
             working_directory: /tmp
         {agent}
-        watchers:
-          - room: general
+        watcher_rules:
+          - name: w1
+            connector: rc
+            agent: default
+            rooms:
+              include: [general]
         {watcher}
         """
 
@@ -2743,7 +2473,7 @@ class TestContextInjectFileListValidation(unittest.TestCase):
                       agent="    context_inject_files: a.md")
 
     def test_a_bare_string_is_rejected_on_a_watcher(self):
-        self._rejects("Watcher entry at index 0: 'context_inject_files'",
+        self._rejects("Watcher rule at index 0 ('w1'): 'context_inject_files'",
                       watcher="    context_inject_files: w.md")
 
     def test_a_non_string_element_is_a_value_error_not_a_type_error(self):
@@ -2759,8 +2489,8 @@ class TestContextInjectFileListValidation(unittest.TestCase):
         ))
         self.assertEqual(len(cfg.connectors[0].context_inject_files), 1)
         self.assertEqual(len(cfg.agents["default"].context_inject_files), 1)
-        self.assertEqual(len(cfg.watchers[0].context_inject_files), 1)
+        self.assertEqual(len(cfg.watcher_rules[0].context_inject_files), 1)
 
     def test_omitting_them_entirely_still_loads(self):
         cfg = GatewayConfig.from_file(self._write())
-        self.assertEqual(cfg.watchers[0].context_inject_files, [])
+        self.assertEqual(cfg.watcher_rules[0].context_inject_files, [])

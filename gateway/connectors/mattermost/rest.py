@@ -10,6 +10,8 @@ from typing import Any
 
 import httpx
 
+from ...core.connector import HistoryPage
+
 logger = logging.getLogger("agent-chat-gateway.connectors.mattermost.rest")
 
 
@@ -20,6 +22,28 @@ class RoomNotFoundError(Exception):
     so callers can distinguish a missing room from a broader infrastructure
     problem.
     """
+
+
+# Mattermost's four channel types, and what each means to the rest of the gateway.
+# `O` open/public, `P` private, `D` 1:1 DM, `G` group DM (§6.4 — Mattermost distinguishes
+# group DMs on the wire, which Rocket.Chat does not).
+#
+# Stated once because the previous mapping was inline and partial: it recognised `P` and
+# called everything else a channel, so an id-based lookup would have typed a DM as a
+# channel. Every `type == "dm"` gate would then have inverted — the mention requirement
+# would start applying to DMs, which §2.7 records as making the agent answer every message
+# from anyone in the room.
+_ROOM_TYPES = {"O": "channel", "P": "group", "D": "dm", "G": "group_dm"}
+
+
+def room_type_for(channel_type: str | None) -> str:
+    """Map a Mattermost channel type to the gateway's room type.
+
+    An unknown or missing value falls back to `channel`, which is the conservative answer:
+    a channel requires a mention where a DM does not, so guessing `channel` cannot turn a
+    quiet room into a talkative one.
+    """
+    return _ROOM_TYPES.get(channel_type or "", "channel")
 
 
 class MattermostREST:
@@ -347,13 +371,13 @@ class MattermostREST:
         logger.info("Uploaded file %s to channel %s -> file_ids=%s", path.name, channel_id, file_ids)
         return file_ids
 
-    async def get_room_history(
+    async def get_room_history_page(
         self,
         channel_id: str,
         count: int = 50,
         before_ts: str | None = None,
         after_ts: str | None = None,
-    ) -> list[dict[str, Any]]:
+    ) -> HistoryPage:
         """Fetch the last ``count`` messages from a channel via the REST API.
 
         Returns messages in **chronological order** (oldest first). System
@@ -392,6 +416,7 @@ class MattermostREST:
         posts_by_id = result.get("posts", {})
         # `order` is newest-first; reverse for chronological order.
         posts = [posts_by_id[pid] for pid in reversed(order) if pid in posts_by_id]
+        raw_count = len(posts)
         posts = [p for p in posts if not p.get("type") and p.get("message")]
         if before_ts:
             before_ms = int(before_ts)
@@ -399,7 +424,84 @@ class MattermostREST:
         if after_ts:
             after_ms = int(after_ts)
             posts = [p for p in posts if p.get("create_at", 0) >= after_ms]
-        return posts
+        return HistoryPage(messages=posts, raw_count=raw_count, limit=count)
+
+    async def get_room_history(
+        self,
+        channel_id: str,
+        count: int = 50,
+        before_ts: str | None = None,
+        after_ts: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """The filtered chronological list, for callers that do not need the page shape.
+
+        The history handoff wants posts; only replay has to tell "an empty window" from
+        "a page the server filled with system posts before ACG could filter them".
+        """
+        page = await self.get_room_history_page(
+            channel_id, count=count, before_ts=before_ts, after_ts=after_ts)
+        return page.messages
+
+    async def get_member_channel_ids(self) -> set[str]:
+        """Every channel id this account is a member of, across all teams.
+
+        `GET /users/{user_id}/channels` streams the caller's full membership
+        (verified in `getChannelsForUser`: it pages internally and writes the
+        complete array). This is the one membership probe that is unambiguous
+        with the bot's own token — the per-channel member lookup answers 403
+        for a non-member, indistinguishable from a permissions problem (§6.2).
+        Raises on failure; the caller owns the tri-state (a set that could not
+        be read is unknown, never empty).
+        """
+        result = await self._request(
+            "GET", f"users/{self.bot_user_id or 'me'}/channels")
+        return {
+            chan["id"]
+            for chan in (result or [])
+            if isinstance(chan, dict) and chan.get("id")
+        }
+
+    async def get_channel(self, channel_id: str) -> dict[str, Any]:
+        """Channel info by id — the fallback for a room the event could not describe.
+
+        A fallback rather than a hot-path call on purpose: name, type and team are all on
+        the wire for a channel post (§6.2), and Mattermost holds a connector-wide permit
+        for the whole handler, so a REST round trip there stalls delivery for every
+        channel. This exists for the paths that genuinely start from an id — a persisted
+        record being recreated, an operator naming a room by id.
+        """
+        result = await self._request("GET", f"channels/{channel_id}")
+        return {
+            "id": result["id"],
+            "name": result.get("name", ""),
+            "display_name": result.get("display_name", ""),
+            "type": room_type_for(result.get("type")),
+            # Kept, not discarded: a channel id is globally unique, so resolving a
+            # persisted record by id can reach a channel in a team this connector no
+            # longer serves — the bot may belong to both. Without this the caller cannot
+            # tell.
+            "team_id": result.get("team_id", ""),
+        }
+
+    async def channel_member_usernames(self, channel_id: str, exclude: str = "") -> list[str]:
+        """Usernames of a channel's members, for describing a room that has no name.
+
+        A direct channel's REST object carries an **empty** `display_name`: the counterpart
+        handle Mattermost puts on a WebSocket event is viewer-specific and is not part of
+        the channel itself. So a DM resolved by id has nothing to describe it, and this
+        supplies it from the membership instead.
+
+        Only ever called on the recreation path, never per message — it is one request plus
+        a cached username lookup per member.
+        """
+        members = await self._request("GET", f"channels/{channel_id}/members")
+        names = []
+        for member in members if isinstance(members, list) else []:
+            user_id = member.get("user_id", "")
+            if not user_id or user_id == exclude:
+                continue
+            names.append(await self.resolve_username(user_id))
+        return names
 
     async def resolve_room(self, room_name: str) -> dict[str, Any]:
         """Resolve a channel name to its info dict, within the configured team.
@@ -441,7 +543,7 @@ class MattermostREST:
         return {
             "id": result["id"],
             "name": result.get("name", room_name),
-            "type": "group" if result.get("type") == "P" else "channel",
+            "type": room_type_for(result.get("type")),
         }
 
 

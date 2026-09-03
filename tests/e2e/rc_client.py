@@ -47,10 +47,43 @@ class RCClient:
         self.auth_token = data["data"]["authToken"]
         self.user_id = data["data"]["userId"]
         self.username = username
+        # Kept for set_setting()'s 2FA password fallback — see there.
+        self._password = password
         self._client.headers.update(
             {"X-Auth-Token": self.auth_token, "X-User-Id": self.user_id}
         )
         return self
+
+    def set_setting(self, setting_id: str, value: object) -> None:
+        """Change an admin setting, satisfying Rocket.Chat's 2FA gate.
+
+        From RC 8.x, writing a protected setting requires two-factor
+        confirmation even when 2FA is off — verified against 8.5, which
+        answers a bare POST with
+        ``{"error": "TOTP Required [totp-required]", "details":
+        {"method": "password", "availableMethods": []}}``. Since no TOTP or
+        email method is available on a fresh workspace, the only usable
+        route is the password fallback, and the code must be the **SHA-256
+        digest** of the password, not the password itself (plaintext returns
+        ``totp-invalid``, which is how this was pinned down).
+
+        This is what broke `make e2e-up` on the 6.12 → 8.5.1 move: the
+        settings write is the first thing setup.py does after logging in.
+        """
+        import hashlib
+
+        response = self._client.post(
+            f"/api/v1/settings/{setting_id}",
+            json={"value": value},
+            headers={
+                "x-2fa-code": hashlib.sha256(self._password.encode()).hexdigest(),
+                "x-2fa-method": "password",
+            },
+        )
+        response.raise_for_status()
+        body = response.json()
+        if not body.get("success"):
+            raise RuntimeError(f"settings/{setting_id} failed: {body}")
 
     # ── Users ────────────────────────────────────────────────────────────────
 
@@ -166,26 +199,49 @@ class RCClient:
         description: str = "",
         tmid: str | None = None,
     ) -> dict[str, Any]:
-        """Upload a file to a room. Returns the file message dict."""
+        """Upload a file to a room. Returns the file message dict.
+
+        Two steps, because the one-step upload endpoint was **removed in
+        Rocket.Chat 8.0.0** and the compose stack now pins 8.5.1:
+        ``rooms.media/{rid}`` uploads the bytes, then
+        ``rooms.mediaConfirm/{rid}/{fileId}`` sends it into the room. Both are
+        required — a file left unconfirmed never appears in the room.
+
+        Deliberately NOT version-dispatching the way the product connector
+        does (``gateway/connectors/rocketchat/rest.py`` picks a flow from the
+        server's detected major version): that code serves whatever server an
+        operator points it at, while this client only ever talks to the server
+        this repo's compose pins, so the pin is the contract. If that pin ever
+        drops below 8.0, the legacy flow has to come back here — which
+        tests/unit/test_e2e_platform_pins.py is what notices.
+        """
         file_path = Path(file_path)
         content = file_path.read_bytes()
         files = {
             "file": (file_path.name, io.BytesIO(content), "application/octet-stream")
         }
-        form_data: dict[str, str] = {}
+        media = self._client.post(f"/api/v1/rooms.media/{room_id}", files=files)
+        media.raise_for_status()
+        media_result = media.json()
+        if not media_result.get("success"):
+            raise RuntimeError(f"rooms.media failed: {media_result}")
+        file_id = (media_result.get("file") or {}).get("_id")
+        if not file_id:
+            raise RuntimeError(f"rooms.media response missing file._id: {media_result}")
+
+        confirm_body: dict[str, str] = {}
         if description:
-            form_data["description"] = description
+            confirm_body["description"] = description
         if tmid:
-            form_data["tmid"] = tmid
-        resp = self._client.post(
-            f"/api/v1/rooms.upload/{room_id}",
-            files=files,
-            data=form_data,
+            confirm_body["tmid"] = tmid
+        confirm = self._client.post(
+            f"/api/v1/rooms.mediaConfirm/{room_id}/{file_id}",
+            json=confirm_body,
         )
-        resp.raise_for_status()
-        result = resp.json()
+        confirm.raise_for_status()
+        result = confirm.json()
         if not result.get("success"):
-            raise RuntimeError(f"rooms.upload failed: {result}")
+            raise RuntimeError(f"rooms.mediaConfirm failed: {result}")
         return result.get("message", result)
 
     # ── Message retrieval ─────────────────────────────────────────────────────

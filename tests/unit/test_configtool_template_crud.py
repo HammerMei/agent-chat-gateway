@@ -68,7 +68,8 @@ def _config_text(work_dir: Path) -> str:
             timeout: 100
         watcher_templates:
           wstd:
-            online_notification: "hi"
+            history_handoff:
+              fetch_count: 25
         agents:
           agent-a:
             inherits: standard
@@ -84,7 +85,7 @@ def _config_text(work_dir: Path) -> str:
           - name: rc
             type: rocketchat
             server: {{url: "http://localhost:3000", username: bot, password: pw}}
-        watchers:
+        watcher_rules:
           - name: w1
             connector: rc
             agent: agent-a
@@ -94,7 +95,8 @@ def _config_text(work_dir: Path) -> str:
             connector: rc
             agent: agent-b
             room: dev
-            online_notification: "custom"
+            history_handoff:
+              fetch_count: 40
             inherits: wstd
     """
 
@@ -234,7 +236,7 @@ class TestTemplateSaveDiffing:
               - name: rc
                 type: rocketchat
                 server: {{url: "http://localhost:3000", username: bot, password: pw}}
-            watchers:
+            watcher_rules:
               - connector: rc
                 agent: agent-a
                 room: general
@@ -380,7 +382,7 @@ class TestTemplateSaveDiffing:
 
 
 class TestTemplateEditWatcherTemplates:
-    async def test_editing_online_notification_requires_confirm_naming_the_watcher(
+    async def test_editing_a_watcher_template_field_requires_confirm_naming_the_watcher(
         self, tmp_path, work_dir
     ):
         config_path = _write_config(tmp_path, _config_text(work_dir))
@@ -388,9 +390,11 @@ class TestTemplateEditWatcherTemplates:
         async with app.run_test() as pilot:
             await pilot.pause()
             await _open_template_edit(pilot, app, row=3)  # watcher:wstd
-            assert app.screen.query_one("#field-online_notification", Input).value == "hi"
+            assert app.screen.query_one(
+                "#field-history_handoff-fetch_count", Input).value == "25"
 
-            app.screen.query_one("#field-online_notification", Input).value = "bye"
+            app.screen.query_one(
+                "#field-history_handoff-fetch_count", Input).value = "30"
             await pilot.pause()
             await pilot.press("ctrl+s")
             await pilot.pause()
@@ -403,7 +407,7 @@ class TestTemplateEditWatcherTemplates:
             await pilot.press("tab", "enter")
             await pilot.pause()
             raw = yaml.safe_load(Path(config_path).read_text())
-            assert raw["watcher_templates"]["wstd"]["online_notification"] == "bye"
+            assert raw["watcher_templates"]["wstd"]["history_handoff"]["fetch_count"] == 30
 
 
 class TestTemplateEditDiscard:
@@ -664,7 +668,7 @@ def _config_with_agent_template_tools(work_dir: Path) -> str:
           - name: rc
             type: rocketchat
             server: {{url: "http://localhost:3000", username: bot, password: pw}}
-        watchers:
+        watcher_rules:
           - connector: rc
             agent: agent-a
             room: general
@@ -869,3 +873,92 @@ class TestTemplateToolListEditor:
 
             assert not app.screen.query("#owner-tools-list")
             assert not app.screen.query("#add-tool-owner_allowed_tools")
+
+
+class TestTemplateFormSharesTheEntryFormRenderer:
+    """Codex review of #129, round 7. `TemplateDetailScreen` used to override
+    `_compute_initial_values()` and `_compose_field_row()` wholesale to change
+    one input each, so every improvement to field handling had to be applied
+    twice — and one copy was forgotten (the raw delimiter-bearing display
+    reached the entry forms, not this one). Both overrides are now two hooks
+    (`_snapshot_source`, `_field_annotation`) over a single implementation.
+    These pin both halves: the shared behaviour arrives here, and this
+    screen's own difference still holds."""
+
+    async def test_a_delimiter_bearing_value_is_displayed_raw_here_too(
+        self, tmp_path, work_dir
+    ):
+        config_path = _write_config(tmp_path, f"""\
+            watcher_templates:
+              shared:
+                context_inject_files: ["my,notes.md"]
+            connectors:
+              - name: rc
+                type: rocketchat
+                server: {{url: "http://localhost:3000", username: bot, password: pw}}
+            agents:
+              default:
+                type: claude
+                working_directory: {work_dir}
+            watcher_rules: []
+        """)
+        app = ConfigToolApp(config_path)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            app.screen.query_one("TabbedContent").active = "tab-templates"
+            await pilot.pause()
+            table = app.screen.query_one("#templates-table", DataTable)
+            table.focus()
+            table.move_cursor(row=0)
+            await pilot.press("e")
+            await pilot.pause()
+            assert isinstance(app.screen, TemplateDetailScreen)
+            box = app.screen.query_one("#field-context_inject_files", Input)
+            # One path, shown as one item — not the split `my, notes.md`.
+            assert box.value == "my,notes.md"
+
+    async def test_the_blast_radius_annotation_still_renders_after_the_unfork(
+        self, tmp_path, work_dir
+    ):
+        """This screen annotates rows with blast radius, not provenance —
+        the hook must keep that, including through the live-refresh path
+        that previously only knew how to write provenance text."""
+        config_path = _write_config(tmp_path, f"""\
+            agent_templates:
+              shared:
+                timeout: 1800
+            agents:
+              a1:
+                inherits: shared
+                working_directory: {work_dir}
+              a2:
+                inherits: shared
+                working_directory: {work_dir}
+                timeout: 60
+            connectors:
+              - name: rc
+                type: rocketchat
+                server: {{url: "http://localhost:3000", username: bot, password: pw}}
+            watcher_rules: []
+        """)
+        app = ConfigToolApp(config_path)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            app.screen.query_one("TabbedContent").active = "tab-templates"
+            await pilot.pause()
+            table = app.screen.query_one("#templates-table", DataTable)
+            table.focus()
+            table.move_cursor(row=0)
+            await pilot.press("e")
+            await pilot.pause()
+            assert isinstance(app.screen, TemplateDetailScreen)
+
+            annotation = app.screen.query_one("#prov-field-timeout", Static)
+            assert "1 inherit, 1 override" in str(annotation.render())
+
+            # And it survives an edit (the refresh path).
+            app.screen.query_one("#field-timeout", Input).value = "900"
+            await pilot.pause()
+            assert "1 inherit, 1 override" in str(
+                app.screen.query_one("#prov-field-timeout", Static).render()
+            )

@@ -51,7 +51,6 @@ class _RecordingAgent(AgentBackend):
 def _make_processor(agent: AgentBackend) -> MessageProcessor:
     config = CoreConfig(
         agents={"default": AgentConfig(timeout=10)},
-        default_agent="default",
     )
     connector = MagicMock()
     connector.send_text = AsyncMock()
@@ -60,8 +59,6 @@ def _make_processor(agent: AgentBackend) -> MessageProcessor:
         side_effect=lambda msg: f"[from: {msg.sender.username}]"
     )
     connector.notify_typing = AsyncMock()
-    connector.notify_online = AsyncMock()
-    connector.notify_offline = AsyncMock()
     return MessageProcessor(
         session_id="ses_001",
         room=Room(id="room_1", name="test-room"),

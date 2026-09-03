@@ -143,7 +143,7 @@ class TestGenerateConfigYaml:
 
         assert "connectors" in config
         assert "agents" in config
-        assert "watchers" in config
+        assert "watcher_rules" in config
 
         connector = config["connectors"][0]
         assert connector["type"] == "rocketchat"
@@ -156,12 +156,12 @@ class TestGenerateConfigYaml:
         assert agent["command"] == "claude"
         assert agent["permissions"]["enabled"] is True
 
-        # A single watcher entry using rooms: — the gateway expands it into
-        # one watcher per room (with an auto-derived name) at load time.
-        watcher = config["watchers"][0]
+        # A single watcher RULE: an @username room becomes the 1:1-DM opt-in,
+        # since DMs have no name for a pattern to match (§2.6).
+        watcher = config["watcher_rules"][0]
         assert watcher["connector"] == "rc-home"
         assert watcher["agent"] == "my-agent"
-        assert watcher["rooms"] == ["@alice"]
+        assert watcher["rooms"] == {"direct": True}
 
     def test_generate_config_yaml_writes_credentials_directly_not_env_placeholders(self):
         """docs/design/config-tool.md decision 6 revisited: credentials go
@@ -217,8 +217,9 @@ class TestGenerateConfigYaml:
         result = generate_config_yaml("claude", "rocketchat", connector_data, watchers)
         config = self._parse(result)
 
-        assert len(config["watchers"]) == 1
-        assert config["watchers"][0]["rooms"] == ["@alice", "general", "dev"]
+        assert len(config["watcher_rules"]) == 1
+        assert config["watcher_rules"][0]["rooms"] == {
+            "include": ["general", "dev"], "direct": True}
 
     def test_generate_config_yaml_multiple_owners(self):
         """Multiple owners are listed in allowed_users.owners."""
@@ -262,8 +263,10 @@ class TestGenerateConfigYaml:
         watchers = [{"name": "dm-alice", "room": "@alice"}]
         result = generate_config_yaml("claude", "rocketchat", connector_data, watchers)
         config = self._parse(result)
-        w = config["watchers"][0]
-        assert "name" not in w
+        w = config["watcher_rules"][0]
+        # A rule REQUIRES a name (rules are not auto-named), so it is the one
+        # identity field the generator must write.
+        assert w["name"] == "my-rooms"
         assert "session_id" not in w
         assert "online_notification" not in w
         assert "offline_notification" not in w
@@ -617,7 +620,7 @@ class TestRunOnboard:
         config = yaml.safe_load(config_file.read_text())
         assert "connectors" in config
         assert "agents" in config
-        assert "watchers" in config
+        assert "watcher_rules" in config
 
         # config.yaml is chmod'd 0600 immediately — it holds the plaintext
         # credentials directly now.

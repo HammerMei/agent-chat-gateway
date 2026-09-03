@@ -47,6 +47,7 @@ from typing import TYPE_CHECKING
 import httpx
 
 from ...core.adapter_utils import build_attachment_prompt
+from ...core.paths import resolve_under
 from .. import AgentBackend, GatewayBrokerConfig
 from ..errors import (
     AgentExecutionError,
@@ -67,7 +68,9 @@ logger = logging.getLogger("agent-chat-gateway.agents.opencode")
 
 # ACG's own runtime state directory — same convention as
 # gateway/agents/claude/adapter.py's RUNTIME_DIR. Durable per-watcher
-# instructions files live under RUNTIME_DIR/system-prompts/<watcher_name>.md
+# instructions files live under RUNTIME_DIR/system-prompts/<path_key>.md, where
+# path_key is opaque to this adapter — the caller derives it per watcher-in-a-room
+# (gateway/core/paths.py's watcher_prompt_key), never from the display name (§2.3)
 # for both backends; watcher names are globally unique and forbidden from
 # containing "/" (see gateway/config.py), so paths never collide, and each
 # watcher only ever uses one backend type, so there's no cross-backend clash
@@ -792,6 +795,20 @@ class OpenCodeBackend(AgentBackend):
         logger.info("Created opencode session: %s", session_id[:16])
         return session_id
 
+    async def reclaim_durable_instructions(self, path_key: str) -> None:
+        """Remove the per-watcher file `ensure_durable_instructions` wrote.
+
+        Expiry's half of that contract (§2.5), mirroring `ClaudeBackend`: same
+        directory, same `resolve_under` containment check — the key is built
+        from connector data and is validated on the way out as on the way in.
+        Idempotent: a missing file is success. Without this override the base
+        no-op ran, and every expired OpenCode watcher left its prompt file —
+        identity and context included — under `system-prompts` for good
+        (Codex, PR #140 round 2).
+        """
+        path = resolve_under(RUNTIME_DIR / "system-prompts", f"{path_key}.md")
+        await asyncio.to_thread(path.unlink, missing_ok=True)
+
     async def ensure_durable_instructions(
         self,
         session_id: str,
@@ -799,13 +816,13 @@ class OpenCodeBackend(AgentBackend):
         timeout: int,
         content: str,
         *,
-        watcher_name: str,
+        path_key: str,
         already_delivered: bool,
     ) -> str | None:
         """Write ``content`` to a stable per-watcher file for per-request resupply.
 
         Mirrors ``ClaudeBackend.ensure_durable_instructions()``'s contract
-        exactly: writes durable content to ``RUNTIME_DIR/system-prompts/<watcher_name>.md``
+        exactly: writes durable content to ``RUNTIME_DIR/system-prompts/<path_key>.md``
         and returns that path as ``to_repeat``. ``message_processor.py`` already
         resupplies whatever this returns via ``append_system_prompt_file`` on
         every subsequent ``send()``/``stream()`` call for this watcher — see
@@ -839,7 +856,15 @@ class OpenCodeBackend(AgentBackend):
         """
         acg_dir = RUNTIME_DIR / "system-prompts"
         await asyncio.to_thread(acg_dir.mkdir, parents=True, exist_ok=True)
-        path = acg_dir / f"{watcher_name}.md"
+        # Named by the caller-supplied ``path_key``, which is opaque here: it is scoped
+        # to the watcher in a room (watcher_prompt_key), NOT to the room alone, because
+        # Scoped to the watcher in a room, not to the room alone. Two watchers on one
+        # connector+room are refused now (§4.1), so the collision it was written for
+        # cannot occur; the key stays because it names files on disk and re-keying
+        # would orphan every existing one.
+        # is for the attachment workspace. resolve_under supplies the containment check
+        # that comes with treating the key as external data (§2.3).
+        path = resolve_under(acg_dir, f"{path_key}.md")
         await asyncio.to_thread(_atomic_write_text, path, content)
         return str(path)
 

@@ -146,6 +146,30 @@ class TestMentionGate(unittest.TestCase):
         )
         self.assertTrue(result.accepted)
 
+    def test_group_dm_requires_mention(self):
+        """A group DM goes down the mention-required side (§2.7, §6.4).
+
+        `require_mention` skips 1:1 DMs only. A group DM classified as a plain
+        DM would make the agent answer every message from anyone in the group —
+        which is why `room_type_for` maps "G" to "group_dm", not "dm", and why
+        this gate must never test `kind is direct` instead of `== "dm"`.
+        """
+        result = filter_mm_message(
+            post=_post(message="no mention here"), mentions=[],
+            sender_username="alice", config=_config(), room_type="group_dm",
+            last_processed_ts=None, bot_user_id=BOT_ID,
+        )
+        self.assertFalse(result.accepted)
+        self.assertEqual(result.reason, "bot not mentioned")
+
+    def test_group_dm_accepted_when_bot_mentioned(self):
+        result = filter_mm_message(
+            post=_post(message="@hammer.mei hi"), mentions=[BOT_ID],
+            sender_username="alice", config=_config(), room_type="group_dm",
+            last_processed_ts=None, bot_user_id=BOT_ID,
+        )
+        self.assertTrue(result.accepted)
+
     def test_agent_sender_bypasses_mention_gate(self):
         cfg = _config(agent_chain=AgentChainConfig(agent_usernames=["peer"]))
         result = filter_mm_message(

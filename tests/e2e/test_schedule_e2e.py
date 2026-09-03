@@ -1,8 +1,8 @@
 """E2E Test: Built-in task scheduler — fire and verify.
 
 Tests two variants:
-  test_schedule_fires[claude]    → e2e-claude-channel watcher → #acg-e2e-claude
-  test_schedule_fires[opencode]  → e2e-dm watcher             → DM with test_user
+  test_schedule_fires[claude]    → watcher rc-e2e:acg-e2e-claude → #acg-e2e-claude
+  test_schedule_fires[opencode]  → watcher rc-e2e:dm:test_user   → DM with test_user
 
 Flow:
   1. Create a 1-minute one-shot job via ``docker exec acg-e2e agent-chat-gateway
@@ -28,6 +28,9 @@ import pytest
 from rc_client import RCClient
 
 BOT_USERNAME = "acg_bot"
+# The connector name in tests/e2e/acg-config/config.yaml. Watcher handles are
+# `<connector>:<room label>`, so this is half of every watcher name below.
+CONNECTOR_NAME = "rc-e2e"
 ACG_CONTAINER = "acg-e2e"
 
 # The scheduler polls every 60 s; allow 90 s for the job to fire + agent to reply.
@@ -62,8 +65,24 @@ def schedule_room(
 ) -> dict[str, Any]:
     """Parameterized fixture — returns watcher + RC room info for the schedule tests.
 
-    claude    → watcher ``e2e-claude-channel`` → #acg-e2e-claude channel
-    opencode  → watcher ``e2e-dm``             → DM with acg_bot
+    claude    → watcher ``rc-e2e:acg-e2e-claude`` → #acg-e2e-claude channel
+    opencode  → watcher ``rc-e2e:dm:test_user``   → DM with acg_bot
+
+    **These are WATCHER names, not rule names.** Since the dynamic-watcher
+    cutover a ``watchers:`` entry is a *rule* that names no room; the watcher
+    it creates per room is handled ``<connector>:<room label>``
+    (``gateway/core/watcher_manager.watcher_label``), with ``dm:<counterpart>``
+    for a 1:1 DM. ``schedule create`` resolves its argument against the
+    PERSISTED WATCHER RECORDS (``control.py``'s ``_find_entry_for_watcher``),
+    so passing a rule name — which this fixture did until the cutover was
+    reconciled — fails with "Watcher ... not found in any connector". The rule
+    names here are ``e2e-claude-channel`` and ``e2e-dm``, and they are
+    deliberately NOT what goes below. Pinned by
+    tests/unit/test_e2e_watcher_names.py, which runs without the lab.
+
+    A watcher exists only once its room has seen a message, which is already
+    guaranteed for both: ``conftest``'s session-scoped ``acg`` fixture warms
+    up exactly this DM and this channel before any test runs.
 
     Returned dict keys:
         watcher:    ACG watcher name to target when creating the job
@@ -79,7 +98,8 @@ def schedule_room(
                 "Run 'make e2e-up' first."
             )
         return {
-            "watcher": "e2e-claude-channel",
+            # <connector>:<channel name> — see this fixture's docstring.
+            "watcher": f"{CONNECTOR_NAME}:{rc_setup['claude_channel']}",
             "room_id": ch["_id"],
             "room_type": "channel",
             "agent": "claude",
@@ -87,7 +107,9 @@ def schedule_room(
     else:
         room_id = test_client.get_dm_room_id(BOT_USERNAME)
         return {
-            "watcher": "e2e-dm",
+            # <connector>:dm:<counterpart> — the counterpart is the human,
+            # never the bot.
+            "watcher": f"{CONNECTOR_NAME}:dm:{rc_setup['test_user_username']}",
             "room_id": room_id,
             "room_type": "dm",
             "agent": "opencode",

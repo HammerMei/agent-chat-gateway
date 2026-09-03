@@ -131,11 +131,11 @@ class AgentConfig:
     guest_allowed_tools: list[ToolRule] = field(default_factory=list)  # auto-approved for guests
     timeout: int = 360           # seconds to wait for the agent to respond; must be > permissions.timeout
     permissions: PermissionConfig = field(default_factory=PermissionConfig)
-    # On-the-fly watcher lifecycle (docs/design/dynamic-watcher-design.md).
-    # Both None = the idle/expire lifecycle is off for this agent's watchers;
-    # runtime consumers must treat None as "never idle"/"never expire", not 0.
-    session_idle_days: int | None = None    # days with no message before a watcher's runtime object is dropped (session kept)
-    session_expire_days: int | None = None  # days with no message before the session itself is dropped too
+    # No session_idle_days / session_expire_days here: the on-the-fly watcher
+    # lifecycle TTLs live on the WatcherRule instead (design §5.4), so two rules
+    # sharing one agent can have different lifecycles. Setting either on an agent
+    # is a load error naming the new home — see `_MOVED_TO_RULE_KEYS` in
+    # gateway/config.py.
 
     def effective_owner_allowed_tools(self) -> "list[ToolRule]":
         """Return owner_allowed_tools with built-in gateway rules prepended.
@@ -204,24 +204,21 @@ class WatcherConfig:
     Defined in config.yaml under 'watchers:'. The gateway starts all configured
     watchers on startup — no runtime add-watcher commands are needed.
 
-    session_id:
-      - Set to a session ID string to pin this watcher to an existing session (sticky).
-        The session ID is never cleared, even by 'reset'.
-      - Set to None (or omit) to let the gateway auto-create a session on first start.
-        The generated session ID is stored in state.json and cleared by 'reset'.
+    There is no `session_id` here: sessions are not pinned from config. The gateway
+    creates one on first start, persists the id it was given in state.json, reuses it
+    across restarts, and clears it on 'reset'. `watchers[].session_id` is refused at
+    load, naming the handoff replacement — see gateway/config.py. The runtime-assigned
+    `WatcherState.session_id` is a different thing and is unaffected.
     """
 
     name: str                                        # unique watcher name (used in CLI commands)
     connector: str                                   # must match a ConnectorConfig.name
     room: str                                        # room name or @username for DM
     agent: str                                       # must match an AgentConfig.name
-    session_id: str | None = None                    # sticky session ID; None = auto-create
     exclude_rooms: list[str] = field(default_factory=list)  # only meaningful once room == "*" is
     # supported (docs/design/dynamic-watcher-design.md) — the config loader currently rejects
     # room == "*" with a clear "not implemented yet" error, so this is always empty today.
     context_inject_files: list[str] = field(default_factory=list)  # watcher-level context (layer 3)
-    online_notification: str | None = None   # message text on startup; None = suppress (default: quiet)
-    offline_notification: str | None = None  # message text on shutdown; None = suppress (default: quiet)
     history_handoff: HistoryHandoffConfig = field(default_factory=HistoryHandoffConfig)  # session context recovery
 
 
@@ -232,19 +229,22 @@ class CoreConfig:
     """Platform-agnostic gateway configuration consumed by SessionManager and MessageProcessor."""
 
     agents: dict[str, AgentConfig] = field(default_factory=dict)
-    default_agent: str = ""
     connector_configs: dict[str, ConnectorConfig] = field(default_factory=dict)
     max_queue_depth: int = 100  # max pending messages per room; 0 = unbounded (not recommended)
 
     def agent_config(self, name: str) -> AgentConfig:
-        """Return the AgentConfig for the given agent name, falling back to default."""
+        """The AgentConfig for `name`, or an empty one if there is no such agent.
+
+        No longer falls back to a `default_agent` or to "whichever agent came
+        first": a rule must state its agent, so every caller passes a name that
+        was resolved against this same dict. An empty `AgentConfig()` is kept as
+        the answer for an unknown name rather than a raise, because the callers
+        here read single fields off it (`timeout`, `working_directory`) on paths
+        where the loud refusal already happened upstream — `WatcherLifecycle`
+        raises before it gets this far.
+        """
         if name and name in self.agents:
             return self.agents[name]
-        if self.default_agent and self.default_agent in self.agents:
-            return self.agents[self.default_agent]
-        # Last resort: return first available config
-        if self.agents:
-            return next(iter(self.agents.values()))
         return AgentConfig()
 
     def env_for_role(self, role: UserRole, agent_name: str = "") -> dict[str, str]:
@@ -323,7 +323,6 @@ class CoreConfig:
         """Derive a CoreConfig from a GatewayConfig (transition helper)."""
         return cls(
             agents=cfg.agents,
-            default_agent=cfg.default_agent,
             connector_configs={c.name: c for c in cfg.connectors},
             max_queue_depth=cfg.max_queue_depth,
         )

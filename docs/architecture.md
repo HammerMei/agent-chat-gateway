@@ -539,10 +539,11 @@ opencode run -s <session-id> --format json [-f <file> ...]
 config.yaml (user-editable)
     ├─ tool_presets: {name: [ToolRule, ...]}              # named, reusable tool-rule lists
     ├─ connector_templates / agent_templates / watcher_templates  # named; opted into per-entry via inherits:
-    ├─ connectors: [ConnectorConfig, ...]                 # room="a" | rooms=[a,b,...] on watchers
+    ├─ connectors: [ConnectorConfig, ...]
     ├─ agents: {name: AgentConfig, ...}
-    ├─ default_agent: "my-agent"
-    ├─ watchers: [WatcherConfig, ...]
+    ├─ watcher_rules: [WatcherRule, ...]                  # which rooms an agent may serve;
+    │                                                     # one WatcherConfig is materialized
+    │                                                     # per room as rooms turn up
     ├─ max_queue_depth: 100
     └─ scheduler: {completed_job_ttl_days: 7}
          → GatewayConfig.from_file()
@@ -586,17 +587,35 @@ GatewayService.run()
 ├─ AgentRuntimeManager.start_all()
 │  ├─ Start agent backends (subprocesses, etc.)
 │  └─ Start permission brokers (HTTP servers, SSE listeners)
-├─ run_once()
-│  ├─ Connector.connect() [DDP WebSocket, etc.]
-│  └─ SessionManager.run_once() [resume persisted watchers]
+├─ SessionManager.connect_only()  [every connector, concurrently]
+│  └─ Connector.connect() [login, DDP WebSocket, etc.]
+├─ identity barrier — Connector.bot_identity() for all, duplicates refused
+├─ SessionManager.sync_only()     [every connector, concurrently]
+│  ├─ resume persisted watchers, resolve rooms, subscribe
+│  └─ Connector.start_inbound() [begin reading; no-op where delivery is per-room]
 └─ ControlServer.run() [accept CLI commands]
 ```
 
 **Startup ordering rationale:**
 1. Backends first — need to be running before messages arrive
 2. Permission brokers second — only if backend succeeded
-3. Session managers third — can now safely dispatch messages to agents
-4. Control socket last — ready to accept CLI commands
+3. Connectors authenticate third — no subscription yet, so nothing is delivered
+4. **Identity barrier fourth** — two connectors logged in as one bot account receive
+   the identical stream, so every shared room would get two agents answering. Only this
+   loop sees all connectors at once (a SessionManager owns exactly one), and it has to
+   run before *any* of them subscribes: a check that fires after one has started is
+   checking something that is already happening. A connector that cannot report its own
+   identity stops startup rather than starting unchecked (design §4.5)
+5. Watchers restore and subscribe fifth — can now safely dispatch messages to agents
+6. **Inbound stream starts last within that phase.** A connector whose transport
+   delivers every room the account can see (Mattermost) discards events for rooms it
+   has no state for, and nothing replays them — so reading before the restore turns
+   "not subscribed yet" into "lost". The socket is open throughout, so arrivals are
+   buffered rather than missed. Rocket.Chat gates delivery per room and needs nothing
+7. Control socket last — ready to accept CLI commands
+
+`SessionManager.run_once()` still runs both phases back to back, for a standalone
+single-connector embedding where there is no second connector to collide with.
 
 ### Shutdown Sequence (Reverse Order)
 
@@ -660,6 +679,10 @@ All state files live in `~/.agent-chat-gateway/`:
 - **watermark** — Last processed message timestamp; used to skip duplicates on restart
 - **paused** — If true, messages are queued but not processed
 - **session_id** — Opaque string from agent backend; used to resume sessions
+- **backend_identity** — The backend type and working directory the session was
+  created against. Checked before `session_id` is resumed: an id is only meaningful
+  inside the store that issued it, so a mismatch starts a fresh session instead of
+  replaying the id into a different one
 
 ---
 
@@ -816,12 +839,34 @@ class AnthropicAPIBackend(AgentBackend):
         # POST message to API, stream response, return AgentResponse
         ...
 
+    async def ensure_durable_instructions(
+        self, session_id, working_directory, timeout, content, *,
+        path_key, already_delivered,
+    ) -> str | None:
+        # Required in practice, though not @abstractmethod: the base raises
+        # NotImplementedError, because a backend must choose *how* content reaches the
+        # model rather than inherit a fallback that is not compaction-resistant.
+        #
+        # `path_key` is OPAQUE — use it verbatim as a file name and derive nothing from
+        # it. It is scoped to the watcher in a room, so two watchers bound to one room do
+        # not overwrite each other's instructions. Do not substitute
+        # gateway.core.paths.room_path_key: that one keys the attachment workspace, which
+        # is per room by design.
+        #
+        # Return None if this backend delivered the content itself (a one-time side
+        # effect); return a path/value for the caller to re-supply on every turn.
+        ...
+
     async def start(self) -> None:
         ...
 
     async def stop(self) -> None:
         ...
 ```
+
+`GatewayService` preflights every backend's `ensure_durable_instructions` signature at
+startup, so an implementation left on the pre-rename `watcher_name` parameter fails with
+an actionable message instead of a bare `TypeError` on the first watcher start.
 
 Register in `service.py`:
 
@@ -865,8 +910,8 @@ agent = ClaudeBackend(command="claude", new_session_args=[], timeout=60)
 agents = {"default": agent}
 
 # Create session manager
-config = CoreConfig(timeout=60, agents=agents, default_agent="default")
-manager = SessionManager(connector, agents, "default", config)
+config = CoreConfig(timeout=60, agents=agents)
+manager = SessionManager(connector, agents, config)
 
 # Simulate conversation
 async def test_agent():
@@ -908,10 +953,22 @@ Check `~/.agent-chat-gateway/gateway.log` for errors. Common issues:
 
 ### Messages not being processed
 
-1. **Check if watcher is running** — `agent-chat-gateway list`
-2. **Check if watcher is paused** — `agent-chat-gateway list -v`
-3. **Check daemon logs** — `tail -f ~/.agent-chat-gateway/gateway.log`
-4. **Check connector logs** — Filter by `connectors.rocketchat` in logs
+1. **Check the room is being watched at all** — `agent-chat-gateway list --all`
+   (plain `list` hides idle watchers). No row means no state record survived;
+   the reason is in the startup log. See step 3 before concluding anything more
+   than that from it.
+2. **Read the STATE column.** `paused` means an operator muted it. **`failed`
+   means a record exists and nothing is running for it.** The startup errors in
+   the log say why. To recover: `resume` retries the start in place — except
+   when the agent backend or its permission broker failed to start, which is
+   decided once at boot and which `resume` refuses fail-closed. **Restart the
+   daemon for that one.**
+3. **No row at all?** Then there is no state to act on. That is *not* proof the
+   start never got far: context injection, the attachment workspace and session
+   binding all roll their record back, so a watcher can fail well into startup
+   and still leave nothing. The log is authoritative, `list` is not.
+4. **Check daemon logs** — `tail -f ~/.agent-chat-gateway/gateway.log`
+5. **Check connector logs** — Filter by `connectors.rocketchat` in logs
 
 ### Permission requests timing out
 

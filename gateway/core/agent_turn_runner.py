@@ -86,6 +86,7 @@ class AgentTurnRunner:
         is_agent_chain: bool = False,
         agent_chain_context: str = "",
         append_system_prompt_file: str | None = None,
+        is_scheduled: bool = False,
     ) -> bool:
         """Execute one turn: send prompt to agent, post response (or error) to room.
 
@@ -161,6 +162,23 @@ class AgentTurnRunner:
                         room_id,
                     )
                     return True
+                elif is_scheduled and not stripped_text:
+                    # The one silence that is almost never intended. A scheduled
+                    # job fired, the agent ran a turn, and answered with the
+                    # token alone — so the room gets nothing, `run_count`
+                    # advances, and the job reads as healthy in `schedule list`.
+                    # An operator staring at an empty channel had to correlate
+                    # this INFO line with the fire by timestamp to find out.
+                    logger.warning(
+                        "Scheduled message in room %s produced no reply: the "
+                        "agent answered with only <end-of-agent-chain> "
+                        "(session=%s). The job's message is a prompt to the "
+                        "agent and its reply is what gets posted — if the "
+                        "message reads as a finished announcement, the agent "
+                        "has nothing to add and stays silent.",
+                        room_id, session_id[:8],
+                    )
+                    return False
                 else:
                     # Not an agent chain — strip the token and deliver remaining content
                     logger.info(

@@ -41,7 +41,7 @@ try:
 except ImportError:
     from backports import zoneinfo  # type: ignore[no-redef]
 
-from ..schedule_types import JobStatus, ScheduledJob
+from ..schedule_types import FIRE_OWNED_FIELDS, JobStatus, ScheduledJob
 from .job_store import JobStore
 
 if TYPE_CHECKING:
@@ -181,7 +181,15 @@ class JobScheduler:
             return
         logger.info("Catching up %d missed job(s) on startup", len(jobs))
         for job in jobs:
-            await self._fire_catch_up(job, now)
+            try:
+                await self._fire_catch_up(job, now)
+            except Exception:
+                # Per-job isolation, as `_fire_due_jobs` has: a hand-edited
+                # cron, a write that fails on a full disk — one job's failure
+                # here used to propagate out of `run()` and stop every job on
+                # every connector until the next restart, silently (final
+                # pre-merge review). Logged with the job, then the next one.
+                logger.exception("Catch-up for job %s failed — skipping it this start", job.id)
 
     async def _fire_catch_up(self, job: ScheduledJob, now: datetime) -> None:
         """Fire a job that was missed during downtime.
@@ -251,7 +259,12 @@ class JobScheduler:
             # Always reset completed_at to now — a hand-edited future timestamp
             # would otherwise make the job immune to TTL purge.
             job.completed_at = datetime.now(UTC).isoformat()
-            await asyncio.to_thread(self._store.update, job)
+            # Field-scoped for consistency with every other fire-path write, not
+            # because a copy is held: `job` here is the stored object from
+            # `list_due()` and nothing awaits between the read and this write,
+            # so `update(job)` could not have reverted anything. Verified by
+            # planting `update` back — no test can tell the two apart here.
+            await asyncio.to_thread(self._store.write_fields, job, FIRE_OWNED_FIELDS)
             return
 
         # For jobs with exactly one remaining run, fire once regardless of how long
@@ -290,7 +303,12 @@ class JobScheduler:
         """One scheduler tick: purge expired + fire due jobs."""
         # Offload the purge file-write to a thread so the event loop is not
         # blocked while jobs.json is being written.
-        await asyncio.to_thread(self._store.remove_expired_completed, self._ttl_days)
+        try:
+            await asyncio.to_thread(self._store.remove_expired_completed, self._ttl_days)
+        except Exception:
+            # A purge that cannot write must not cost this tick's fires, nor
+            # the scheduler task (final pre-merge review).
+            logger.exception("Purging expired jobs failed — firing anyway")
         await self._fire_due_jobs()
 
     async def _fire_due_jobs(self) -> None:
@@ -355,10 +373,39 @@ class JobScheduler:
             str(job.times) if job.times > 0 else "∞",
         )
 
-        success = await self._inject(job)
+        if self._connector_is_gone(job):
+            # Owner's rule (PR #140): a job whose connector has left the config
+            # is not re-homed and not left to fail at every slot — it is
+            # cancelled (marked, kept), with the same audit line a room removal writes. The
+            # scheduler owns this because the fire is the moment the job is
+            # known to be undeliverable; nothing else touches it until then.
+            reason = (f"connector '{job.connector}' is no longer configured, so "
+                      f"the job has no account to run under")
+            try:
+                await asyncio.to_thread(self._store.cancel, job.id, reason=reason)
+            except Exception:
+                # The store could not be written; the job stays ACTIVE on disk
+                # and the next slot tries again. Like every other write on the
+                # fire path, a failure is logged, not raised (final review).
+                logger.exception("Job %s: could not persist the cancellation", job.id)
+            else:
+                logger.warning(
+                    "AUDIT: cancelled scheduled job %s (watcher '%s', room %s) — %s. "
+                    "The record is kept; 'agent-chat-gateway schedule resume %s' restores it.",
+                    job.id, job.watcher, job.room_id, reason, job.id,
+                )
+            # The copy, marked, not None: `_fire_catch_up` re-assigns this
+            # return and reads `.status` on its next missed slot (internal
+            # review — a bare `return` here raised AttributeError out of the
+            # catch-up loop and killed the scheduler task at startup).
+            job.status = JobStatus.CANCELLED
+            return job
+
+        target = self._resolve_target(job)
+        success = await self._inject(job, target)
         if not success:
-            sm = self._get_sm_for_watcher(job)
-            watcher_state = sm.get_watcher_state(job.watcher) if sm is not None else None
+            sm, room_id = target if target is not None else (None, "")
+            watcher_state = sm.record_for_room(room_id) if sm is not None else None
             is_paused = watcher_state is not None and bool(watcher_state.paused)
 
             if is_paused:
@@ -375,7 +422,7 @@ class JobScheduler:
                     job.id,
                     job.watcher,
                 )
-                await self._notify_injection_failure(job, sm, watcher_state)
+                await self._notify_injection_failure(job, sm, room_id)
 
             if job.times > 0:
                 # Finite job: delivery failed — do NOT consume run_count so the
@@ -392,7 +439,14 @@ class JobScheduler:
                     job.status = JobStatus.PAUSED
                     job.next_run = None
                 try:
-                    await asyncio.to_thread(self._store.update, job)
+                    # Field-scoped here too. The success path was converted first
+                    # and this branch was missed (Codex, PR #140): a migration
+                    # landing while the inject that then FAILED was in flight had
+                    # its room id reverted by this whole-object write of the
+                    # pre-await copy. Self-healing since `needs_migration` also
+                    # looks at the jobs, but a fire must not undo a migration.
+                    await asyncio.to_thread(
+                        self._store.write_fields, job, FIRE_OWNED_FIELDS)
                 except Exception as e:
                     logger.error("Failed to persist job %s after failed fire: %s", job.id, e)
                 return job
@@ -426,34 +480,105 @@ class JobScheduler:
 
         try:
             # Offload the file-write to a thread pool so the event loop is not
-            # blocked while jobs.json is being written.  store.update() replaces
-            # _jobs[job.id] under the lock, making the updated copy visible to
-            # all subsequent readers atomically.
-            await asyncio.to_thread(self._store.update, job)
+            # blocked while jobs.json is being written.
+            #
+            # `write_fields`, NOT `update`: `job` is the copy taken at the top of
+            # this method, before the inject await, so writing it back whole also
+            # writes back every field as it was BEFORE the await. A
+            # `schedule migrate` completing in that window had its `room_id`
+            # silently reverted — and since the migration had already stamped the
+            # schema version, the job became permanently unmigratable and routed
+            # by handle forever. The fire declares the fields it owns instead.
+            await asyncio.to_thread(
+                self._store.write_fields, job, FIRE_OWNED_FIELDS)
         except Exception as e:
             logger.error("Failed to persist job %s after fire: %s", job.id, e)
 
         return job
 
-    def _get_sm_for_watcher(self, job: ScheduledJob) -> "SessionManager | None":
-        """Return the SessionManager that owns the job's watcher.
+    def _connector_is_gone(self, job: ScheduledJob) -> bool:
+        """The job names a connector, and no configured connector has that name.
 
-        Prefers the connector named in job.connector; falls back to a linear
-        search when the connector field is absent or stale.
+        A job that names NO connector is unknown, not gone. Every job the
+        scheduler ever wrote names one (`connector` predates schema 2; schema 2
+        added `room_id`), so an empty field is a hand-edited or damaged record —
+        resolved by its handle, refused if that fails, never cancelled on that
+        evidence.
+        """
+        return bool(job.connector) and job.connector not in self._session_managers
+
+    def _resolve_target(self, job: ScheduledJob) -> "tuple[SessionManager, str] | None":
+        """The manager and the ROOM this job fires into, resolved once per fire.
+
+        Every downstream step — inject, pause check, failure notice — takes the
+        room id this returns and nothing else. A fire used to resolve the same
+        job four times through four different methods, some by room and some by
+        handle, and the handle-taking ones were where the defect kept
+        reappearing (§2.8). One seam; one answer.
+
+        Manager first, and ONLY `job.connector`. A job whose connector is not
+        configured is not resolved by asking who else holds its room: room ids
+        are per-server, not per-connector, and the canonical multi-agent setup
+        is one account per agent in the same rooms — so when a connector is
+        removed, every other account in those rooms is a "holder", and the
+        sole survivor is by construction a DIFFERENT agent. Running the job
+        there would execute it with another agent's backend, tools and account
+        while the fire logged success (Codex, PR #140 round 4; an earlier
+        version inferred the owner when exactly one holder remained, which
+        refused only the two-holder case). Loud, None. `_fire_once` cancels
+        such a job before it gets here (`_connector_is_gone`); this branch is
+        the refusal for any other caller.
+
+        Room second. `job.room_id` when the job has one. A job written before
+        schema 2 has only its handle, which `resolve_handle` turns into whatever
+        room currently answers to that name — the single by-name lookup on this
+        path, and the reason `schedule migrate` exists.
         """
         sm = self._session_managers.get(job.connector)
-        if sm is not None:
-            return sm
-        for manager in self._session_managers.values():
-            if manager.get_watcher_config(job.watcher) is not None:
-                return manager
-        return None
+        if sm is None and job.room_id:
+            holders = sum(1 for m in self._session_managers.values()
+                          if m.record_for_room(job.room_id) is not None)
+            logger.error(
+                "Job %s: its connector %r is not configured, and %d configured "
+                "connector(s) hold a record for its room %s. Refusing to run it "
+                "under another account — delete and recreate the job against a "
+                "current watcher (or restore the connector under its old name).",
+                job.id, job.connector, holders, job.room_id,
+            )
+            return None
+        if sm is None and not job.room_id:
+            # A handle embeds its connector's name, so at most one manager can
+            # answer for it — this cannot cross accounts the way a room can.
+            for manager in self._session_managers.values():
+                room_id = manager.resolve_handle(job.watcher)
+                if room_id:
+                    return manager, room_id
+        if sm is None:
+            logger.warning(
+                "Job %s: no session manager owns watcher %r (connector %r is "
+                "not configured and no room or record names one). "
+                "'agent-chat-gateway schedule migrate' records the room.",
+                job.id, job.watcher, job.connector,
+            )
+            return None
+
+        room_id = job.room_id or sm.resolve_handle(job.watcher)
+        if not room_id:
+            logger.warning(
+                "Job %s: watcher %r has no resolvable room — a job created "
+                "before schema 2 carries no room id and its watcher's record is "
+                "gone, so there is nothing to fire into. "
+                "'agent-chat-gateway schedule migrate' records one.",
+                job.id, job.watcher,
+            )
+            return None
+        return sm, room_id
 
     async def _notify_injection_failure(
         self,
         job: ScheduledJob,
         sm: "SessionManager | None",
-        watcher_state: object | None,
+        room_id: str,
     ) -> None:
         """Best-effort notification to the watcher's room when injection fails.
 
@@ -461,7 +586,7 @@ class JobScheduler:
         queue) so it reaches the room even while the watcher is stopped or
         draining.  Failures are logged but never re-raised.
         """
-        if sm is None:
+        if sm is None or not room_id:
             return
         retry_note = (
             "The run count was **not** consumed — it will retry at the next scheduled time."
@@ -473,34 +598,32 @@ class JobScheduler:
             f"(watcher `{job.watcher}` is not accepting messages). {retry_note}"
         )
         try:
-            await sm.notify_watcher_room(job.watcher, text)
+            await sm.notify_watcher_room(room_id, text)
         except Exception as e:
             logger.warning(
                 "Job %s: failed to send injection-failure notification: %s", job.id, e
             )
 
-    async def _inject(self, job: ScheduledJob) -> bool:
-        """Inject the job message into the target watcher via SessionManager.
+    async def _inject(
+        self, job: ScheduledJob, target: "tuple[SessionManager, str] | None",
+    ) -> bool:
+        """Inject the job message into the room `_resolve_target` chose.
 
-        Tries the connector-specific SessionManager first; falls back to
-        searching all managers if connector is not specified or not found.
+        Takes the resolution rather than redoing it — this method used to
+        resolve on its own, and an earlier version resolved by *attempting
+        delivery* into every manager with `except Exception: pass`, so a real
+        failure in the owning manager was indistinguishable from "no manager
+        has it". Resolving once, upstream, and injecting once means a failure
+        is reported as a failure, against the room it was actually for.
         """
-        sm = self._session_managers.get(job.connector)
-        if sm is not None:
-            try:
-                return await sm.inject_message(job.watcher, job.message)
-            except Exception as e:
-                logger.error("Job %s: inject_message failed on connector %r: %s", job.id, job.connector, e)
-                return False
-
-        # Fallback: search all session managers
-        for connector_name, manager in self._session_managers.items():
-            try:
-                result = await manager.inject_message(job.watcher, job.message)
-                if result:
-                    return True
-            except Exception:
-                pass
-
-        logger.warning("Job %s: no session manager could deliver message to watcher %r", job.id, job.watcher)
-        return False
+        if target is None:
+            return False  # `_resolve_target` already said why
+        sm, room_id = target
+        try:
+            return await sm.inject_message(room_id, job.message)
+        except Exception as e:
+            logger.error(
+                "Job %s: inject_message failed for room %s (watcher %r): %s",
+                job.id, room_id, job.watcher, e,
+            )
+            return False

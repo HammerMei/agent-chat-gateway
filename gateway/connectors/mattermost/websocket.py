@@ -61,6 +61,7 @@ class MattermostWebSocketClient:
 
         self._ws: websockets.ClientConnection | None = None
         self._handler: PostedEventHandler | None = None
+        self._membership_handler: PostedEventHandler | None = None
         self._seq = 1
         self._reconnect_delay = 1.0
         self._max_reconnect_delay = 60.0
@@ -68,6 +69,8 @@ class MattermostWebSocketClient:
         self._listen_task: asyncio.Task | None = None
         self._callback_sem = asyncio.Semaphore(_CALLBACK_CONCURRENCY)
         self._callback_tasks: set[asyncio.Task] = set()
+        # The single in-flight reconnect replay — see _reconnect's coalescing.
+        self._replay_task: asyncio.Task | None = None
         self._channel_queues: dict[str, asyncio.Queue] = {}
         self._channel_workers: dict[str, asyncio.Task] = {}
         # Local bookkeeping only — no wire-protocol subscribe exists.  Tracks
@@ -84,13 +87,38 @@ class MattermostWebSocketClient:
         """Register the single callback invoked for every decoded `posted` event."""
         self._handler = handler
 
+    def register_membership_handler(self, handler: PostedEventHandler) -> None:
+        """Register the callback for raw `user_added`/`user_removed` events (§2.7).
+
+        The transport hands the *whole* event over, undecoded: the two events
+        carry their ids in asymmetric places (a removal broadcast to the
+        removed user has the channel in `data` and the user in `broadcast`;
+        every other variant is the mirror image), and which user matters —
+        the bot's own id — is the connector's knowledge, not this layer's.
+        The handler must return fast; anything slow belongs on its own task.
+        """
+        self._membership_handler = handler
+
     def register_channel(self, channel_id: str) -> None:
         """Record that the dispatcher cares about this channel (no wire call)."""
         self._registered_channels.add(channel_id)
 
     def unregister_channel(self, channel_id: str) -> None:
-        """Stop caring about this channel locally (no wire call)."""
+        """Release the channel's local delivery machinery (no wire call).
+
+        The RC twin pops the queue and cancels the worker; this method used
+        to discard only the bookkeeping set — which is write-only in
+        production code — so every unsubscribe/reap over a long-lived process
+        leaked an asyncio.Task parked on `queue.get()` plus its queue,
+        forever (#115). Cancel-and-forget rather than awaited, because
+        `reap_room` is synchronous: a cancelled worker finishes on the loop,
+        and `_dispatch` lazily recreates the pair if the channel returns.
+        """
         self._registered_channels.discard(channel_id)
+        self._channel_queues.pop(channel_id, None)
+        worker = self._channel_workers.pop(channel_id, None)
+        if worker is not None and not worker.done():
+            worker.cancel()
 
     def set_reconnect_callback(self, cb: Callable[[], Any]) -> None:
         self._on_reconnect_cb = cb
@@ -192,11 +220,35 @@ class MattermostWebSocketClient:
             "mentions": mentions,
             "channel_type": data.get("channel_type"),
             "channel_name": data.get("channel_name"),
+            # A DM's `channel_name` is the opaque `<userid>__<userid>` form; its
+            # `channel_display_name` is the counterpart's handle, and for a group DM it is
+            # the member list (§6.2). Kept because it is the only usable identity a DM
+            # event carries — deliberately not used as a *label*, which must not move when
+            # membership does.
+            "channel_display_name": data.get("channel_display_name"),
             "team_id": data.get("team_id"),
         }
 
     async def _dispatch(self, decoded: dict[str, Any]) -> None:
         """Route a decoded posted-event to the per-channel ordering queue."""
+        self.deliver_to_channel(decoded)
+
+    def deliver_to_channel(self, decoded: dict[str, Any]) -> None:
+        """Enqueue a decoded event onto its channel's ordering queue.
+
+        The public form of `_dispatch`, for the creation path (§2.7): the message
+        that triggered a creation is handed back through the channel's own queue
+        once the channel is tracked, so every gate that applies to a tracked
+        channel's message — the mention gate, dedup, the capacity preflight —
+        applies to it, and so does the queue's ordering. The Rocket.Chat
+        transport's `deliver_to_room` is the same contract; one copy of the
+        enqueue rule serves both callers here so the two cannot drift.
+
+        Synchronous on purpose: the enqueue never blocks (`put_nowait`), and a
+        full queue drops the event with a warning — the same audible overflow
+        answer live delivery gives, because a silent drop here would lose the
+        one message the new watcher exists to answer with nothing in the log.
+        """
         channel_id = decoded["post"]["channel_id"]
         queue = self._channel_queues.get(channel_id)
         if queue is None:
@@ -249,6 +301,19 @@ class MattermostWebSocketClient:
                             logger.exception("Failed to decode posted event: %r", evt)
                             continue
                         await self._dispatch(decoded)
+                    elif evt.get("event") in ("user_added", "user_removed"):
+                        # Membership events (§2.7). Deliberately not routed
+                        # through the per-channel ordering queues: the handler
+                        # filters to the bot's own membership and spawns its
+                        # slow half, and ordering against posts is provided by
+                        # the core's locks, not the transport. A handler error
+                        # must not kill delivery for every channel.
+                        if self._membership_handler is not None:
+                            try:
+                                await self._membership_handler(evt)
+                            except Exception:
+                                logger.exception(
+                                    "Unhandled error in membership handler: %r", evt)
                     # Other events (hello, status_change, typing, seq_reply
                     # acks, etc.) are intentionally not acted on here.
             except asyncio.CancelledError:
@@ -274,10 +339,50 @@ class MattermostWebSocketClient:
                 self._reconnect_delay = 1.0
                 logger.info("Reconnected to %s", self.ws_url)
                 if self._on_reconnect_cb is not None:
+                    # OFF the receive loop (Codex round 22): this coroutine
+                    # runs ON the listen task, and awaiting the reconnect
+                    # replay here stopped event consumption for its whole
+                    # duration — including `user_removed`, the ONLY feeder of
+                    # the membership generation the replay's own era fence
+                    # reads. A removal landing mid-replay was therefore
+                    # unreadable until the replay finished, and the stale
+                    # batch delivered despite it. As a task, the loop keeps
+                    # consuming and the fence's signal stays live; the replay
+                    # was never serialized against live traffic anyway (it
+                    # calls _on_posted_event directly, not via the workers).
+                    def _log_replay_failure(task: asyncio.Task) -> None:
+                        if not task.cancelled() and task.exception():
+                            logger.error("Error in on_reconnect callback: %r",
+                                         task.exception())
+
+                    # COALESCED (Codex round 25): a flaky connection can
+                    # complete another reconnect before the previous replay
+                    # finishes, and two replays over one room interleave
+                    # their dispatches and double the REST work. The prior
+                    # replay is cancelled first — its window was claimed
+                    # before its first await, so the cancellation loses
+                    # nothing: this newer replay reads the same (or older)
+                    # boundary and re-covers the tail.
+                    prev = self._replay_task
+                    if prev is not None and not prev.done():
+                        prev.cancel()
+                        try:
+                            await prev
+                        except (asyncio.CancelledError, Exception):
+                            pass
                     try:
                         result = self._on_reconnect_cb()
                         if asyncio.iscoroutine(result):
-                            await result
+                            task = asyncio.create_task(result)
+                            task.add_done_callback(_log_replay_failure)
+                            # Tracked like the channel workers (Codex round
+                            # 23): stop() must be able to harvest a replay
+                            # still fetching when shutdown or another drop
+                            # arrives — an untracked task could outlive
+                            # disconnect() and use a closed REST client.
+                            self._replay_task = task
+                            self._callback_tasks.add(task)
+                            task.add_done_callback(self._callback_tasks.discard)
                     except Exception:
                         logger.exception("Error in on_reconnect callback")
                 return

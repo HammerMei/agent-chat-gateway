@@ -196,6 +196,7 @@ class InjectedContextBuilder:
         working_directory: str,
         timeout: int,
         watcher_name: str,
+        path_key: str,
         content: str,
     ) -> str | None:
         """Call agent.ensure_durable_instructions(), with retry bookkeeping.
@@ -231,7 +232,7 @@ class InjectedContextBuilder:
                     working_directory,
                     timeout,
                     content,
-                    watcher_name=watcher_name,
+                    path_key=path_key,
                     already_delivered=ws.context_injected,
                 )
             except AgentExecutionError as e:

@@ -107,10 +107,12 @@ connectors:
     port: 8765
     secret: "$VOICE_SECRET"
 
-watchers:
+watcher_rules:
   - name: siri-watcher
     connector: siri-voice
-    room: voice-room           # → POST /ask/voice-room
+    rooms:
+      include: [voice-room]    # literal (no stream to match patterns against)
+                               # → POST /ask/voice-room
     agent: my-agent
     context_inject_files:
       - gateway/contexts/voice-context.md
@@ -171,7 +173,10 @@ watchers:
 #### Persistence & Recovery
 - ✅ Persistent watcher state across daemon restarts (`state.json`)
 - ✅ Auto-created session IDs retained across restarts
-- ✅ Fixed (sticky) session IDs preserved across reset operations
+- ❌ Pinning a session ID from config (`session_id` on a watcher rule) — removed;
+  setting it is a load error, reported as an unrecognised key like any other.
+  Carry context into a session with a handoff file instead
+  (`context_inject_files`), which also survives the backend expiring the session
 - ✅ Graceful recovery from corrupted state files
 
 #### Session Operations
@@ -266,7 +271,8 @@ watchers:
 - ✅ `status` — Check if daemon is running
 
 #### Watcher Control
-- ✅ `list` — List watchers and runtime status (supports multi-connector aggregation)
+- ✅ `list` — List watcher records and their state; everything but `idle` by
+  default (`--active/--idle/--paused/--failed/--all`; multi-connector aggregation)
 - ✅ `pause <watcher>` — Pause watcher (stop processing messages)
 - ✅ `resume <watcher>` — Resume paused watcher
 - ✅ `reset <watcher>` — Clear session state
@@ -319,9 +325,12 @@ watchers:
 - ✅ Default agent must reference existing agent (if specified)
 - ✅ Required paths must exist at validation time
 - ✅ Queue depth settings reject invalid values
-- ✅ Sticky session IDs validated for uniqueness
-- ✅ `*_defaults` blocks reject identity fields (e.g. `name`, `room`/`rooms`,
-  `session_id`) that must be set per-entry, not inherited
+- ✅ A `watchers[].session_id` left over from an earlier version is rejected with the
+  replacement named, never silently ignored (the cross-watcher uniqueness check it
+  used to need is gone with the field)
+- ✅ `*_defaults` blocks reject identity fields (`name`, `room`/`rooms`) that must be
+  set per-entry, not inherited — and the removed `session_id`, reported as removed
+  rather than as "set it per-entry"
 - ✅ `tool_presets` are regex-validated eagerly at load, even if unused
 - ✅ `agent-chat-gateway config validate [--lint]` — checks config.yaml
   without starting the daemon: structural validation, per-connector-type
@@ -348,6 +357,23 @@ watchers:
 ---
 
 ## Known Limitations & Constraints
+
+### Message Delivery
+
+- 🔶 **No zero-loss guarantee under sustained overload.** ACG applies backpressure: when
+  every processor queue for a room is full, an inbound message is refused rather than
+  queued without bound. A refused message is normally recoverable — its dedup id is
+  forgotten and a mark is left below it so the next reconnect re-fetches it — but that
+  mark lives only in memory. If the gateway restarts *before* the next reconnect, the
+  message is not recovered and nothing reports it.
+  - Requires all queues full **and** a restart before the next socket reconnect, so it
+    needs sustained overload rather than a burst.
+  - A live message refused by the capacity preflight still gets a "server busy" reply, so
+    the sender knows to resend. A message refused while replaying a reconnect window does
+    not — 200 such replies would be worse than the loss.
+  - **Deliberate.** Persisting the mark was assessed and declined: guaranteeing delivery
+    through overload is not a goal ACG trades complexity for. Both chat connectors behave
+    the same way here.
 
 ### Platform Support
 

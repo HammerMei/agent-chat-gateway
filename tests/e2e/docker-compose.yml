@@ -1,19 +1,24 @@
 # =============================================================================
-# E2E Test Infrastructure — Rocket.Chat + MongoDB + ACG
+# E2E Test Infrastructure — Rocket.Chat + MongoDB, Mattermost + Postgres, ACG
 #
-# Usage (via Makefile):
-#   Phase 1 — infrastructure only:
-#     docker compose -f tests/e2e/docker-compose.yml up -d mongodb rocketchat
-#   Phase 2 — accounts created, then start ACG:
-#     docker compose -f tests/e2e/docker-compose.yml up -d acg
-#   Teardown:
-#     docker compose -f tests/e2e/docker-compose.yml down -v
+# Four phases, and the ORDER is load-bearing — `make e2e-up` is the authority:
+#   1. platforms:  up -d mongodb rocketchat postgres mattermost
+#   2. RC accounts:  python tests/e2e/setup.py
+#   3. MM team + accounts:  python tests/e2e/mm_setup.py
+#   4. up -d acg
+# Steps 2-3 must precede 4: each connector logs in as acg_bot at startup, and a
+# connector that cannot connect is fatal to the whole daemon.
+# Teardown: docker compose -f tests/e2e/docker-compose.yml down -v
+#   (or `make e2e-down` — it passes -v, so platform data goes with it)
 #
 # Port layout:
 #   RC:  host:3100  (avoids conflict with dev RC on port 3000)
+#   MM:  host:8065
 #
-# ACG internal URL to RC: http://rocketchat:3100  (Docker network)
-# Test runner URL to RC:  http://localhost:3100   (host-mapped port)
+# From INSIDE the network (what acg-config/config.yaml uses):
+#   http://rocketchat:3100   http://mattermost:8065
+# From the HOST (what the pytest clients use):
+#   http://localhost:3100    http://localhost:8065
 # =============================================================================
 
 services:
@@ -53,8 +58,22 @@ services:
 
   # ── Rocket.Chat ──────────────────────────────────────────────────────────────
   rocketchat:
-    image: rocket.chat:6.12
-    platform: linux/amd64   # no arm64 image; runs via Rosetta 2 on Apple Silicon
+    # Pinned to the version the dynamic-watcher design was actually verified
+    # against (docs/design/dynamic-watcher-design.md §6: "Versions tested:
+    # Rocket.Chat 8.5.1"). This pin was 6.12, chosen when the E2E suite was
+    # first written and never revisited when delivery switched to the
+    # subscribe-all `__my_messages__` stream — so every §6.1 finding the
+    # runtime now depends on (the stream being accepted, args[1] carrying
+    # roomParticipant/roomType/roomName, system messages arriving) was
+    # unverified on the version E2E actually ran.
+    #
+    # MongoDB stays at 8.2 deliberately. RC's own notes contradict each
+    # other here (8.0.0's notes say "must upgrade to MongoDB 8.2"; the 8.5.1
+    # release page lists engine MongoDB 8.0 — see RocketChat/Rocket.Chat
+    # issue #41022, which is exactly about that inconsistency), and 8.2 is
+    # the version reported working on RC 8.x in practice.
+    image: rocket.chat:8.5.1
+    platform: linux/amd64   # still amd64-only at 8.5.1; runs via Rosetta 2 on Apple Silicon
     container_name: acg-e2e-rocketchat
     restart: unless-stopped
     depends_on:
@@ -84,9 +103,87 @@ services:
       retries: 40
       start_period: 90s
 
+  # ── Mattermost (+ its Postgres) ──────────────────────────────────────────────
+  # Pinned to the version §6 of docs/design/dynamic-watcher-design.md was
+  # verified against ("Versions tested: ... Mattermost 11.7.0"), for the same
+  # reason Rocket.Chat is: §6.2's finding that DELIVERY TRACKS MEMBERSHIP —
+  # a post in a readable-but-not-joined channel produces no event at all — is
+  # what the MM router relies on instead of a membership gate, and it is only
+  # meaningful against the version it was observed on.
+  postgres:
+    image: postgres:16-alpine
+    container_name: acg-e2e-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: mmuser
+      POSTGRES_PASSWORD: mmuser_e2e_2024
+      POSTGRES_DB: mattermost
+    volumes:
+      - acg_e2e_postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U mmuser -d mattermost"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  mattermost:
+    image: mattermost/mattermost-team-edition:11.7.0
+    platform: linux/amd64   # amd64-only, like Rocket.Chat; Rosetta 2 on Apple Silicon
+    container_name: acg-e2e-mattermost
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      MM_SQLSETTINGS_DRIVERNAME: postgres
+      MM_SQLSETTINGS_DATASOURCE: "postgres://mmuser:mmuser_e2e_2024@postgres:5432/mattermost?sslmode=disable&connect_timeout=10"
+      MM_SERVICESETTINGS_SITEURL: http://localhost:8065
+      MM_SERVICESETTINGS_LISTENADDRESS: ":8065"
+      # E2E conveniences, both of them reasons a real deployment would NOT set
+      # them: create accounts over the API with no invite, and no email
+      # verification. The connector authenticates with username+password here,
+      # so nothing enables personal access tokens.
+      MM_TEAMSETTINGS_ENABLEOPENSERVER: "true"
+      MM_EMAILSETTINGS_REQUIREEMAILVERIFICATION: "false"
+      MM_EMAILSETTINGS_SENDEMAILNOTIFICATIONS: "false"
+      MM_LOGSETTINGS_CONSOLELEVEL: INFO
+    ports:
+      - "8065:8065"
+    volumes:
+      - acg_e2e_mm_data:/mattermost/data
+      - acg_e2e_mm_config:/mattermost/config
+    # The TEST is the image's own, restated verbatim rather than replaced. It
+    # is the only kind that can work here: this image has NO SHELL and no
+    # curl, so every `CMD-SHELL` probe fails with `stat /bin/sh: no such file
+    # or directory` and the container sits unhealthy forever while the server
+    # is in fact serving. That is exactly how it failed here — `/system/ping`
+    # answered 200 from the host while compose refused to start ACG on an
+    # "unhealthy" dependency. The vendor probe also checks more than a port:
+    # it reports database and filestore status. `--local` needs local mode,
+    # which this image enables by ENV default (nothing in this repo sets it),
+    # so a tag bump can break the probe with no change here to blame.
+    #
+    # What IS overridden is the budget. The image ships 30s interval, 10s
+    # timeout and no `start_period`, so Docker's default of 3 retries marks
+    # Mattermost unhealthy at ~90s — and compose does not wait out an
+    # `unhealthy` dependency, it aborts immediately, even though the probe
+    # would recover 30s later. On a cold CI runner booting Mongo, Rocket.Chat,
+    # Postgres and Mattermost concurrently, with MM running first-boot
+    # migrations against an empty database, 90s is not a margin. The main path
+    # is protected by ordering (the bootstraps and an image build run first),
+    # but `up -d --force-recreate acg` — the recovery this repo's own Makefile
+    # prescribes — re-evaluates `depends_on` and would abort naming Mattermost.
+    healthcheck:
+      test: ["CMD", "/mattermost/bin/mmctl", "system", "status", "--local"]
+      interval: 10s
+      timeout: 10s
+      retries: 30
+      start_period: 60s
+
   # ── ACG ─────────────────────────────────────────────────────────────────────
-  # Started separately (after setup.py creates RC accounts).
-  # Config is pre-written in tests/e2e/acg-config/.
+  # Started last, after BOTH platforms have been bootstrapped: each connector
+  # logs in as acg_bot at boot, and on Mattermost an unresolvable team is fatal
+  # to the whole gateway. Config is pre-written in tests/e2e/acg-config/.
   acg:
     # Build from the current branch source so that unreleased features (e.g.
     # the scheduling CLI) are available during E2E tests.  The published
@@ -99,6 +196,8 @@ services:
     restart: unless-stopped
     depends_on:
       rocketchat:
+        condition: service_healthy
+      mattermost:
         condition: service_healthy
     environment:
       # Claude Code auth — pick ONE (same env vars as the production ACG image).
@@ -124,5 +223,8 @@ services:
 volumes:
   acg_e2e_mongodb:
   acg_e2e_rc_uploads:
+  acg_e2e_postgres:
+  acg_e2e_mm_data:
+  acg_e2e_mm_config:
   acg_e2e_work:
   acg_e2e_contexts:

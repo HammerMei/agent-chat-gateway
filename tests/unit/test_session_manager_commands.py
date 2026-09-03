@@ -15,37 +15,88 @@ from unittest.mock import AsyncMock, MagicMock
 
 def _make_manager():
     """Build a minimal SessionManager with all collaborators mocked."""
-    from gateway.core.session_manager import SessionManager
+    from tests.helpers import make_bare_session_manager
 
-    mgr = SessionManager.__new__(SessionManager)
-    mgr._connector = MagicMock()
-    mgr._connector.register_handler = MagicMock()
-    mgr._connector.register_capacity_check = MagicMock()
-    mgr._connector.connect = AsyncMock()
-    mgr._connector.disconnect = AsyncMock()
-    mgr._lifecycle = MagicMock()
+    mgr = make_bare_session_manager()
     mgr._lifecycle.list_watchers = MagicMock(return_value=[])
-    mgr._lifecycle.pause_watcher = AsyncMock()
-    mgr._lifecycle.resume_watcher = AsyncMock()
-    mgr._lifecycle.reset_watcher = AsyncMock()
-    mgr._lifecycle.stop_all = AsyncMock()
     mgr._lifecycle.save_state = MagicMock()
-    mgr._lifecycle.sync_watchers = AsyncMock(return_value=[])
-    mgr._dispatcher = MagicMock()
-    mgr._dispatcher.dispatch = MagicMock()
-    mgr._dispatcher.has_capacity = MagicMock()
-    mgr._injector = MagicMock()
-    mgr._state_store = MagicMock()
     return mgr
 
 
 class TestDispatchCommandList(unittest.IsolatedAsyncioTestCase):
     """dispatch_command({'cmd': 'list'}) returns watcher data."""
 
+    async def test_the_wire_filter_reaches_the_lifecycle(self):
+        """`request["states"]` → `StateFilter` is the only join between the CLI
+        and the reader, and both halves being tested in isolation left it
+        uncovered: mutating this call to ignore the request passed the entire
+        suite while the daemon silently answered every query with the default.
+        """
+        from gateway.core.state import StateFilter
+
+        mgr = _make_manager()
+
+        await mgr.dispatch_command({"cmd": "list", "states": ["idle"]})
+        self.assertEqual(
+            mgr._lifecycle.list_watchers.call_args[0][0], StateFilter.IDLE
+        )
+
+        await mgr.dispatch_command(
+            {"cmd": "list", "states": ["active", "failed"]}
+        )
+        self.assertEqual(
+            mgr._lifecycle.list_watchers.call_args[0][0],
+            StateFilter.ACTIVE | StateFilter.FAILED,
+        )
+
+    async def test_no_states_field_uses_the_server_side_default(self):
+        """The CLI expresses "the default" by sending nothing, so the default
+        has exactly one definition and it lives here."""
+        from gateway.core.state import StateFilter
+
+        mgr = _make_manager()
+
+        await mgr.dispatch_command({"cmd": "list"})
+
+        self.assertEqual(
+            mgr._lifecycle.list_watchers.call_args[0][0], StateFilter.OPERABLE
+        )
+
+    async def test_a_non_iterable_filter_is_a_bad_request_not_a_broken_daemon(self):
+        """`parse_state_filter` iterates what it is handed, so a hand-written
+        socket client sending `"states": 5` raises `TypeError`.
+
+        Escaping uncaught turns a malformed request into a per-connector
+        "failed to list watchers" warning, which reads as the daemon being
+        broken rather than the request being wrong. (Written because injecting
+        this fault changed nothing: the `TypeError` arm shipped without a test,
+        which is what a fix-and-test-in-one-edit always leaves behind.)
+        """
+        mgr = _make_manager()
+
+        result = await mgr.dispatch_command({"cmd": "list", "states": 5})
+
+        self.assertFalse(result["ok"])
+        self.assertIn("states", result["error"])
+        mgr._lifecycle.list_watchers.assert_not_called()
+
+    async def test_an_unparseable_filter_is_an_error_not_a_silent_default(self):
+        """A caller cannot tell from the rows that it was answered with a
+        different question than the one it asked."""
+        mgr = _make_manager()
+
+        result = await mgr.dispatch_command(
+            {"cmd": "list", "states": ["sleeping"]}
+        )
+
+        self.assertFalse(result["ok"])
+        self.assertIn("sleeping", result["error"])
+        mgr._lifecycle.list_watchers.assert_not_called()
+
     async def test_list_returns_watchers(self):
         mgr = _make_manager()
         mgr._lifecycle.list_watchers.return_value = [
-            {"watcher_name": "support", "active": True}
+            {"watcher_name": "support", "state": "active"}
         ]
         result = await mgr.dispatch_command({"cmd": "list"})
         self.assertTrue(result["ok"])
@@ -184,6 +235,41 @@ class TestShutdownOrdering(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(call_order[:2], ["stop_all", "save_state"])
 
+    async def test_the_manager_is_drained_before_anything_stops(self):
+        """The wake arms stay reachable until the connector disconnects, so a
+        shutdown that stops things before disarming leaves a window where an
+        idle room's message recreates a watcher nothing below will stop —
+        absent from stop_all's snapshot, its save rewriting the state file
+        after the final save (§2.5). Since Codex round 5 the first step is
+        `drain()` — disarm PLUS waiting out in-flight starts, because an
+        episode already inside start_watcher_in_room installs its processor
+        after stop_all's snapshot."""
+        mgr = _make_manager()
+        call_order: list[str] = []
+
+        mgr._watcher_manager = MagicMock()
+
+        async def _drain():
+            call_order.append("drain")
+
+        mgr._watcher_manager.drain = _drain
+        sweep = MagicMock()
+
+        async def _sweep_stop():
+            call_order.append("sweep_stop")
+
+        sweep.stop = _sweep_stop
+        mgr._sweep = sweep
+
+        async def _stop_all():
+            call_order.append("stop_all")
+
+        mgr._lifecycle.stop_all = _stop_all
+
+        await mgr.shutdown()
+
+        self.assertEqual(call_order[:3], ["drain", "sweep_stop", "stop_all"])
+
     async def test_disconnect_called_after_save_state(self):
         mgr = _make_manager()
 
@@ -222,6 +308,7 @@ class TestRunOnce(unittest.IsolatedAsyncioTestCase):
         errors = await mgr.run_once()
         mgr._connector.connect.assert_called_once()
         mgr._lifecycle.sync_watchers.assert_called_once()
+        mgr._connector.start_inbound.assert_awaited_once()
         self.assertEqual(errors, [])
 
     async def test_run_once_registers_handler(self):
@@ -235,6 +322,116 @@ class TestRunOnce(unittest.IsolatedAsyncioTestCase):
         unavailable = {"slow-agent"}
         await mgr.run_once(unavailable_agents=unavailable)
         mgr._lifecycle.sync_watchers.assert_called_once_with(unavailable_agents=unavailable)
+
+
+
+class TestTheRouterWiring(unittest.IsolatedAsyncioTestCase):
+    """Rules give the manager runtime effect (§2.8), and the registration order
+    is load-bearing: Rocket.Chat's start_inbound attempts subscribe-all only
+    when a router is already registered."""
+
+    def _real_manager(self, rules):
+        from gateway.core.session_manager import SessionManager
+        from tests.helpers import make_core_config
+
+        connector = MagicMock()
+        connector.register_handler = MagicMock()
+        connector.register_capacity_check = MagicMock()
+        connector.register_router = MagicMock()
+        connector.connect = AsyncMock()
+        connector.start_inbound = AsyncMock()
+        connector.trigger_history_bound = MagicMock(
+            return_value="2026-08-16T10:00:00+00:00")
+        return SessionManager(
+            connector, {"default": MagicMock()}, make_core_config(),
+            state_name="rc", watcher_rules=rules,
+        ), connector
+
+    def _rule(self):
+        from gateway.core.room_pattern import RoomPattern
+        from gateway.core.watcher_rule import RoomMatcher, WatcherRule
+
+        return WatcherRule(
+            name="eng", connector="rc", agent="default",
+            rooms=RoomMatcher(include=(RoomPattern("eng-*"),)))
+
+    async def test_rules_register_a_router_before_connect(self):
+        mgr, connector = self._real_manager([self._rule()])
+        parent = MagicMock()
+        parent.attach_mock(connector.register_router, "register_router")
+        parent.attach_mock(connector.connect, "connect")
+
+        await mgr.connect_only()
+
+        names = [c[0] for c in parent.mock_calls]
+        self.assertEqual(names, ["register_router", "connect"])
+
+    async def test_omitted_rules_normalize_to_an_empty_list(self):
+        """Codex round 10: the always-on manager received the declared
+        default None, and the first new room's first_matching_rule raised
+        iterating it instead of declining the room."""
+        from tests.helpers import make_manager
+
+        mgr = make_manager()  # watcher_rules omitted → None
+        self.assertEqual(mgr._watcher_manager._rules, [],
+                         "None normalizes to [] before reaching the manager")
+
+    async def test_no_rules_still_registers_the_router(self):
+        """INVERTED with Codex round 5's fix (the old pin protected
+        static-only deployments, which no longer load): the manager and the
+        router now exist unconditionally — removing a connector's last rule
+        must not strand its hydrated rule-derived records with no router, no
+        recreation and no replay. RC running subscribe-all with zero rules
+        (every offer declined) is the named, accepted consequence."""
+        mgr, connector = self._real_manager([])
+        await mgr.connect_only()
+        connector.register_router.assert_called_once()
+
+    # The startup-replay ordering is pinned in test_startup_replay.py, which
+    # asserts all four points (sync -> snapshot -> inbound -> replay). Stating
+    # a weaker version of the same rule here would be a second copy of it.
+
+    async def test_the_router_asks_the_manager_with_the_triggers_bound(self):
+        from gateway.core.watcher_manager import RoomRef
+        from gateway.core.watcher_rule import RoomKind
+
+        mgr, connector = self._real_manager([self._rule()])
+        mgr._watcher_manager = MagicMock()
+        mgr._watcher_manager.get_or_create = AsyncMock()
+        room = RoomRef(id="r1", kind=RoomKind.CHANNEL, name="eng-backend")
+        trigger = {"_id": "m1"}
+
+        await mgr._route_unclaimed_room(room, trigger)
+
+        connector.trigger_history_bound.assert_called_once_with(trigger)
+        mgr._watcher_manager.get_or_create.assert_awaited_once_with(
+            "rc", room, history_before_ts="2026-08-16T10:00:00+00:00")
+
+
+class TestNotifyWatcherRoomTakesARoomId(unittest.IsolatedAsyncioTestCase):
+    """`notify_watcher_room` is addressed by room id and nothing else.
+
+    It used to take a watcher name and look the room up — and a scheduled job's
+    failure notice once went to whichever room had taken the handle over. The
+    class this replaces pinned a policy about records "this process never
+    loaded"; with no lookup there is no such policy to pin.
+    """
+
+    async def test_an_empty_room_id_is_refused(self):
+        mgr = _make_manager()
+
+        with self.assertRaises(ValueError):
+            await mgr.notify_watcher_room("", "hello")
+        mgr._connector.send_text.assert_not_called()
+
+    async def test_the_notice_goes_to_the_room_it_was_given(self):
+        mgr = _make_manager()
+        mgr._connector.send_text = AsyncMock()
+
+        sent = await mgr.notify_watcher_room("r1", "hello")
+
+        self.assertTrue(sent)
+        self.assertEqual(mgr._connector.send_text.call_args[0][0], "r1")
 
 
 if __name__ == "__main__":
@@ -275,13 +472,11 @@ def _make_manager_sm(connector, agent, watcher_configs=None):
     from gateway.core.session_manager import SessionManager
 
     agent_cfg = AgentConfig(timeout=10)
-    config = CoreConfig(agents={"default": agent_cfg}, default_agent="default")
+    config = CoreConfig(agents={"default": agent_cfg})
     return SessionManager(
         connector,
         {"default": agent},
-        "default",
         config,
-        watcher_configs=watcher_configs or [],
     )
 
 
@@ -315,3 +510,20 @@ class TestDispatchCommandPublic(_IsolatedTestCase2):
         self.assertIn("Unknown command", result["error"])
 
         await manager.shutdown()
+
+
+class TestTheBareSessionManagerMatchesARealOne(unittest.IsolatedAsyncioTestCase):
+    """`make_bare_session_manager` builds via `__new__`, so every field is set
+    by hand — the same drift the connector fixture test pins, on the object
+    that broke seven tests across two files when `_sweep` arrived."""
+
+    async def test_no_field_from_init_is_missing(self):
+        from tests.helpers import make_bare_session_manager, make_manager
+
+        real = make_manager()
+        missing = set(vars(real)) - set(vars(make_bare_session_manager()))
+        self.assertEqual(
+            missing, set(),
+            "fields on a real SessionManager that make_bare_session_manager "
+            "never sets — add them there, with the value __init__ gives them",
+        )

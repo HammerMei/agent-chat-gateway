@@ -2,7 +2,25 @@
 
 You can schedule recurring or one-time tasks using the `agent-chat-gateway schedule` CLI. When a user asks you to set up a recurring task, reminder, or automated job, use these commands.
 
-> **IMPORTANT — watcher name**: The `<watcher>` argument must be the **exact** watcher name from this gateway's configuration. Do NOT invent or guess a name. If you are unsure of the correct watcher name, run `agent-chat-gateway list` first to see all configured watchers, then use the name shown there.
+> **IMPORTANT — watcher name**: The `<watcher>` argument is the watcher's **runtime handle** — `<connector>:<room label>`, e.g. `rc:general` or `mm:dm:alice` — which is what your own message header identifies you as and what `agent-chat-gateway list --all` shows. It is **not** the rule name from `config.yaml`: a rule creates one watcher per room, and `schedule create` rejects a rule name. Do NOT invent or guess a handle; if you are unsure, run `agent-chat-gateway list --all` first and use one shown there.
+>
+> **Check the STATE column before scheduling.** A scheduled message is injected into the watcher's running session, so a watcher that is not running cannot receive it at that moment. This does **not** mean you should refuse — it means you should tell the user and confirm.
+>
+> | STATE | What happens to a fire |
+> |---|---|
+> | `active` | Delivered normally. |
+> | `idle` | Fine — the watcher is woken on demand. |
+> | `paused` | Skipped quietly and retried at the job's **next scheduled occurrence**. A finite job's remaining run count is **not** consumed. |
+> | `failed` | Same retry. A ⚠️ notice is posted into the room **only if the gateway loaded that watcher this run** — one whose agent was unavailable at startup never did, so its misses are silent. Do not promise the user they will be told. |
+> | not listed at all | `schedule create` is refused — a job needs a record with a room id. Tell the user to send one message in that room first, then run `agent-chat-gateway list --all` and use the handle it shows. |
+>
+> For `paused` or `failed`, say that the agent in that room is currently paused / not running, **and say when the retry would actually land** — "the next scheduled occurrence" means very different things:
+>
+> - `--every 5m --times 1` → retries every 5 minutes until it gets through.
+> - `--every 1w` → next week.
+> - `--starting "YYYY-MM-DD HH:MM"` with **no** `--every` → the same date **next year**. A one-shot anchored to a specific date that misses its slot effectively does not happen at all.
+>
+> So a reminder for a time when the watcher will be back is fine — an ops pause today and a reminder next week works exactly as intended. A one-shot whose only fire lands inside the outage is not; say so and let the user decide.
 
 ## Create a scheduled task
 
@@ -26,38 +44,38 @@ agent-chat-gateway schedule create <watcher> "<message>" [OPTIONS]
 
 ```bash
 # Remind the user in 5 minutes (one-shot relative reminder)
-agent-chat-gateway schedule create general-watcher "提醒：去喝水！" --every 5m --times 1
+agent-chat-gateway schedule create rc:general "提醒：去喝水！" --every 5m --times 1
 
 # Remind the user in 1 hour (one-shot)
-agent-chat-gateway schedule create general-watcher "Time to take a break!" --every 1h --times 1
+agent-chat-gateway schedule create rc:general "Time to take a break!" --every 1h --times 1
 
 # Run a daily standup check at 09:00, starting today
-agent-chat-gateway schedule create general-watcher "Run the daily standup summary" --every 1d --starting "09:00" --times 0
+agent-chat-gateway schedule create rc:general "Run the daily standup summary" --every 1d --starting "09:00" --times 0
 
 # Check CI status every hour, 24 times (one day)
-agent-chat-gateway schedule create ops-watcher "Check CI pipeline status" --every 1h --times 24
+agent-chat-gateway schedule create rc:ops "Check CI pipeline status" --every 1h --times 24
 
 # Weekly report every Monday at 10:00 AM
-agent-chat-gateway schedule create general-watcher "Generate the weekly report" --every 1w --starting "Mon 10:00" --times 0
+agent-chat-gateway schedule create rc:general "Generate the weekly report" --every 1w --starting "Mon 10:00" --times 0
 
 # One-time reminder at a specific date/time
-agent-chat-gateway schedule create general-watcher "Reminder: feature freeze today" --starting "2026-04-10 15:30"
+agent-chat-gateway schedule create rc:general "Reminder: feature freeze today" --starting "2026-04-10 15:30"
 
 # Monitor every 30 minutes, forever (no --tz needed for sub-hourly jobs)
-agent-chat-gateway schedule create ops-watcher "Check server health" --every 30m --times 0
+agent-chat-gateway schedule create rc:ops "Check server health" --every 30m --times 0
 
 # Daily standup at 09:00 in a specific timezone — use --tz here
-agent-chat-gateway schedule create general-watcher "Run daily standup" --every 1d --starting "09:00" --tz "America/New_York"
+agent-chat-gateway schedule create rc:general "Run daily standup" --every 1d --starting "09:00" --tz "America/New_York"
 
 # Start firing every minute, 5 times, beginning at 14:00 today
-agent-chat-gateway schedule create general-watcher "Pulse check" --every 1m --times 5 --starting "14:00"
+agent-chat-gateway schedule create rc:general "Pulse check" --every 1m --times 5 --starting "14:00"
 ```
 
 ## List scheduled tasks
 
 ```bash
 agent-chat-gateway schedule list              # Show active and paused tasks
-agent-chat-gateway schedule list --all        # Also show recently completed tasks
+agent-chat-gateway schedule list --all        # Also show recently completed or cancelled tasks
 agent-chat-gateway schedule list --connector rc-home  # Filter by connector
 ```
 
@@ -71,12 +89,12 @@ agent-chat-gateway schedule delete <job-id>   # e.g.: agent-chat-gateway schedul
 
 ```bash
 agent-chat-gateway schedule pause <job-id>    # Temporarily stop a recurring task
-agent-chat-gateway schedule resume <job-id>   # Re-enable a paused task
+agent-chat-gateway schedule resume <job-id>   # Re-enable a paused task, or restore a cancelled one
 ```
 
 ## Notes
 
-- Scheduled messages are injected directly into your agent session — they do not appear as chat messages in the room.
+- The job's **message is a prompt to you**, delivered into your own session when the job fires, with the header `from: scheduler | … | to: me`. The prompt itself is never shown in the room — **your reply is what gets posted**. So write the message as an instruction to yourself ("Post one computer part with a one-line fact"), not as the finished text you want to appear; a message that already reads as the announcement gives you nothing to add, and answering it with `<end-of-agent-chain>` posts nothing at all, every run.
 - The minimum scheduling interval is 1 minute.
 - Job IDs look like `acg-a3f2b1c0`. Use `agent-chat-gateway schedule list` to find a job's ID.
 - If the gateway is restarted, any jobs missed during downtime will be fired immediately on startup.

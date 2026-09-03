@@ -66,7 +66,7 @@ def _config_text(work_dir: Path) -> str:
           - name: rc
             type: rocketchat
             server: {{url: "http://localhost:3000", username: bot, password: pw}}
-        watchers:
+        watcher_rules:
           - connector: rc
             agent: agent-a
             room: general

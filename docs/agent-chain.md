@@ -315,7 +315,7 @@ If an agent reaches the final turn but the task isn't done, encourage it to sche
 
 ```
 Prompt:
-  "If you need to continue, use: agent-chat-gateway schedule create general-watcher 
+  "If you need to continue, use: agent-chat-gateway schedule create rc:general 
    'Continue the X task' --every 1h --times 1"
 ```
 

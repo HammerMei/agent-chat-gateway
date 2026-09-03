@@ -6,7 +6,6 @@ Responsibilities after decomposition:
   - Queue orchestration (enqueue / consumer loop)
   - Lifecycle (start / stop / _stopping gate)
   - Session-map updates (role, permission thread)
-  - Online/offline notifications
   - Anonymous user rejection
 
 Delegated to extracted collaborators:
@@ -18,6 +17,7 @@ Delegated to extracted collaborators:
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import logging
 from typing import TYPE_CHECKING
 
@@ -27,11 +27,12 @@ from .agent_chain import build_agent_chain_context
 from .agent_turn_runner import AgentTurnRunner, _user_facing_agent_error_message
 from .attachment_workspace import localize_attachment_paths
 from .config import CoreConfig, WatcherConfig
-from .connector import Attachment, Connector, IncomingMessage, Room, UserRole
+from .connector import Attachment, Connector, IncomingMessage, Room, UserRole, is_scheduled_message
 from .injected_context_builder import InjectedContextBuilder
+from .paths import watcher_prompt_key
 from .prompt_builder import build_catchup_prompt, build_prompt
 from .session_maps import SessionMaps
-from .state import WatcherState
+from .state import WatcherState, now_iso
 
 if TYPE_CHECKING:
     from .permission import PermissionRegistry
@@ -75,8 +76,6 @@ class MessageProcessor:
         watcher_state: WatcherState | None = None,
         watcher_config: WatcherConfig | None = None,
         connector_name: str = "",
-        online_notification: str | None = "✅ _Agent online_",
-        offline_notification: str | None = "❌ _Agent offline_",
         attachment_local_base: str | None = None,
         append_system_prompt_file: str | None = None,
     ) -> None:
@@ -96,8 +95,6 @@ class MessageProcessor:
         self._watcher_state = watcher_state
         self._watcher_config = watcher_config
         self._connector_name = connector_name
-        self._online_notification = online_notification
-        self._offline_notification = offline_notification
         self._attachment_local_base = attachment_local_base
         # Path to re-supply on every turn via AgentBackend.send()/.stream()'s
         # append_system_prompt_file kwarg (e.g. Claude's
@@ -117,7 +114,6 @@ class MessageProcessor:
             maxsize=self._config.max_queue_depth or 0
         )
         self._task: asyncio.Task | None = None
-        self._notify_task: asyncio.Task | None = None
         # Track short-lived fire-and-forget tasks (e.g. queue-full notifications)
         # so they can be awaited/cancelled during stop() and don't float free.
         self._background_tasks: set[asyncio.Task] = set()
@@ -127,6 +123,8 @@ class MessageProcessor:
         #   draining → enqueue() rejects, consumer finishes queued messages then exits
         #   stopped  → everything halted
         self._state: str = "running"  # "running" | "draining" | "stopped"
+        # True while the consumer loop is inside a turn — see has_work_in_flight.
+        self._turn_in_flight: bool = False
         # Event set when the consumer finishes draining (or is forced to stop).
         self._drained = asyncio.Event()
         # Cooldown for queue-full notifications to prevent spam storms.
@@ -136,11 +134,10 @@ class MessageProcessor:
     # ── Lifecycle ─────────────────────────────────────────────────────────────
 
     def start(self) -> None:
-        """Start the consumer task and post an online notification."""
+        """Start the consumer task."""
         self._task = asyncio.create_task(
             self._run(), name=f"processor-{self._watcher_id[:8]}"
         )
-        self._notify_task = asyncio.create_task(self._notify_online())
         logger.info(
             "MessageProcessor started: watcher=%s room=%s session=%s agent=%s cwd=%s",
             self._watcher_id[:8],
@@ -159,12 +156,10 @@ class MessageProcessor:
           3. Wait for the consumer to finish processing all already-queued messages
              (up to ``drain_timeout`` seconds).  If the timeout expires, the consumer
              task is force-cancelled — queued messages may be lost in this case.
-          4. Post offline notification — only after drain so users never see
-             "offline" followed by residual replies from queued work.
-          5. Cancel and await any in-flight background tasks.
-          6. Transition to ``stopped``.
+          4. Cancel and await any in-flight background tasks.
+          5. Transition to ``stopped``.
 
-        Draining matters for user-visible ordering (point 4) and for not losing
+        Draining matters for not losing
         queued work — but note it does **not** affect the persisted watermark.
         Both connectors advance their watermark when a message is *accepted into
         the queue*, not when it is handled, so draining never moves it.
@@ -183,13 +178,6 @@ class MessageProcessor:
         # Phase 1: stop accepting new messages.
         self._state = "draining"
 
-        if self._notify_task:
-            self._notify_task.cancel()
-            try:
-                await self._notify_task
-            except asyncio.CancelledError:
-                pass
-            self._notify_task = None
 
         # Phase 2: wake the consumer (if blocked on empty queue) and wait for drain.
         if self._task:
@@ -216,10 +204,6 @@ class MessageProcessor:
                 pass
             self._task = None
 
-        # Post offline notification only after drain — users never see "offline"
-        # followed by residual replies from still-draining queued work.
-        await self._notify_offline()
-
         # Phase 3: clean up background tasks.
         for task in list(self._background_tasks):
             task.cancel()
@@ -231,9 +215,31 @@ class MessageProcessor:
         logger.info("MessageProcessor stopped: watcher=%s", self._watcher_id[:8])
 
     @property
+    def watcher_id(self) -> str:
+        """Which watcher this processor belongs to.
+
+        Public because the dispatcher has to tell "this watcher is registering again"
+        from "a second watcher wants the same room" (§4.1), and identity of the
+        *object* cannot: a restart builds a new processor for the same watcher.
+        """
+        return self._watcher_id
+
+    @property
     def is_accepting(self) -> bool:
         """True if the processor is running and has queue capacity."""
         return self._state == "running" and not self._queue.full()
+
+    @property
+    def has_work_in_flight(self) -> bool:
+        """A turn is running or messages are queued — accepted work not yet done.
+
+        The idle sweep's busy gate (§2.5): a room must not be dropped
+        mid-conversation, and `last_activity_at` alone cannot say so — it is
+        stamped at *acceptance*, so a turn still running reads as old activity.
+        The pending-permission half of that gate lives with the sweep, which
+        holds the registry; this property answers only for the processor.
+        """
+        return self._turn_in_flight or not self._queue.empty()
 
     # ── Inbound ───────────────────────────────────────────────────────────────
 
@@ -241,7 +247,7 @@ class MessageProcessor:
         """Called by MessageDispatcher when a message arrives.
 
         Permission commands (approve/deny) are already intercepted at the
-        Dispatcher level before fan-out, so this method only handles
+        Dispatcher level before routing, so this method only handles
         normal message queueing.
 
         Returns:
@@ -259,6 +265,19 @@ class MessageProcessor:
             return False
         try:
             self._queue.put_nowait(msg)
+            # The idle clock (§2.5), advanced on *accepted* work only — a refused
+            # message is not activity, and counting it would keep a room the
+            # gateway is dropping messages for alive forever. The clock's one
+            # ADVANCING write site: inbound and scheduled injection both funnel
+            # through this method, so the two cannot drift. (Creation initializes
+            # the field — a birth stamp, not an advance — and recreation carries
+            # it untouched: a restart is not activity.) In memory only, persisted
+            # at the existing save points — a per-message disk write is the cost
+            # §2.2 explicitly rejects — and a crash that loses the advance idles
+            # the room *early*, which is the safe direction: its next message
+            # wakes it and the same session resumes.
+            if self._watcher_state is not None:
+                self._watcher_state.last_activity_at = now_iso()
             return True
         except asyncio.QueueFull:
             logger.warning(
@@ -331,6 +350,7 @@ class MessageProcessor:
                         break
                     batch.append(extra)
 
+                self._turn_in_flight = True
                 try:
                     if len(batch) == 1:
                         await self._process(batch[0])
@@ -340,6 +360,8 @@ class MessageProcessor:
                     raise
                 except Exception:
                     logger.exception("Unhandled error in processor loop")
+                finally:
+                    self._turn_in_flight = False
                 # After each turn, check if we should exit (drain mode + empty).
                 if self._state == "draining" and self._queue.empty():
                     break
@@ -437,6 +459,7 @@ class MessageProcessor:
             is_agent_chain=is_agent_chain,
             agent_chain_context=agent_chain_context,
             append_system_prompt_file=self._append_system_prompt_file,
+            is_scheduled=is_scheduled_message(msg),
         )
 
     async def _process_batch(self, batch: list[IncomingMessage]) -> None:
@@ -568,7 +591,73 @@ class MessageProcessor:
             is_agent_chain=is_agent_chain,
             agent_chain_context=agent_chain_context,
             append_system_prompt_file=self._append_system_prompt_file,
+            is_scheduled=is_scheduled_message(anchor),
         )
+
+    async def rename(self, handle: str, *, room_name: str) -> None:
+        """The room was renamed; take the new handle and re-issue the identity header.
+
+        The handle is display data, but it is display data the AGENT reads: the
+        "ACG Session Identity" block names the watcher and the room (from
+        `_watcher_config`), and it is handed to the backend on every turn, so a
+        stale one sends the agent's own `schedule create` at a name that no
+        longer resolves — or, once the platform reuses it, at another room
+        (Codex, PR #140). The processor's own `watcher_id` is the room id and
+        does not move. The durable file
+        is rewritten under the same room-keyed path (`watcher_prompt_key` no
+        longer includes the handle), so the path the session was started with
+        stays valid and the next turn reads the new content.
+
+        Raises whatever the backend raises; the lifecycle logs and moves on —
+        the processor's own context-injection retry re-issues the header later.
+        """
+        # NOT `self._watcher_id`: that is the processor's identity, and it is the
+        # ROOM ID (`_start_watcher` passes `watcher_id=room.id`) — the dispatcher
+        # compares it to decide whether a replacement processor is the same
+        # watcher's. Overwriting it with the handle made the next restart of
+        # this room's processor look like another watcher's claim and be
+        # refused. The handle lives in `_watcher_config.name`, which is what the
+        # identity header reads.
+        self._room = Room(id=self._room.id, name=room_name, type=self._room.type)
+        if self._watcher_config is not None:
+            self._watcher_config = dataclasses.replace(
+                self._watcher_config, name=handle, room=room_name)
+        if self._context_injector is None or self._watcher_config is None:
+            return
+        content = await self._context_injector.build(
+            self._agent_name,
+            self._connector_name,
+            self._watcher_config,
+            agent_username=self._connector.agent_username,
+        )
+        try:
+            to_repeat = await self._agent.ensure_durable_instructions(
+                self._session_id,
+                self._working_directory,
+                self._config.timeout_for(self._agent_name),
+                content,
+                path_key=watcher_prompt_key(self._connector_name, self._room.id),
+                # A rename IS a re-delivery: the agent must learn the new handle,
+                # so a backend that delivers by sending (OpenCode) sends again.
+                # Claude rewrites the file regardless. Required keyword — the
+                # first version omitted it, every rename raised TypeError into
+                # the lifecycle's catch, and the header never changed (Codex,
+                # PR #140).
+                already_delivered=False,
+            )
+        except Exception:
+            # Arm the retry `_ensure_context_injected` runs on the next message:
+            # it returns at once while `context_injected` is set and the
+            # injector's status says done, so without this the old header
+            # would stand for the watcher's lifetime while the log promised a
+            # retry (Codex, PR #140). The renamed config is already in place,
+            # so that retry builds the new header.
+            if self._watcher_state is not None:
+                self._watcher_state.context_injected = False
+            self._context_injector.reset_session(self._session_id)
+            raise
+        if to_repeat is not None:
+            self._append_system_prompt_file = to_repeat
 
     async def _ensure_context_injected(self) -> None:
         """Retry durable-context delivery on message processing when appropriate.
@@ -623,29 +712,11 @@ class MessageProcessor:
             self._working_directory,
             self._config.timeout_for(self._agent_name),
             watcher_name=self._watcher_id,
+            # Must be the SAME key the watcher start used, or the retry would write a
+            # second file. Derived here rather than threaded down from the caller so the
+            # two sites cannot drift apart — the derivation is the single source.
+            path_key=watcher_prompt_key(self._connector_name, self._room.id),
             content=content,
         )
         if to_repeat is not None:
             self._append_system_prompt_file = to_repeat
-
-    # ── Notifications ─────────────────────────────────────────────────────────
-
-    async def _notify_online(self) -> None:
-        if self._online_notification is None:
-            return
-        try:
-            await self._connector.notify_online(
-                self._room.id, self._online_notification
-            )
-        except Exception as e:
-            logger.warning("Failed to post online notification: %s", e)
-
-    async def _notify_offline(self) -> None:
-        if self._offline_notification is None:
-            return
-        try:
-            await self._connector.notify_offline(
-                self._room.id, self._offline_notification
-            )
-        except Exception as e:
-            logger.warning("Failed to post offline notification: %s", e)

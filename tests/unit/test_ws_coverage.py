@@ -8,7 +8,7 @@ Targets the uncovered branches identified in the coverage report:
   - _handle_room_message: empty args, missing room_id, no callback, dead-worker
   - _room_worker: no callback after dequeue, generic exception
   - _ping_loop: CancelledError re-raise, generic exception swallowed
-  - _reconnect: cancels old _resubscribe_task before starting new one
+  - _reconnect: cancels old _recovery_task before starting new one
   - stop(): tasks already done (None guard)
 """
 
@@ -308,7 +308,7 @@ class TestHandleRoomMessage(unittest.IsolatedAsyncioTestCase):
 
         # Also put an old queue with a pending item (to trigger warning log)
         old_q: asyncio.Queue = asyncio.Queue()
-        old_q.put_nowait({"old": "msg"})
+        old_q.put_nowait(({"old": "msg"}, None))
         client._room_queues[room_id] = old_q
 
         msg = self._make_msg(args=[{"rid": room_id, "text": "hi"}], rid=room_id)
@@ -343,7 +343,7 @@ class TestRoomWorker(unittest.IsolatedAsyncioTestCase):
         client = _make_client()
         room_id = "room-x"
         q: asyncio.Queue = asyncio.Queue()
-        q.put_nowait({"_id": "msg-1"})
+        q.put_nowait(({"_id": "msg-1"}, None))
 
         # No callback registered for this room
         task = asyncio.create_task(client._room_worker(room_id, q))
@@ -368,7 +368,7 @@ class TestRoomWorker(unittest.IsolatedAsyncioTestCase):
         client._callbacks[room_id] = _bad_callback
 
         q: asyncio.Queue = asyncio.Queue()
-        q.put_nowait({"_id": "msg-2"})
+        q.put_nowait(({"_id": "msg-2"}, None))
 
         task = asyncio.create_task(client._room_worker(room_id, q))
         await asyncio.sleep(0)  # let worker process the message
@@ -381,7 +381,7 @@ class TestRoomWorker(unittest.IsolatedAsyncioTestCase):
             client2 = _make_client()
             client2._callbacks[room_id] = _bad_callback
             q2: asyncio.Queue = asyncio.Queue()
-            q2.put_nowait({"_id": "msg-3"})
+            q2.put_nowait(({"_id": "msg-3"}, None))
             task2 = asyncio.create_task(client2._room_worker(room_id, q2))
             await asyncio.sleep(0.05)
             task2.cancel()
@@ -405,7 +405,7 @@ class TestRoomWorker(unittest.IsolatedAsyncioTestCase):
         client._callbacks[room_id] = _exploding_callback
 
         q: asyncio.Queue = asyncio.Queue()
-        q.put_nowait({"_id": "x"})
+        q.put_nowait(({"_id": "x"}, None))
 
         with patch(
             "gateway.connectors.rocketchat.websocket.logger"
@@ -466,8 +466,8 @@ class TestPingLoop(unittest.IsolatedAsyncioTestCase):
 
 
 class TestReconnect(unittest.IsolatedAsyncioTestCase):
-    async def test_cancels_old_resubscribe_task(self):
-        """_reconnect must cancel an in-progress _resubscribe_task before creating a new one."""
+    async def test_cancels_old_recovery_task(self):
+        """_reconnect must cancel an in-progress _recovery_task before creating a new one."""
         client = _make_client()
         client._reconnect_delay = 0  # no real sleep
 
@@ -483,7 +483,7 @@ class TestReconnect(unittest.IsolatedAsyncioTestCase):
                 raise
 
         old_task = asyncio.create_task(_long_resubscribe())
-        client._resubscribe_task = old_task
+        client._recovery_task = old_task
 
         async def _fake_connect():
             pass
@@ -494,6 +494,13 @@ class TestReconnect(unittest.IsolatedAsyncioTestCase):
         with patch.object(client, "connect", side_effect=_fake_connect):
             with patch("asyncio.sleep"):
                 await client._reconnect()
+
+        # One turn, because nobody awaits this one: a recovery that has a replacement is
+        # awaited by it, and with nothing to recover there is no replacement to do the
+        # awaiting. The cancellation is still delivered on the next loop iteration, and
+        # `stop()` drains the task either way — the intent under test is that a reconnect
+        # retires the previous recovery, not that it blocks until it unwinds.
+        await asyncio.sleep(0)
 
         self.assertTrue(old_task.cancelled() or cancelled)
 
@@ -508,7 +515,7 @@ class TestStopNoneGuard(unittest.IsolatedAsyncioTestCase):
         client._running = True
         client._ping_task = None
         client._listen_task = None
-        client._resubscribe_task = None
+        client._recovery_task = None
 
         # Should not raise
         await client.stop()
@@ -548,6 +555,8 @@ class TestHandlerSendBusy(unittest.IsolatedAsyncioTestCase):
 
         connector = RocketChatConnector.__new__(RocketChatConnector)
         connector._rest = MagicMock()
+        # Pre-login: agent_username falls back to the configured spelling.
+        connector._rest.bot_username = None
         connector._rest.post_message = AsyncMock()
         return connector
 

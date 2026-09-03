@@ -30,8 +30,6 @@ class _MockAgent(AgentBackend):
 
 def _make_processor() -> tuple[MessageProcessor, MagicMock]:
     connector = MagicMock()
-    connector.notify_online = AsyncMock()
-    connector.notify_offline = AsyncMock()
     connector.send_text = AsyncMock()
     connector.notify_typing = AsyncMock()
     connector.notify_agent_event = AsyncMock()
@@ -40,7 +38,6 @@ def _make_processor() -> tuple[MessageProcessor, MagicMock]:
 
     config = CoreConfig(
         agents={"default": AgentConfig(timeout=10)},
-        default_agent="default",
     )
     room = Room(id="room_1", name="test-room", type="channel")
     processor = MessageProcessor(
@@ -179,3 +176,48 @@ class TestMessageProcessorAgentChain(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestTheProcessorTellsTheRunnerWhenATurnIsScheduled(unittest.IsolatedAsyncioTestCase):
+    """`run_turn(is_scheduled=...)` is derived from the triggering message's
+    sender, so the runner can warn when a scheduled prompt gets a silent reply.
+    Pinned at the seam: a processor that stopped passing it would silently
+    demote that WARNING back to the INFO line nobody correlated."""
+
+    def _msg(self, sender):
+        from gateway.core.connector import IncomingMessage, Room, UserRole
+
+        return IncomingMessage(
+            id="msg_1", timestamp="3000",
+            room=Room(id="room_1", name="test-room", type="channel"),
+            sender=sender, role=UserRole.OWNER, text="🖥️ Computer Part of the Minute",
+            attachments=[], warnings=[], thread_id=None, raw={},
+        )
+
+    async def _captured_for(self, sender) -> dict:
+        processor, _connector = _make_processor()
+        captured: dict = {}
+
+        async def _capture_run_turn(**kw):
+            captured.update(kw)
+            return False
+
+        with patch.object(processor._turn_runner, "run_turn", new=_capture_run_turn):
+            await processor._process(self._msg(sender))
+        return captured
+
+    async def test_a_scheduler_sent_message_is_flagged(self):
+        from gateway.core.connector import SCHEDULER_SENDER_ID, User
+
+        captured = await self._captured_for(
+            User(id=SCHEDULER_SENDER_ID, username=SCHEDULER_SENDER_ID, display_name="Scheduler"))
+
+        self.assertIs(captured.get("is_scheduled"), True)
+
+    async def test_a_persons_message_is_not(self):
+        from gateway.core.connector import User
+
+        captured = await self._captured_for(User(id="u1", username="alice", display_name="Alice"))
+
+        self.assertIs(captured.get("is_scheduled"), False)
+

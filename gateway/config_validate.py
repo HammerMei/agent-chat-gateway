@@ -20,7 +20,7 @@ adds two things `from_file` alone cannot catch, plus an optional lint pass:
    duplicate a value already inherited from the entry's own ``inherits:``
    template — noise that can be deleted without changing behavior.
 
-Used by the ``acg config validate`` CLI command; written as a plain function
+Used by the ``agent-chat-gateway config validate`` CLI command; written as a plain function
 (not a CLI-only code path) so a future config-editing tool can reuse the same
 save-time check.
 """
@@ -38,11 +38,29 @@ from .config import (
     GatewayConfig,
     _parse_templates_block,
     collect_config,
+    find_shadowed_rules,
 )
 from .connectors.mattermost.config import MattermostConfig
 from .connectors.rocketchat.config import RocketChatConfig
 from .connectors.voice.config import VoiceConfig
-from .core.state import load_state
+from .core.bot_identity import (
+    BotIdentity,
+    ConnectorIdentity,
+    DmClaim,
+    canonical_origin,
+    dm_claims,
+    find_identity_conflicts,
+)
+from .core.connector import SUPPORTED_CONNECTOR_TYPES
+from .core.state import (
+    DuplicateSessionError,
+    StateFormatError,
+    backend_identity,
+    check_session_uniqueness,
+    connector_name_of,
+    load_state,
+    state_files,
+)
 
 # Connector types validated via their own dataclass parser. 'script' is
 # intentionally omitted — ScriptConnector never reads ConnectorConfig.raw
@@ -65,9 +83,6 @@ _AGENT_LINT_DEFAULTS: list[tuple[str, object]] = [
 ]
 _WATCHER_LINT_DEFAULTS: list[tuple[str, object]] = [
     ("context_inject_files", []),
-    ("online_notification", None),
-    ("offline_notification", None),
-    ("session_id", None),
 ]
 _CONNECTOR_LINT_DEFAULTS: list[tuple[str, object]] = [
     ("reply_in_thread", False),
@@ -82,7 +97,7 @@ class Finding:
 
     Additive alongside ValidationResult's flat string lists (errors/
     warnings/lint_findings), which remain the source of truth for
-    `acg config validate`'s CLI output — this exists so the config TUI can
+    `agent-chat-gateway config validate`'s CLI output — this exists so the config TUI can
     attach a finding to the right row/screen without re-parsing message
     text. Not every finding can be attributed this precisely: a
     GatewayConfig.from_file load failure (bad structure, unknown reference,
@@ -147,7 +162,9 @@ def validate_config(config_path: str, lint: bool = False) -> ValidationResult:
     if config is None:
         return result
 
-    result.watcher_count = len(config.watchers)
+    # Rules are the only watcher shape after cutover; `config.watchers` is
+    # always empty (the static list died with its parser).
+    result.watcher_count = len(config.watcher_rules)
 
     try:
         with open(config_path) as f:
@@ -160,14 +177,122 @@ def validate_config(config_path: str, lint: bool = False) -> ValidationResult:
         )
         return result
 
-    result.entry_count = len(raw.get("watchers") or [])
+    # isinstance, not truthiness: `watchers: 5` parses fine and reaches here
+    # (collect_config tolerates it into a ConfigIssue + an empty rule list),
+    # and `len(5)` raised a TypeError out of the one function whose whole
+    # contract is collecting problems instead of raising them — crashing
+    # both `agent-chat-gateway config validate` and the TUI's banner (Codex review of #129).
+    raw_watchers = raw.get("watcher_rules")
+    result.entry_count = len(raw_watchers) if isinstance(raw_watchers, list) else 0
 
     _check_connectors(config, result)
     _check_state_orphans(config, result)
+    _check_session_uniqueness(result)
+    _check_shadowed_rules(config, result)
+    _check_declared_bot_accounts(config, result)
     if lint:
         _lint_config(raw, result)
 
     return result
+
+
+# Plain-language halves of the sentence built below. The old wording leaned on
+# "reach" as a noun and on "first-match precedence", which asked the reader to
+# know the matching model before they could act on the warning.
+# Each phrase carries its own verb so the sentence below needs none — the first
+# attempt left "every room it would serve ARE already taken" for one scope and
+# correct grammar for the others.
+_SHADOW_SCOPE_WORDING = {
+    "rule": "will never be used, because every room it would serve is already handled by",
+    "named": "will never match a room by name, because the names it lists are already handled by",
+    "direct": "will never see one-to-one direct messages, because those are already handled by",
+    "group_direct": "will never see group direct messages, because those are already handled by",
+}
+
+
+def _check_shadowed_rules(config: GatewayConfig, result: ValidationResult) -> None:
+    """Warn about rule reaches an earlier rule already claims.
+
+    Warnings, not errors: under first-match precedence a shadowed rule is dead
+    config — nearly always a mistake in ordering — but the config is coherent and
+    the daemon starts fine, so refusing to load would be wrong.
+
+    This lives here rather than in the loader for two reasons. `from_file()` is
+    fail-fast and has no warning channel at all, and `collect_config()`'s
+    `ConfigIssue` is documented as "a from_file()-would-have-raised problem" and is
+    converted to severity="error" unconditionally above — riding it would report
+    dead-but-legal config as a load failure. `validate_config()` already emits
+    warnings, and is what both `agent-chat-gateway config validate` and the config TUI's banner
+    read.
+
+    Nothing warns at daemon startup, because until the watcher manager lands
+    nothing consumes rules, so there is no behaviour for a shadowed rule to affect.
+    """
+    for finding in find_shadowed_rules(config.watcher_rules):
+        detail = _SHADOW_SCOPE_WORDING.get(
+            finding.scope, f"overlaps '{finding.scope}' with"
+        )
+        msg = (
+            f"Watcher rule '{finding.rule.name}' {detail} "
+            f"'{finding.shadowed_by.name}', which is listed above it. Entries are "
+            "checked in order and the first one that matches a room handles it — "
+            f"so move '{finding.rule.name}' above '{finding.shadowed_by.name}', or "
+            f"narrow '{finding.shadowed_by.name}' so it leaves those rooms alone."
+        )
+        result.warnings.append(msg)
+        result.findings.append(
+            Finding("warning", "watcher", finding.rule.name, "rooms", msg)
+        )
+
+
+def _check_declared_bot_accounts(config: GatewayConfig, result: ValidationResult) -> None:
+    """Catch a shared bot account here when config actually declares one (§4.5).
+
+    An optimisation on the runtime barrier in `GatewayService`, never a replacement,
+    and the split is not arbitrary: Mattermost token auth leaves `username` empty and
+    two different tokens can authenticate one account, so config *cannot* decide this
+    in general. What it can do is spot the obvious case — two connectors naming one
+    server and one username — before the operator restarts the daemon to find out.
+
+    It calls `find_identity_conflicts` rather than restating the rule, so the team
+    exception and the single-DM-owner condition cannot drift between the two callers.
+
+    Its blind spots all point the same way, which is the safe one: a connector
+    authenticating by token contributes nothing to compare, and two Mattermost
+    connectors spelling one team as a name and as an id read as different scopes. Both
+    are missed duplicates that the runtime check still catches — never a rejection of a
+    configuration that would have worked.
+    """
+    claims = dm_claims(config.watcher_rules)
+    declared: list[ConnectorIdentity] = []
+    for connector in config.connectors:
+        validator = _CONNECTOR_VALIDATORS.get(connector.type)
+        if validator is None:
+            continue
+        try:
+            cfg = validator(connector)
+        except ValueError:
+            continue  # already reported, with a better message, by _check_connectors
+        username = getattr(cfg, "username", "")
+        server_url = getattr(cfg, "server_url", "")
+        if not username or not server_url:
+            continue  # nothing declared to compare
+        declared.append(
+            ConnectorIdentity(
+                connector_name=connector.name,
+                identity=BotIdentity(
+                    platform=connector.type,
+                    origin=canonical_origin(server_url),
+                    user_id=username,
+                    scope=getattr(cfg, "team", ""),
+                ),
+                dms=claims.get(connector.name, DmClaim()),
+            )
+        )
+
+    for msg in find_identity_conflicts(declared):
+        result.errors.append(msg)
+        result.findings.append(Finding("error", "connector", None, None, msg))
 
 
 def _looks_like_url(value: str) -> bool:
@@ -178,11 +303,46 @@ def _looks_like_url(value: str) -> bool:
     return bool(parsed.scheme) and bool(parsed.netloc)
 
 
+
+def _closest_type(written: str) -> str | None:
+    """The supported type a misspelling most likely meant, or None.
+
+    Deliberately crude — `difflib` with a high cutoff. It exists to turn "not a
+    known type" into "you dropped a letter", which is the difference between a
+    reader checking the docs and a reader fixing the line. A wrong guess costs
+    nothing: the valid list is printed either way.
+    """
+    import difflib
+
+    matches = difflib.get_close_matches(
+        written.lower(), SUPPORTED_CONNECTOR_TYPES, n=1, cutoff=0.7
+    )
+    return matches[0] if matches else None
+
+
 def _check_connectors(config: GatewayConfig, result: ValidationResult) -> None:
     """Instantiate each connector's own config dataclass and flag empty
     credentials — fields from_connector_config defaults to "" rather than
     validating."""
     for connector in config.connectors:
+        # An unrecognised type used to be skipped in silence here, so a
+        # misspelling like 'mattrmost' either passed validation outright or
+        # surfaced as an unrelated complaint about 'rooms.direct' from the
+        # literal-rooms check. Name the real problem instead: the type.
+        if connector.type not in SUPPORTED_CONNECTOR_TYPES:
+            supported = ", ".join(f"'{t}'" for t in SUPPORTED_CONNECTOR_TYPES)
+            hint = _closest_type(connector.type)
+            msg = (
+                f"Connector '{connector.name}': '{connector.type}' is not a chat "
+                f"platform this gateway knows. Change 'type' to one of: {supported}."
+                + (f" Did you mean '{hint}'?" if hint else "")
+            )
+            result.errors.append(msg)
+            result.findings.append(
+                Finding("error", "connector", connector.name, "type", msg)
+            )
+            continue
+
         validator = _CONNECTOR_VALIDATORS.get(connector.type)
         if validator is None:
             continue
@@ -231,32 +391,178 @@ def _check_connectors(config: GatewayConfig, result: ValidationResult) -> None:
                 _empty_field("server.team")
 
 
+def _check_session_uniqueness(result: ValidationResult) -> None:
+    """Report the state-file condition that now refuses to boot the daemon.
+
+    `GatewayService` runs `check_session_uniqueness()` before anything is built, so a
+    state file binding one session to two rooms stops the daemon. Adding that refusal
+    without teaching this command about it would have left `agent-chat-gateway config validate`
+    reporting success on exactly the fault it exists to find first — the operator's only
+    way to learn about it would be a failed start.
+
+    Attributed globally: the fault is a pair of records in a state file, not a config
+    entry, so there is no row to mark. The check reads the same files
+    `_check_state_orphans` already looks at.
+    """
+    try:
+        check_session_uniqueness()
+    except DuplicateSessionError as exc:
+        result.errors.append(str(exc))
+        result.findings.append(Finding("error", "global", None, None, str(exc)))
+    except StateFormatError:
+        # Deliberately not reported here. `_check_state_orphans` runs immediately before
+        # this and already loads every state file, reporting the same error with the same
+        # global attribution — catching it again printed each format failure twice and
+        # inflated the error count. Swallowed rather than re-raised so an unreadable file
+        # does not abort a run that has more to say.
+        return
+    except OSError:
+        # Same dedup reasoning as StateFormatError above, for the enumeration
+        # failure: check_session_uniqueness() re-enumerates via state_files(),
+        # whose ensure_runtime_dir() raises on an uncreatable/unlistable
+        # runtime dir — the exact fault `_check_state_orphans` (which runs
+        # immediately before this) already collected as its own warning.
+        # Codex review of #129, round 3: the round-2 guard covered only the
+        # orphan check's call, so this second call still crashed validation
+        # on the same broken directory.
+        return
+
+
 def _check_state_orphans(config: GatewayConfig, result: ValidationResult) -> None:
-    """Warn when a connector's persisted state.<connector>.json references a
-    watcher name no longer present in the (expanded) config."""
-    configured_by_connector: dict[str, set[str]] = {}
-    for w in config.watchers:
-        configured_by_connector.setdefault(w.connector, set()).add(w.name)
+    """Warn when a connector's persisted state carries records the next boot
+    will prune.
+
+    After cutover the orphan test is the record's own shape, not a config
+    lookup: a rule-derived record (`rule_name` set) is never an orphan — its
+    recreation source is the record itself (§2.4), and "absent from config"
+    is its normal state — while a static-era record has no config entry left
+    to own it and is pruned at the next start, per the clean-break migration
+    ruling."""
+    # Checked over the files on disk, not over config.connectors: a connector renamed
+    # or removed in config.yaml leaves its state file behind, and only iterating
+    # configured connectors would never open it — so an unreadable file belonging to a
+    # since-renamed connector would pass validation and then be abandoned silently at
+    # startup, which is the failure the refusal exists to prevent.
+    configured = {c.name for c in config.connectors}
+    # The enumeration itself can raise before any per-file try is entered —
+    # state_files() calls ensure_runtime_dir(), which fails when the runtime
+    # dir cannot be created or listed (a file squatting on the path, a
+    # read-only $HOME). Collected as a warning rather than raised: this
+    # function's whole contract is reporting problems, not crashing on them
+    # (Codex review of #129 — same contract the entry_count fix restored).
+    try:
+        persisted = state_files()
+    except OSError as exc:
+        msg = f"Could not enumerate persisted state files: {exc}"
+        result.warnings.append(msg)
+        result.findings.append(Finding("warning", "global", None, None, msg))
+        persisted = []
+    for path in persisted:
+        file_connector = connector_name_of(path)
+        try:
+            states = load_state(file_connector)
+        except StateFormatError as exc:
+            msg = str(exc)
+            result.errors.append(msg)
+            result.findings.append(
+                Finding("error", "global", None, None, msg)
+            )
+            continue
+        except Exception:
+            # Handled inside load_state by starting fresh; nothing to report.
+            continue
+        if file_connector not in configured and states:
+            # A state file whose connector was renamed or removed (Codex round
+            # 4): its records are valid but no SessionManager will ever
+            # hydrate them — the loop below iterates configured connectors
+            # only, so without this the file's sessions are abandoned with no
+            # warning anywhere. Only files that actually carry records are
+            # reported; an empty leftover file is noise.
+            msg = (
+                f"State file '{path.name}' belongs to connector "
+                f"'{file_connector}', which is not in config.yaml. Its "
+                f"{len(states)} saved watcher(s) are being ignored — nothing "
+                "reads that file, and nothing deletes it either, so their "
+                f"sessions are left unused. Add '{file_connector}' back to "
+                "config.yaml to use them again, or delete the file yourself "
+                "if you do not want them."
+            )
+            result.warnings.append(msg)
+            result.findings.append(
+                Finding("warning", "global", None, None, msg)
+            )
 
     for connector in config.connectors:
         try:
             states = load_state(connector.name)
-        except Exception:
+        except StateFormatError:
+            # Already reported above, against the file rather than the connector.
             continue
-        configured = configured_by_connector.get(connector.name, set())
+        except Exception:
+            # Anything else (unreadable file, malformed JSON) is handled inside
+            # load_state by starting fresh, so reaching here means something
+            # unexpected — skip this connector's orphan check rather than failing the
+            # whole validation over it.
+            continue
         for st in states:
-            if st.watcher_name not in configured:
-                msg = (
-                    f"Connector '{connector.name}': state.json has watcher "
-                    f"'{st.watcher_name}' with no matching entry in this config — "
-                    "its session/pause state will be dropped on next start. "
-                    "Restore the old watcher name (e.g. an explicit 'name:') "
-                    "if you want to keep it."
-                )
-                result.warnings.append(msg)
-                result.findings.append(
-                    Finding("warning", "connector", connector.name, None, msg)
-                )
+            if st.rule_name or st.config:
+                # Same both-fields prune test as sync_watchers (Codex round
+                # 22): a materialized config alone is enough for sticky
+                # recreation, so such a record is NOT pruned and must not be
+                # warned about as static-era.
+                # The record-vs-agent divergences (matrix sweep after Codex
+                # round 6): the runtime is fail-closed and loud about both,
+                # but only AFTER the restart — this command's job is to say
+                # it before.
+                if st.agent and st.agent not in config.agents:
+                    msg = (
+                        f"Connector '{connector.name}': watcher "
+                        f"'{st.watcher_name}' uses agent '{st.agent}', which "
+                        f"is not in config.yaml. This watcher will not start "
+                        f"and will show as failed. Either add '{st.agent}' "
+                        f"back to config.yaml, or give up the room with "
+                        f"'expire {st.watcher_name}'."
+                    )
+                    result.warnings.append(msg)
+                    result.findings.append(
+                        Finding("warning", "connector", connector.name, None, msg)
+                    )
+                elif st.agent and st.session_id and st.backend_identity:
+                    agent_cfg = config.agents[st.agent]
+                    current = backend_identity(
+                        agent_cfg.type, agent_cfg.working_directory)
+                    if st.backend_identity != current:
+                        msg = (
+                            f"Connector '{connector.name}': watcher "
+                            f"'{st.watcher_name}' has a saved session "
+                            f"({st.session_id}) that was started when agent "
+                            f"'{st.agent}' was set up "
+                            f"as '{st.backend_identity}'. It is now "
+                            f"'{current}', so that session cannot be reused "
+                            f"and the next start will begin a new one. "
+                            f"Nothing to do if you meant to change the "
+                            f"agent's 'type' or 'working_directory'."
+                        )
+                        result.warnings.append(msg)
+                        result.findings.append(
+                            Finding("warning", "connector", connector.name,
+                                    None, msg)
+                        )
+                continue
+            msg = (
+                f"Connector '{connector.name}': the saved watcher "
+                f"'{st.watcher_name}' was written by an older version of this "
+                "gateway, which used a config format that no longer exists. "
+                "The next start will discard it, including its paused setting "
+                "and its session. To keep serving that room, add a rule "
+                "under 'watcher_rules:' whose rooms match it — it will start a "
+                "new session on the room's next message. See "
+                "docs/migration-dynamic-watchers.md."
+            )
+            result.warnings.append(msg)
+            result.findings.append(
+                Finding("warning", "connector", connector.name, None, msg)
+            )
 
 
 def _lint_config(raw: dict, result: ValidationResult) -> None:
@@ -303,7 +609,13 @@ def _lint_config(raw: dict, result: ValidationResult) -> None:
                     _AGENT_LINT_DEFAULTS, result,
                 )
 
-    for i, wc in enumerate(raw.get("watchers") or []):
+    # The collector reports a non-list `watcher_rules:` as a structural error
+    # and returns a partial config; lint then still runs, and iterating the
+    # raw value here raised TypeError on `watcher_rules: 5` — a traceback in
+    # place of the error already collected (Codex, PR #140 round 2). Same
+    # list-type guard as `entry_count`.
+    raw_rules = raw.get("watcher_rules")
+    for i, wc in enumerate(raw_rules if isinstance(raw_rules, list) else []):
         if isinstance(wc, dict):
             name_hint = wc.get("name")
             label = name_hint if isinstance(name_hint, str) and name_hint else f"watchers[{i}]"

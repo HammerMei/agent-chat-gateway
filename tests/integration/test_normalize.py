@@ -23,6 +23,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from gateway.core.paths import room_path_key
 from tests.helpers import IsolatedTestCase
 
 # ── Tests: path traversal check ──────────────────────────────────────────────
@@ -370,7 +371,7 @@ class TestAttachmentWarningPromptInjection(IsolatedTestCase):
         """When IncomingMessage has warnings, they appear in the agent prompt."""
         from gateway.agents import AgentBackend
         from gateway.agents.response import AgentResponse
-        from gateway.config import AgentConfig, WatcherConfig
+        from gateway.config import AgentConfig
         from gateway.connectors.script import ScriptConnector
         from gateway.core.config import CoreConfig
         from gateway.core.connector import IncomingMessage, Room, User, UserRole
@@ -391,7 +392,7 @@ class TestAttachmentWarningPromptInjection(IsolatedTestCase):
                 return AgentResponse(text="mock reply")
 
             async def ensure_durable_instructions(self, session_id, working_directory,
-                                                    timeout, content, *, watcher_name,
+                                                    timeout, content, *, path_key,
                                                     already_delivered):
                 return await self._send_once_as_durable_fallback(
                     session_id, working_directory, timeout, content, already_delivered,
@@ -399,11 +400,11 @@ class TestAttachmentWarningPromptInjection(IsolatedTestCase):
 
         connector = ScriptConnector()
         agent = MockAgent()
-        wc = WatcherConfig(name="script", connector="script", room="script", agent="default")
+        from tests.helpers import make_rule
         agent_cfg = AgentConfig(timeout=10)
-        config = CoreConfig(agents={"default": agent_cfg}, default_agent="default")
-        manager = SessionManager(connector, {"default": agent}, "default", config,
-                                 watcher_configs=[wc])
+        config = CoreConfig(agents={"default": agent_cfg})
+        manager = SessionManager(connector, {"default": agent}, config,
+                                 watcher_rules=[make_rule("script")])
         await manager.run_once()
 
         msg = IncomingMessage(
@@ -432,7 +433,7 @@ class TestAttachmentWarningPromptInjection(IsolatedTestCase):
         """When no warnings, prompt is unchanged."""
         from gateway.agents import AgentBackend
         from gateway.agents.response import AgentResponse
-        from gateway.config import AgentConfig, WatcherConfig
+        from gateway.config import AgentConfig
         from gateway.connectors.script import ScriptConnector
         from gateway.core.config import CoreConfig
         from gateway.core.connector import UserRole
@@ -453,7 +454,7 @@ class TestAttachmentWarningPromptInjection(IsolatedTestCase):
                 return AgentResponse(text="mock reply")
 
             async def ensure_durable_instructions(self, session_id, working_directory,
-                                                    timeout, content, *, watcher_name,
+                                                    timeout, content, *, path_key,
                                                     already_delivered):
                 return await self._send_once_as_durable_fallback(
                     session_id, working_directory, timeout, content, already_delivered,
@@ -461,11 +462,11 @@ class TestAttachmentWarningPromptInjection(IsolatedTestCase):
 
         connector = ScriptConnector()
         agent = MockAgent()
-        wc = WatcherConfig(name="script", connector="script", room="script", agent="default")
+        from tests.helpers import make_rule
         agent_cfg = AgentConfig(timeout=10)
-        config = CoreConfig(agents={"default": agent_cfg}, default_agent="default")
-        manager = SessionManager(connector, {"default": agent}, "default", config,
-                                 watcher_configs=[wc])
+        config = CoreConfig(agents={"default": agent_cfg})
+        manager = SessionManager(connector, {"default": agent}, config,
+                                 watcher_rules=[make_rule("script")])
         await manager.run_once()
 
         await connector.inject("hello", role=UserRole.OWNER)
@@ -484,10 +485,16 @@ class TestAttachmentSymlink(IsolatedTestCase):
     """Issue #17: per-watcher symlinks for attachment paths inside agent cwd."""
 
     async def test_symlink_created_on_watcher_start(self):
-        """_start_watcher should create .acg-attachments/{watcher_name} symlink."""
+        """_start_watcher creates .acg-attachments/{path_key} — keyed on the room.
+
+        The component used to be the watcher's display name, which made that name
+        load-bearing: renaming a room orphaned the link, and a collision pointed one
+        room's attachment path at another's files (§2.3). Asserting the derived key is
+        what pins the new contract; asserting the name would pin the bug.
+        """
         from gateway.agents import AgentBackend
         from gateway.agents.response import AgentResponse
-        from gateway.config import AgentConfig, WatcherConfig
+        from gateway.config import AgentConfig
         from gateway.connectors.script import ScriptConnector
         from gateway.core.config import CoreConfig
         from gateway.core.session_manager import SessionManager
@@ -505,7 +512,7 @@ class TestAttachmentSymlink(IsolatedTestCase):
                 return AgentResponse(text="ok")
 
             async def ensure_durable_instructions(self, session_id, working_directory,
-                                                    timeout, content, *, watcher_name,
+                                                    timeout, content, *, path_key,
                                                     already_delivered):
                 return await self._send_once_as_durable_fallback(
                     session_id, working_directory, timeout, content, already_delivered,
@@ -519,16 +526,22 @@ class TestAttachmentSymlink(IsolatedTestCase):
             connector.attachment_cache_dir = lambda room_id: str(cache_dir)
 
             agent = MockAgent()
-            wc = WatcherConfig(name="script", connector="script", room="script", agent="default")
+            from tests.helpers import make_rule
             agent_cfg = AgentConfig(timeout=10, working_directory=tmpdir)
-            config = CoreConfig(agents={"default": agent_cfg}, default_agent="default")
+            config = CoreConfig(agents={"default": agent_cfg})
 
-            manager = SessionManager(connector, {"default": agent}, "default", config,
-                                     watcher_configs=[wc])
+            manager = SessionManager(connector, {"default": agent}, config,
+                                     watcher_rules=[make_rule("script")])
             await manager.run_once()
 
-            link = Path(tmpdir) / ".acg-attachments" / "script"
+            link = (
+                Path(tmpdir) / ".acg-attachments" / room_path_key("default", "script")
+            )
             self.assertTrue(link.is_symlink(), f"Expected symlink at {link}")
+            self.assertFalse(
+                (Path(tmpdir) / ".acg-attachments" / "script").exists(),
+                "the display name must no longer be a path component",
+            )
             self.assertEqual(link.resolve(), cache_dir.resolve())
 
             await manager.shutdown()
@@ -537,7 +550,7 @@ class TestAttachmentSymlink(IsolatedTestCase):
         """Two watchers on same cwd get separate symlinks under .acg-attachments/."""
         from gateway.agents import AgentBackend
         from gateway.agents.response import AgentResponse
-        from gateway.config import AgentConfig, WatcherConfig
+        from gateway.config import AgentConfig
         from gateway.connectors.script import ScriptConnector
         from gateway.core.config import CoreConfig
         from gateway.core.session_manager import SessionManager
@@ -555,7 +568,7 @@ class TestAttachmentSymlink(IsolatedTestCase):
                 return AgentResponse(text="ok")
 
             async def ensure_durable_instructions(self, session_id, working_directory,
-                                                    timeout, content, *, watcher_name,
+                                                    timeout, content, *, path_key,
                                                     already_delivered):
                 return await self._send_once_as_durable_fallback(
                     session_id, working_directory, timeout, content, already_delivered,
@@ -578,21 +591,24 @@ class TestAttachmentSymlink(IsolatedTestCase):
 
             agent = MockAgent()
             agent_cfg = AgentConfig(timeout=10, working_directory=tmpdir)
-            config = CoreConfig(agents={"default": agent_cfg}, default_agent="default")
+            config = CoreConfig(agents={"default": agent_cfg})
 
-            wc1 = WatcherConfig(
-                name="watcher-a", connector="script", room="room-a", agent="default"
-            )
-            wc2 = WatcherConfig(
-                name="watcher-b", connector="script", room="room-b", agent="default"
-            )
+            from tests.helpers import make_rule
 
-            manager = SessionManager(connector, {"default": agent}, "default", config,
-                                     watcher_configs=[wc1, wc2])
+            manager = SessionManager(connector, {"default": agent}, config,
+                                     watcher_rules=[make_rule("room-a"),
+                                                    make_rule("room-b")])
             await manager.run_once()
 
-            link_a = Path(tmpdir) / ".acg-attachments" / "watcher-a"
-            link_b = Path(tmpdir) / ".acg-attachments" / "watcher-b"
+            # Keyed per ROOM, not per watcher name — which is the distinction the
+            # re-key introduces: two watchers on one room would share a link, and the
+            # same watcher renamed keeps its own.
+            link_a = (
+                Path(tmpdir) / ".acg-attachments" / room_path_key("default", "room-a")
+            )
+            link_b = (
+                Path(tmpdir) / ".acg-attachments" / room_path_key("default", "room-b")
+            )
 
             self.assertTrue(link_a.is_symlink())
             self.assertTrue(link_b.is_symlink())
@@ -605,7 +621,7 @@ class TestAttachmentSymlink(IsolatedTestCase):
         """MessageProcessor should remap attachment paths to cwd-local symlink paths."""
         from gateway.agents import AgentBackend
         from gateway.agents.response import AgentResponse
-        from gateway.config import AgentConfig, WatcherConfig
+        from gateway.config import AgentConfig
         from gateway.connectors.script import ScriptConnector
         from gateway.core.config import CoreConfig
         from gateway.core.connector import Attachment, IncomingMessage, Room, User, UserRole
@@ -626,7 +642,7 @@ class TestAttachmentSymlink(IsolatedTestCase):
                 return AgentResponse(text="ok")
 
             async def ensure_durable_instructions(self, session_id, working_directory,
-                                                    timeout, content, *, watcher_name,
+                                                    timeout, content, *, path_key,
                                                     already_delivered):
                 return await self._send_once_as_durable_fallback(
                     session_id, working_directory, timeout, content, already_delivered,
@@ -644,11 +660,11 @@ class TestAttachmentSymlink(IsolatedTestCase):
 
             agent = MockAgent()
             agent_cfg = AgentConfig(timeout=10, working_directory=tmpdir)
-            config = CoreConfig(agents={"default": agent_cfg}, default_agent="default")
+            config = CoreConfig(agents={"default": agent_cfg})
 
-            wc = WatcherConfig(name="script", connector="script", room="script", agent="default")
-            manager = SessionManager(connector, {"default": agent}, "default", config,
-                                     watcher_configs=[wc])
+            from tests.helpers import make_rule
+            manager = SessionManager(connector, {"default": agent}, config,
+                                     watcher_rules=[make_rule("script")])
             await manager.run_once()
 
             msg = IncomingMessage(
@@ -673,7 +689,8 @@ class TestAttachmentSymlink(IsolatedTestCase):
 
             last_send = agent.sent_messages[-1]
             expected_local = str(
-                Path(tmpdir) / ".acg-attachments" / "script" / "fileXYZ_doc.pdf"
+                Path(tmpdir) / ".acg-attachments" / room_path_key("default", "script")
+                / "fileXYZ_doc.pdf"
             )
             self.assertIsNotNone(last_send["attachments"])
             self.assertIn(
@@ -700,7 +717,7 @@ class TestAttachmentSymlink(IsolatedTestCase):
         """ScriptConnector returns None for attachment_cache_dir — no symlink created."""
         from gateway.agents import AgentBackend
         from gateway.agents.response import AgentResponse
-        from gateway.config import AgentConfig, WatcherConfig
+        from gateway.config import AgentConfig
         from gateway.connectors.script import ScriptConnector
         from gateway.core.config import CoreConfig
         from gateway.core.session_manager import SessionManager
@@ -718,7 +735,7 @@ class TestAttachmentSymlink(IsolatedTestCase):
                 return AgentResponse(text="ok")
 
             async def ensure_durable_instructions(self, session_id, working_directory,
-                                                    timeout, content, *, watcher_name,
+                                                    timeout, content, *, path_key,
                                                     already_delivered):
                 return await self._send_once_as_durable_fallback(
                     session_id, working_directory, timeout, content, already_delivered,
@@ -727,12 +744,12 @@ class TestAttachmentSymlink(IsolatedTestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             connector = ScriptConnector()
             agent = MockAgent()
-            wc = WatcherConfig(name="script", connector="script", room="script", agent="default")
+            from tests.helpers import make_rule
             agent_cfg = AgentConfig(timeout=10, working_directory=tmpdir)
-            config = CoreConfig(agents={"default": agent_cfg}, default_agent="default")
+            config = CoreConfig(agents={"default": agent_cfg})
 
-            manager = SessionManager(connector, {"default": agent}, "default", config,
-                                     watcher_configs=[wc])
+            manager = SessionManager(connector, {"default": agent}, config,
+                                     watcher_rules=[make_rule("script")])
             await manager.run_once()
 
             acg_dir = Path(tmpdir) / ".acg-attachments"

@@ -306,9 +306,12 @@ class TestCLIConfigValidate(_CLITestBase):
               default:
                 type: claude
                 working_directory: {self.agent_dir}
-            watchers:
+            watcher_rules:
               - name: w1
-                room: general
+                connector: rc
+                agent: default
+                rooms:
+                  include: [general]
         """)
         stdout, stderr, code = self._run_validate(config_path=cfg_path)
 
@@ -326,9 +329,12 @@ class TestCLIConfigValidate(_CLITestBase):
             agents:
               default:
                 type: claude
-            watchers:
+            watcher_rules:
               - name: w1
-                room: general
+                connector: rc
+                agent: default
+                rooms:
+                  include: [general]
         """)
         stdout, stderr, code = self._run_validate(config_path=cfg_path)
 
@@ -347,9 +353,12 @@ class TestCLIConfigValidate(_CLITestBase):
               default:
                 type: claude
                 working_directory: {self.agent_dir}
-            watchers:
+            watcher_rules:
               - name: w1
-                room: general
+                connector: rc
+                agent: default
+                rooms:
+                  include: [general]
         """)
         stdout, stderr, code = self._run_validate(config_path=cfg_path)
 
@@ -369,9 +378,12 @@ class TestCLIConfigValidate(_CLITestBase):
                 type: claude
                 working_directory: {self.agent_dir}
                 timeout: 360
-            watchers:
+            watcher_rules:
               - name: w1
-                room: general
+                connector: rc
+                agent: default
+                rooms:
+                  include: [general]
         """)
         stdout, stderr, code = self._run_validate(["--lint"], config_path=cfg_path)
 
@@ -389,9 +401,12 @@ class TestCLIConfigValidate(_CLITestBase):
               default:
                 type: claude
                 working_directory: {self.agent_dir}
-            watchers:
+            watcher_rules:
               - name: w1
-                room: general
+                connector: rc
+                agent: default
+                rooms:
+                  include: [general]
         """)
         stdout, stderr, code = self._run_validate(["--lint"], config_path=cfg_path)
 
@@ -408,15 +423,20 @@ class TestCLIConfigValidate(_CLITestBase):
               default:
                 type: claude
                 working_directory: {self.agent_dir}
-            watchers:
-              - connector: rc
-                rooms: [general, dev]
+            watcher_rules:
+              - name: two-rooms
+                agent: default
+                connector: rc
+                rooms:
+                  include: [general, dev]
         """)
         stdout, stderr, code = self._run_validate(config_path=cfg_path)
 
         self.assertEqual(code, 0)
-        self.assertIn("2 watcher(s)", stdout)
-        self.assertIn("expanded from 1 entries", stdout)
+        # One rule covering two rooms is one watcher entry — the static
+        # expansion ("2 watcher(s), expanded from 1 entries") died with its
+        # shape; rooms materialize at runtime now.
+        self.assertIn("1 watcher(s)", stdout)
 
     def test_state_orphan_produces_warning(self):
         cfg_path = self._write(f"""\
@@ -428,12 +448,20 @@ class TestCLIConfigValidate(_CLITestBase):
               default:
                 type: claude
                 working_directory: {self.agent_dir}
-            watchers:
+            watcher_rules:
               - name: w1
-                room: general
+                connector: rc
+                agent: default
+                rooms:
+                  include: [general]
         """)
+        # Imported here, not at module scope: this file defers every gateway import
+        # (see _import_main) so the CLI's own import-time behaviour stays under test.
+        from gateway.core.state import STATE_FORMAT_VERSION
+
         self.runtime_dir.mkdir()
         (self.runtime_dir / "state.rc.json").write_text(json.dumps({
+            "version": STATE_FORMAT_VERSION,
             "watchers": [{"watcher_name": "stale-watcher", "session_id": "x", "room_id": "y"}]
         }))
 
@@ -441,7 +469,10 @@ class TestCLIConfigValidate(_CLITestBase):
 
         self.assertEqual(code, 0)
         self.assertIn("stale-watcher", stdout)
-        self.assertIn("dropped on next start", stdout)
+        # Contract, not phrasing: the warning was rewritten in plain language
+        # ("pruned" meant nothing to a reader who had not seen the old format).
+        self.assertIn("older version", stdout)
+        self.assertIn("discard", stdout)
 
 
 class TestCLIConfigMigrateEnv(_CLITestBase):
@@ -486,9 +517,12 @@ class TestCLIConfigMigrateEnv(_CLITestBase):
               default:
                 type: claude
                 working_directory: {self.agent_dir}
-            watchers:
+            watcher_rules:
               - name: w1
-                room: general
+                connector: rc
+                agent: default
+                rooms:
+                  include: [general]
         """)
         stdout, stderr, code = self._run_migrate(cfg_path)
 
@@ -505,9 +539,12 @@ class TestCLIConfigMigrateEnv(_CLITestBase):
               default:
                 type: claude
                 working_directory: {self.agent_dir}
-            watchers:
+            watcher_rules:
               - name: w1
-                room: general
+                connector: rc
+                agent: default
+                rooms:
+                  include: [general]
         """)
         (Path(self.tmp) / ".env").write_text("RC_PASSWORD=hunter2\n")
 
@@ -529,9 +566,12 @@ class TestCLIConfigMigrateEnv(_CLITestBase):
               default:
                 type: claude
                 working_directory: {self.agent_dir}
-            watchers:
+            watcher_rules:
               - name: w1
-                room: general
+                connector: rc
+                agent: default
+                rooms:
+                  include: [general]
         """)
         (Path(self.tmp) / ".env").write_text("UNRELATED=1\n")
 
@@ -555,9 +595,12 @@ class TestCLIConfigMigrateEnv(_CLITestBase):
               default:
                 type: claude
                 working_directory: {self.agent_dir}
-            watchers:
+            watcher_rules:
               - name: w1
-                room: general
+                connector: rc
+                agent: default
+                rooms:
+                  include: [general]
         """)
 
         with patch(
@@ -606,6 +649,23 @@ class TestCLIStatus(_CLITestBase):
         self.assertIn("99999", stdout)          # pid shown
         self.assertIn("Watchers: 2", stdout)     # watcher count from list response
 
+    def test_status_counts_every_state(self):
+        """`status` reports a total, so it must not inherit `list`'s narrower
+        default — idle rooms would silently drop out of a number that reads as
+        "how many watchers does this daemon have"."""
+        self._write_pid_file()
+        received: list[dict] = []
+
+        def _capture(req):
+            received.append(req)
+            return {"ok": True, "data": [], "errors": []}
+
+        self._start_daemon({"list": _capture})
+        self._run(["status"])
+
+        self.assertEqual(len(received), 1)
+        self.assertEqual(received[0]["states"], ["active", "idle", "paused", "failed"])
+
 
 # ---------------------------------------------------------------------------
 # Tests: list command  ← PRIMARY INTEGRATION TEST
@@ -614,56 +674,159 @@ class TestCLIStatus(_CLITestBase):
 class TestCLIList(_CLITestBase):
     """list: full integration path through socket, response parsing, formatting."""
 
+    _ROWS = [
+        {
+            "watcher_name": "support",
+            "room_name": "#eng-triage",
+            "room_id": "rid-support",
+            "connector": "rc-prod",
+            "agent_name": "claude",
+            "session_id": "sess-abc123",
+            "participants": [],
+            "state": "active",
+        },
+        {
+            "watcher_name": "gdm-a3f9c1b2",
+            # A group DM has no platform name, and the server has already
+            # collapsed that to the room id (`room_name or room_id`) — the real
+            # case for a room whose label is a hash.  (A 1:1 DM is *not* this
+            # case: both connectors return the configured `@handle` as its name.)
+            "room_name": "rid-gdm",
+            "room_id": "rid-gdm",
+            "connector": "rc-prod",
+            "agent_name": "opencode",
+            "session_id": "sess-def456",
+            "participants": ["@alice", "@bob"],
+            "state": "paused",
+        },
+    ]
+
     def test_list_normal_path_shows_watchers(self):
-        """Normal path: daemon running, watchers returned, output formatted."""
+        """Normal path: daemon running, rows returned, table formatted."""
         self._start_daemon({
-            "list": {
-                "ok": True,
-                "data": [
-                    {
-                        "watcher_name": "support",
-                        "room_name": "support-channel",
-                        "connector": "rc-prod",
-                        "agent_name": "claude",
-                        "session_id": "sess-abc123",
-                        "active": True,
-                        "paused": False,
-                    },
-                    {
-                        "watcher_name": "internal",
-                        "room_name": "internal-chat",
-                        "connector": "rc-prod",
-                        "agent_name": "opencode",
-                        "session_id": "sess-def456",
-                        "active": True,
-                        "paused": True,
-                    },
-                ],
-                "errors": [],
-            }
+            "list": {"ok": True, "data": self._ROWS, "errors": []}
         })
 
         stdout, stderr, code = self._run(["list"])
 
         self.assertEqual(code, 0, f"stderr: {stderr}")
-        # Both watchers should appear
-        self.assertIn("support", stdout)
-        self.assertIn("sess-abc123", stdout)
-        self.assertIn("internal", stdout)
-        self.assertIn("sess-def456", stdout)
-        # Paused watcher should show PAUSED status
-        self.assertIn("PAUSED", stdout)
-        # Active non-paused shows "active"
-        self.assertIn("active", stdout)
+        header, *rows = stdout.strip().splitlines()
+        for column in ("NAME", "CONNECTOR", "ROOM", "ROOM ID", "AGENT", "STATE",
+                       "SESSION", "PARTICIPANTS"):
+            self.assertIn(column, header)
+        self.assertEqual(len(rows), 2)
+        self.assertIn("support", rows[0])
+        # Pinned separately from the watcher name: with both spelled "support",
+        # deleting the ROOM column entirely left every assertion passing.
+        self.assertIn("#eng-triage", rows[0])
+        self.assertIn("rid-support", rows[0])
+        self.assertIn("active", rows[0])
+        self.assertIn("sess-abc123", rows[0])
+        self.assertIn("paused", rows[1])
+        # The participants column is how a group DM is identified, so it is in
+        # the default view rather than behind a verbose flag.
+        self.assertIn("@alice, @bob", rows[1])
+        # And the absent-value placeholder, which nothing else pins.
+        self.assertIn("—", rows[0])
 
-    def test_list_empty_shows_no_watchers_message(self):
-        """When no watchers configured, print the no-watchers message."""
-        self._start_daemon({"list": {"ok": True, "data": [], "errors": []}})
+    def test_list_columns_are_aligned(self):
+        """A table whose columns do not line up is not a table."""
+        self._start_daemon({
+            "list": {"ok": True, "data": self._ROWS, "errors": []}
+        })
 
         stdout, _, code = self._run(["list"])
 
         self.assertEqual(code, 0)
-        self.assertIn("No configured watchers", stdout)
+        header, *rows = stdout.strip().splitlines()
+        state_column = header.index("STATE")
+        for row, expected in zip(rows, ("active", "paused")):
+            self.assertTrue(
+                row[state_column:].startswith(expected),
+                f"expected {expected!r} at column {state_column} in: {row!r}",
+            )
+
+    def test_a_non_string_participant_does_not_take_down_the_table(self):
+        """The loader refuses these, but the CLI reads rows off a socket — it
+        does not parse the state file — so a daemon on a different version can
+        still hand it one. A formatter must never be the thing that loses every
+        other connector's rows."""
+        from gateway.cli import _print_watcher_table
+
+        row = dict(self._ROWS[0], participants=[1, None, "@alice"])
+
+        stdout_buf = io.StringIO()
+        with redirect_stdout(stdout_buf):
+            _print_watcher_table([row])
+
+        out = stdout_buf.getvalue()
+        self.assertIn("@alice", out)
+        self.assertIn("support", out)
+
+    def test_list_empty_names_the_states_that_were_asked_for(self):
+        """"None" and "none you asked about" are different answers.
+
+        The default case points at `--all` without restating what the default
+        *is* — the server owns that, and a second copy in the CLI would go
+        stale silently.
+        """
+        self._start_daemon({"list": {"ok": True, "data": [], "errors": []}})
+
+        default_out, _, code = self._run(["list"])
+        self.assertEqual(code, 0)
+        self.assertIn("--all", default_out)
+
+        idle_out, _, code = self._run(["list", "--idle"])
+        self.assertEqual(code, 0)
+        self.assertIn("idle", idle_out)
+        self.assertNotIn("--all", idle_out)
+
+    def test_a_hard_failure_does_not_get_an_empty_list_answer(self):
+        """An unknown --connector comes back ok:false with no `errors` list.
+
+        "No watchers, try --all" is a substantive answer to a query the daemon
+        never ran, and it would send the operator to a flag that changes
+        nothing.
+        """
+        self._start_daemon(
+            {"list": {"ok": False, "error": "Unknown connector: bogus"}}
+        )
+
+        stdout, stderr, code = self._run(["list", "--connector", "bogus"])
+
+        self.assertEqual(code, 1)
+        self.assertEqual(stdout.strip(), "")
+        self.assertIn("Unknown connector", stderr)
+
+    def test_list_state_flags_are_forwarded(self):
+        """The flags compose, and the default is expressed by sending nothing."""
+        received: list[dict] = []
+
+        def _capture(req):
+            received.append(req)
+            return {"ok": True, "data": [], "errors": []}
+
+        self._start_daemon({"list": _capture})
+
+        self._run(["list"])
+        self._run(["list", "--idle"])
+        self._run(["list", "--active", "--paused"])
+        self._run(["list", "--all"])
+        self._run(["list", "--failed"])
+        self._run(["list", "--all", "--idle"])
+        self._run(["list", "--connector", "rc-prod", "--idle"])
+
+        self.assertNotIn("states", received[0], "the default lives on the server")
+        self.assertEqual(received[1]["states"], ["idle"])
+        self.assertEqual(received[2]["states"], ["active", "paused"])
+        self.assertEqual(received[3]["states"], ["active", "idle", "paused", "failed"])
+        self.assertEqual(received[4]["states"], ["failed"])
+        # --all wins over a narrower flag rather than intersecting with it.
+        self.assertEqual(received[5]["states"], ["active", "idle", "paused", "failed"])
+        # A state filter and a connector filter compose.
+        self.assertEqual(received[6]["states"], ["idle"])
+        self.assertEqual(received[6]["connector"], "rc-prod")
+
 
     def test_list_with_connector_filter(self):
         """--connector flag is forwarded in the command payload."""
@@ -715,6 +878,31 @@ class TestCLIPauseResumeReset(_CLITestBase):
         _, stderr, code = self._run(["pause", "nonexistent"])
         self.assertEqual(code, 1)
         self.assertIn("watcher not found", stderr)
+
+    def test_expire_normal_path(self):
+        """Successful expire → print confirmation + exit 0 (§2.8)."""
+        self._start_daemon({"expire": {"ok": True}})
+        stdout, _, code = self._run(["expire", "rc-eng"])
+        self.assertEqual(code, 0)
+        self.assertIn("expired", stdout.lower())
+
+    def test_expire_does_not_claim_to_have_reclaimed_the_jobs(self):
+        """The success line said "record, session and scheduled jobs reclaimed"
+        after the jobs stopped being cancelled — contradicting its own `--help`,
+        which was corrected in the same commit that claimed to have swept every
+        operator-facing mention. An operator who believes this line stops looking
+        for the job that is about to recreate the watcher."""
+        self._start_daemon({"expire": {"ok": True}})
+        stdout, _, code = self._run(["expire", "rc-eng"])
+        self.assertEqual(code, 0)
+        self.assertNotIn("scheduled jobs reclaimed", stdout)
+        self.assertIn("scheduled jobs are kept", stdout)
+
+    def test_expire_failure_exits_1(self):
+        self._start_daemon({"expire": {"ok": False, "error": "no expirable record"}})
+        _, stderr, code = self._run(["expire", "ghost"])
+        self.assertEqual(code, 1)
+        self.assertIn("no expirable record", stderr)
 
     def test_resume_normal_path(self):
         """Successful resume → print confirmation + exit 0."""
@@ -846,6 +1034,105 @@ class TestCLISend(_CLITestBase):
 # ---------------------------------------------------------------------------
 # Tests: daemon-not-running path
 # ---------------------------------------------------------------------------
+
+class TestCLIScheduleMigrateReporting(_CLITestBase):
+    """`schedule migrate`'s output IS its product — the whole reason the
+    migration is a command rather than something done invisibly at fire time.
+    It had no test, which is how it came to report a migration that did not run.
+    """
+
+    _OUTCOME_OK = {"job_id": "acg-1", "watcher": "rc:general",
+                   "changed": True, "detail": "room room-1 (resolved 'general')",
+                   "needs_attention": False}
+    _OUTCOME_STUCK = {"job_id": "acg-2", "watcher": "rc:gone",
+                      "changed": False, "detail": "there is no room named 'gone'",
+                      "needs_attention": True}
+
+    def _migrate(self, **report) -> tuple[str, str, int]:
+        self._start_daemon({"schedule-migrate": {"ok": True, **report}})
+        return self._run(["schedule", "migrate"])
+
+    def test_a_run_held_back_by_an_unresolved_job_does_not_claim_to_have_migrated(self):
+        """The version does not move while any job needs attention, so saying
+        "migrated 1 → 2" here is contradicted by the next startup warning. The
+        report carries `stamped` for exactly this: `to_version` is the target,
+        not the outcome."""
+        stdout, _, code = self._migrate(
+            from_version=1, to_version=2, stamped=False, changed=1,
+            steps=["1 → 2: record each job's room id"],
+            outcomes=[self._OUTCOME_OK, self._OUTCOME_STUCK])
+
+        self.assertEqual(code, 0)
+        self.assertNotIn("migrated 1 → 2", stdout)
+        self.assertIn("STILL at schema version 1", stdout)
+        # And it says what to do next, since the command is worth re-running.
+        self.assertIn("run 'schedule migrate' again", stdout)
+        self.assertIn("1 job(s) need attention", stdout)
+
+    def test_a_clean_run_reports_the_version_it_reached(self):
+        stdout, _, code = self._migrate(
+            from_version=1, to_version=2, stamped=True, changed=1,
+            steps=["1 → 2: record each job's room id"],
+            outcomes=[self._OUTCOME_OK])
+
+        self.assertEqual(code, 0)
+        self.assertIn("migrated 1 → 2", stdout)
+        self.assertNotIn("STILL", stdout)
+        self.assertNotIn("need attention", stdout)
+
+    def test_a_current_version_that_still_owed_work_shows_the_work(self):
+        """`needs_migration` also looks at the jobs, so a version-2 file with a
+        live job lacking a room id re-runs the 1→2 step at version 2. The CLI
+        keyed "nothing to do" on the versions matching and hid that run — steps,
+        outcomes, jobs needing attention — while the startup warning kept
+        firing (Codex, PR #140 round 2)."""
+        stdout, _, code = self._migrate(
+            from_version=2, to_version=2, stamped=False, changed=0,
+            steps=["1 → 2: record each job's room id"],
+            outcomes=[self._OUTCOME_STUCK])
+
+        self.assertEqual(code, 0)
+        self.assertNotIn("nothing to do", stdout)
+        self.assertIn("1 → 2", stdout)
+        self.assertIn("1 job(s) need attention", stdout)
+        self.assertIn("STILL at schema version 2", stdout)
+
+    def test_an_already_current_file_says_so_without_a_job_list(self):
+        stdout, _, code = self._migrate(
+            from_version=2, to_version=2, stamped=True, changed=0, outcomes=[])
+
+        self.assertEqual(code, 0)
+        self.assertIn("already at schema version 2", stdout)
+
+    def test_a_newer_file_is_an_error_not_a_downgrade(self):
+        """`migrate` refuses rather than writing the file down to this version;
+        the CLI has to surface that as a failure, not a quiet success."""
+        self._start_daemon({"schedule-migrate": {
+            "ok": False,
+            "error": "jobs.json declares schema version 3, but this ACG "
+                     "understands 2. It was written by a newer version — "
+                     "upgrade ACG rather than migrating down."}})
+        stdout, stderr, code = self._run(["schedule", "migrate"])
+
+        self.assertEqual(code, 1)
+        self.assertIn("newer version", stderr)
+        self.assertNotIn("migrated", stdout)
+
+    def test_the_marks_distinguish_changed_from_already_fine_from_stuck(self):
+        """Three states, three marks. Collapsing "already had a room id" into
+        the attention list would hold the schema version back forever, because a
+        clean re-run reports every job as unchanged."""
+        already = {"job_id": "acg-3", "watcher": "rc:ops", "changed": False,
+                   "detail": "already has a room id", "needs_attention": False}
+        stdout, _, _ = self._migrate(
+            from_version=1, to_version=2, stamped=False, changed=1,
+            outcomes=[self._OUTCOME_OK, already, self._OUTCOME_STUCK])
+
+        self.assertIn("✓ acg-1", stdout)
+        self.assertIn("· acg-3", stdout)
+        self.assertIn("✗ acg-2", stdout)
+        self.assertIn("1 job(s) need attention", stdout)
+
 
 class TestCLIDaemonNotRunning(unittest.TestCase):
     """Commands that require the daemon print an error when it's not running."""

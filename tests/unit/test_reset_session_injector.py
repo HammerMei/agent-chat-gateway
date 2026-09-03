@@ -28,7 +28,6 @@ from gateway.state import WatcherState
 def _make_injector() -> InjectedContextBuilder:
     config = CoreConfig(
         agents={"default": AgentConfig(timeout=10)},
-        default_agent="default",
     )
     return InjectedContextBuilder(config)
 
@@ -57,7 +56,7 @@ async def _run_ensure_error(injector, ws, session_id="ses_1"):
         side_effect=AgentExecutionError("agent error")
     )
     await injector.ensure(
-        ws, session_id, agent, "/tmp", 10, watcher_name="test", content="context",
+        ws, session_id, agent, "/tmp", 10, watcher_name="test", path_key='pk-test', content="context",
     )
 
 
@@ -66,7 +65,7 @@ async def _run_ensure_success(injector, ws, session_id="ses_1"):
     agent = AsyncMock()
     agent.ensure_durable_instructions = AsyncMock(return_value=None)
     await injector.ensure(
-        ws, session_id, agent, "/tmp", 10, watcher_name="test", content="context",
+        ws, session_id, agent, "/tmp", 10, watcher_name="test", path_key='pk-test', content="context",
     )
 
 

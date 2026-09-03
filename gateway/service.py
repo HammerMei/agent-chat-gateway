@@ -21,12 +21,20 @@ import logging
 import os
 from dataclasses import dataclass
 
-from .agents import AgentBackend, GatewayBrokerConfig
+from .agents import AgentBackend, GatewayBrokerConfig, check_backend_signatures
 from .agents.claude import ClaudeBackend
 from .agents.opencode import OpenCodeBackend
 from .config import AgentConfig, GatewayConfig
 from .connectors import connector_factory
 from .control import ControlServer
+from .core.bot_identity import (
+    ConnectorIdentity,
+    DmClaim,
+    DuplicateBotIdentityError,
+    dm_claims,
+    find_identity_conflicts,
+    fold_record_dm_claims,
+)
 from .core.config import CoreConfig
 from .core.connector import Connector
 from .core.expiry_task import run_expiry_task
@@ -39,6 +47,7 @@ from .core.permission import (
 from .core.scheduler import JobScheduler
 from .core.session_manager import SessionManager
 from .core.session_maps import SessionMaps
+from .core.state import check_session_uniqueness, check_state_formats, load_state
 
 logger = logging.getLogger("agent-chat-gateway.service")
 
@@ -251,6 +260,20 @@ class GatewayService:
     """
 
     def __init__(self, config: GatewayConfig) -> None:
+        # Preflight the persisted state BEFORE building anything. A state file this
+        # build cannot read holds real sessions, and every path that would notice it
+        # later is per-connector — so a file belonging to a connector no longer in
+        # config.yaml would never be opened, and the daemon would start successfully
+        # while abandoning every session in it. Raising here is the whole point of the
+        # version marker: an unreadable file must stop the boot, not be discovered as
+        # an absence. See gateway/core/state.py.
+        check_state_formats()
+        # Before anything is built: a state file binding one session to two rooms is a
+        # cross-room leak waiting for both watchers to start (§4.1). The runtime check
+        # in `bind_session` catches it too, but only once one of them is already
+        # answering, and which one wins would depend on start order.
+        check_session_uniqueness()
+
         core_config = CoreConfig.from_gateway_config(config)
 
         # Shared permission registry (one per gateway instance)
@@ -267,24 +290,44 @@ class GatewayService:
             name: _build_agent_backend(agent_cfg)
             for name, agent_cfg in config.agents.items()
         }
+        # Fail here rather than at the first watcher start: a backend implementing the
+        # pre-rename signature would otherwise raise a bare TypeError deep in the
+        # lifecycle, which rolls the startup back and says nothing about what to change.
+        check_backend_signatures(agents)
+
         self._runtime_manager = AgentRuntimeManager(agents)
 
+        # What each connector claims of its account's direct messages — a rule opting
+        # in takes the whole stream, a static `@someone` watcher takes one channel.
+        # Read once here rather than holding the whole config: the identity barrier
+        # needs only this, and config is immutable after load. A DM has no team, so it
+        # is the one thing the Mattermost different-teams exception cannot keep apart
+        # (§4.5).
+        self._dm_claims: dict[str, DmClaim] = dm_claims(config.watcher_rules)
         self._entries: list[ConnectorEntry] = []
         for cc in config.connectors:
             connector = connector_factory(cc)
-            # Filter watcher configs belonging to this connector
-            connector_watchers = [
-                wc for wc in config.watchers if wc.connector == cc.name
-            ]
             sm = SessionManager(
                 connector=connector,
                 agents=agents,
-                default_agent=config.default_agent,
                 config=core_config,
                 state_name=cc.name,
-                watcher_configs=connector_watchers,
                 permission_registry=self._registry,
                 session_maps=self._maps,
+                # Rules give the manager runtime effect (§2.8). Filtered like the
+                # watcher configs: a rule binds to one connector by name, and the
+                # manager keys its matches on that same name.
+                watcher_rules=[
+                    r for r in config.watcher_rules if r.connector == cc.name
+                ],
+                # The membership-remove handler's job cancellation (§2.7).
+                # The expiry-exemption oracle that used to sit here is gone with
+                # the exemption itself: a job records the room it targets and can
+                # resurrect it, so there is no record to protect on its behalf.
+                cancel_jobs=(
+                    lambda room_id, legacy_handle, _cn=cc.name: self._cancel_jobs_for(
+                        _cn, room_id, legacy_handle=legacy_handle)
+                ),
             )
             self._entries.append(
                 ConnectorEntry(name=cc.name, connector=connector, session_manager=sm)
@@ -303,6 +346,173 @@ class GatewayService:
             self._entries,
             job_store=self._job_store,
         )
+
+    def _cancel_jobs_for(
+        self, connector_name: str, room_id: str, *, legacy_handle: str
+    ) -> None:
+        """Cancel every scheduled job targeting a reclaimed room (§2.7).
+
+        Room id first and required; `legacy_handle` is keyword-only and named
+        for what it is — the ONLY thing a job written before schema 2 has to be
+        matched by. Nothing else here reads a handle (§2.8).
+
+        Fired by the membership-remove handler after `reclaim_room` succeeds:
+        the room can never receive another message, so a job left in the store
+        would fire forever at nothing. Each cancellation is logged as an audit
+        line with the reason — a job disappearing from `schedule list` must be
+        explainable. Best-effort like the oracle: a store that cannot answer
+        leaves the jobs, and each fires audibly against the missing room
+        rather than being silently lost here.
+        """
+        try:
+            configured = {e.name for e in self._entries}
+
+            def _owner_of(job) -> str:
+                """Which connector would DELIVER this job.
+
+                The same order `JobScheduler._resolve_target` uses, and
+                deliberately so: cancellation must claim exactly the jobs this
+                connector would have fired. `job.connector` when it names a
+                configured connector; otherwise the handle's prefix, the only
+                other thing in a job that names one.
+                """
+                if job.connector in configured:
+                    return job.connector
+                return job.watcher.partition(":")[0]
+
+            def _claims_this_room(job) -> bool:
+                """Is this job THIS connector's job for THIS room?
+
+                Both halves, because cancellation is destructive and
+                unappealable. A room id does NOT establish ownership: ids are
+                per-server, not per-connector, and the canonical multi-agent
+                setup is one account per agent in the same rooms, so several
+                connectors' jobs legitimately carry one room id.
+
+                An earlier version admitted any job whose connector was not
+                configured (`or j.connector not in configured`), on the argument
+                that such a job is deliverable here through the fallback scan and
+                so must be cancellable here. The argument was right and the
+                clause too broad: a job belonging to a connector renamed away in
+                `config.yaml` was deleted by a DIFFERENT connector's membership
+                event, under an audit line saying the bot had been removed from
+                the room — it had not been removed from that agent's account.
+                Asking who would deliver it keeps the intent and drops the reach.
+                """
+                if _owner_of(job) != connector_name:
+                    return False
+                if job.room_id:
+                    # A handle can have been taken over by a different room, and
+                    # cancelling by it would delete a live room's jobs while
+                    # leaving this room's own firing at a room the bot has left.
+                    # Both directions were reachable.
+                    return job.room_id == room_id
+                # Pre-schema-2: the handle is the only key there is.
+                return job.watcher == legacy_handle
+
+            doomed = [j for j in self._job_store.list_jobs()
+                      if _claims_this_room(j)]
+            for job in doomed:
+                reason = "the bot was removed from the room, so the job could never deliver"
+                self._job_store.cancel(job.id, reason=reason)
+                logger.warning(
+                    "AUDIT: cancelled scheduled job %s (watcher '%s', room %s, "
+                    "connector '%s') — %s. The record is kept; "
+                    "'agent-chat-gateway schedule resume %s' restores it.",
+                    job.id, job.watcher, room_id, job.connector, reason, job.id,
+                )
+        except Exception as e:
+            logger.warning(
+                "Could not cancel scheduled jobs for reclaimed room %s: %s",
+                room_id, e,
+            )
+
+    async def _settle(
+        self,
+        coros: list,
+        *,
+        phase: str,
+        startup_errors: list[str],
+    ) -> None:
+        """Await every coroutine, then raise the first failure — never before.
+
+        `return_exceptions=True` is required, and the reason is a race this code was
+        bitten by: without it the FIRST failure (a bad URL failing DNS almost instantly)
+        propagates immediately WITHOUT cancelling the still-in-flight calls for the
+        other connectors (a real login plus handshake is much slower). Those keep
+        running as orphaned tasks, while the caller's `except Exception` routes into
+        `shutdown()` -> `session_manager.shutdown()` -> `save_state()` for EVERY entry —
+        including one whose startup had not finished populating its watcher states,
+        overwriting that connector's state file with a partial dict and wiping real
+        session ids for a connector that was never part of the failure.
+
+        Awaiting every result before deciding closes that race. Extracted because
+        startup now settles twice, and two copies of this reasoning would be one edit
+        away from one of them losing it.
+        """
+        results = await asyncio.gather(*coros, return_exceptions=True)
+        first_exception: BaseException | None = None
+        for entry, result in zip(self._entries, results, strict=True):
+            if isinstance(result, BaseException):
+                logger.error(
+                    "SessionManager for connector '%s' failed to %s during startup: %s",
+                    entry.name,
+                    phase,
+                    result,
+                )
+                startup_errors.append(
+                    f"Connector '{entry.name}' failed to {phase}: {result}"
+                )
+                if first_exception is None:
+                    first_exception = result
+            elif isinstance(result, list):
+                startup_errors.extend(result)
+        if first_exception is not None:
+            raise first_exception
+
+    def _check_bot_identities(self) -> None:
+        """Refuse to go further if two connectors are one bot account (§4.5).
+
+        Runs between authentication and subscription: earlier there is no identity to
+        read, later the damage is already possible. A connector that cannot answer
+        raises `ConnectorIdentityError` out of here, which is the fail-closed half.
+
+        Rejects the whole startup rather than disabling the offending connector: which
+        one is "offending" depends only on config order, and this project's other
+        preflights (`check_state_formats`, `check_backend_signatures`) refuse loudly
+        rather than degrade quietly — a daemon that silently drops a connector looks
+        healthy while half its rooms go unanswered.
+        """
+        identities: list[ConnectorIdentity] = []
+        for e in self._entries:
+            identity = e.connector.bot_identity()
+            if identity is None:
+                continue  # declares no shared account to collide over
+            claim = self._dm_claims.get(e.name, DmClaim())
+            # Widened by the connector's persisted DM records (Codex round
+            # 6): sticky binding keeps a record answering its room after its
+            # rule is deleted, so a rule-only claim misses exactly the
+            # records that outlive their rules — and two connectors sharing
+            # an account would both answer one private conversation. Read
+            # best-effort: an unreadable file was already refused loudly by
+            # check_state_formats, so nothing here needs a second refusal.
+            try:
+                claim = fold_record_dm_claims(claim, load_state(e.name))
+            except Exception:
+                logger.debug(
+                    "Could not fold persisted DM claims for connector '%s' — "
+                    "using the rule-derived claim alone", e.name, exc_info=True,
+                )
+            identities.append(
+                ConnectorIdentity(
+                    connector_name=e.name,
+                    identity=identity,
+                    dms=claim,
+                )
+            )
+        conflicts = find_identity_conflicts(identities)
+        if conflicts:
+            raise DuplicateBotIdentityError("\n".join(conflicts))
 
     async def run(self, startup_fd: int = -1) -> None:
         """Connect all connectors, start unified control socket, block until cancelled.
@@ -336,6 +546,16 @@ class GatewayService:
                     name="permission-expiry",
                 )
 
+            # The job store LOADS before any connector goes live (Codex round
+            # 8): a membership removal arriving between start_inbound and the
+            # load reclaimed the record and then failed its job cancellation
+            # on the store's not-loaded error — and with the record gone,
+            # nothing could ever rediscover those jobs. Loading is a cheap
+            # file read; only the SCHEDULER must start after run_once (its
+            # catch-up injections need processors), and it still does, below.
+            if getattr(self, "_job_store", None) is not None:
+                self._job_store.load()
+
             # 3. run_once() connects each SessionManager without blocking — the daemon
             #    loop below keeps the process alive.  We intentionally avoid sm.run()
             #    so that only the GatewayService owns the control socket.
@@ -357,38 +577,35 @@ class GatewayService:
             # before deciding what to do next closes that race: by the time
             # any exception is re-raised, no run_once() call is still
             # in-flight, so shutdown() can no longer race one.
-            sm_results = await asyncio.gather(
-                *[
-                    e.session_manager.run_once(
+            #
+            # The two phases are separated by an identity barrier rather than merged:
+            # two connectors on one bot account must be refused before EITHER
+            # subscribes (§4.5), and a SessionManager owns exactly one connector, so
+            # only this loop can see the collision. Fanning `run_once()` out would let
+            # connector A finish subscribing while B was still logging in, and the
+            # check would then run after the duplicate had started answering.
+            await self._settle(
+                [e.session_manager.connect_only() for e in self._entries],
+                phase="connect",
+                startup_errors=startup_errors,
+            )
+            self._check_bot_identities()
+            await self._settle(
+                [
+                    e.session_manager.sync_only(
                         unavailable_agents=self._runtime_manager.unavailable_agents,
                     )
                     for e in self._entries
                 ],
-                return_exceptions=True,
+                phase="start",
+                startup_errors=startup_errors,
             )
-            first_exception: BaseException | None = None
-            for entry, result in zip(self._entries, sm_results, strict=True):
-                if isinstance(result, BaseException):
-                    logger.error(
-                        "SessionManager for connector '%s' failed during startup: %s",
-                        entry.name,
-                        result,
-                    )
-                    startup_errors.append(
-                        f"Connector '{entry.name}' failed to start: {result}"
-                    )
-                    if first_exception is None:
-                        first_exception = result
-                else:
-                    startup_errors.extend(result)
-            if first_exception is not None:
-                raise first_exception
 
-            # Load persisted jobs and start the job scheduler AFTER connectors are
-            # connected and watchers are up.  Starting it before run_once() would
-            # cause catch-up messages to be dropped (processors not yet started).
+            # Start the job scheduler AFTER connectors are connected and
+            # watchers are up.  Starting it before run_once() would cause
+            # catch-up messages to be dropped (processors not yet started).
+            # The store itself loaded BEFORE run_once — see above.
             if getattr(self, "_job_store", None) is not None:
-                self._job_store.load()
                 self._scheduler_task = asyncio.create_task(
                     self._job_scheduler.run(),
                     name="job-scheduler",

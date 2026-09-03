@@ -33,6 +33,10 @@ from typing import TYPE_CHECKING
 
 from ...core.adapter_utils import ts_to_float as _ts_to_float
 from ...core.connector import Attachment, IncomingMessage, Room, User, UserRole
+from ...core.sender_policy import sender_allowed  # noqa: F401 — re-exported for
+
+# this module's existing importers; the rule itself lives in core now that both
+# connectors ask it.
 from .mentions import text_has_room_wide_mention
 
 if TYPE_CHECKING:
@@ -41,6 +45,47 @@ if TYPE_CHECKING:
     from .rest import MattermostREST
 
 logger = logging.getLogger("agent-chat-gateway.connectors.mattermost.normalize")
+
+
+def bare_handle(display: str) -> str:
+    """A Mattermost display handle with its leading `@` removed, if it has one.
+
+    A **DM's** `channel_display_name` on the websocket event is the counterpart
+    `@`-prefixed — `@alice`, not `alice`. Rocket.Chat supplies bare usernames,
+    so carrying the prefix through left the same person addressable by two
+    different watcher handles depending on the platform, and the Mattermost one
+    needed percent-encoding to type: `mm:dm:%40alice` against `rc:dm:alice`
+    (`@` is outside `_LABEL_SAFE`).
+
+    **A group DM's is not prefixed.** Verified on 11.7.0 against a live server,
+    because assuming otherwise is what put a fictional value into this
+    function's first set of tests: a DM event carries `'@mmadmin'` while a group
+    DM event carries `'acg_bot, mmadmin, probe-extra'` (§6.4). So this is
+    applied to both kinds and is simply a no-op for one of them — two branches
+    treating one wire field by different rules is what let the DM prefix go
+    unnoticed in the first place.
+
+    Exactly one leading `@` is removed and nothing else is touched, which is
+    lossless for a username: Mattermost restricts those to letters, digits and
+    `.-_`, so a name cannot itself begin with `@`.
+
+    **The prefix is unconditional, not a display preference.** Worth recording
+    because it was the one assumption here nothing in this repo could settle:
+    mattermost-server builds the event's field with
+    `GetChannelName(model.ShowUsername, "")` in `notification.go`, hardcoding
+    the format — `GetDisplayNameWithPrefix` only drops the `@` under
+    `ShowNicknameFullName`/`ShowFullName`, which that call never passes. So a
+    server whose `TeammateNameDisplay` is set to full name still sends
+    `@alice` on the wire, and the strip is not silently doing nothing there.
+
+    Idempotence is a property of the implementation, not a requirement any
+    caller currently exercises — and the earlier claim that the membership-add
+    path "supplies a bare name" was wrong. That path reads REST's
+    `display_name`, which for a direct channel is the **empty string** (see
+    `rest.py`'s `channel_member_usernames` docstring), so it never reaches here
+    with a name at all.
+    """
+    return display[1:] if display.startswith("@") else display
 
 
 @functools.lru_cache(maxsize=8)
@@ -93,6 +138,10 @@ class FilterResult:
     reason: str = ""  # debug only
     is_agent_chain: bool = False   # True when sender is a known ACG agent
     agent_chain_turn: int = 0      # current turn (1-based, after increment)
+    # Names the increment rather than counting it — the same field, for the same reason,
+    # as the Rocket.Chat result. `agent_chain_turn` is the live count and moves in both
+    # directions, so it cannot identify a delivery. Zero when no turn was taken.
+    agent_chain_token: int = 0
     agent_chain_max_turns: int = 5  # from config
 
 
@@ -137,11 +186,10 @@ def filter_mm_message(
     is_agent = sender_username in config.agent_chain.agent_usernames
 
     # 2. Sender filter
-    if config.filter_sender:
-        if sender_username not in config.allow_senders and not is_agent:
-            return FilterResult(
-                accepted=False, sender=sender_username, reason="sender not in allow-list"
-            )
+    if not sender_allowed(config, sender_username):
+        return FilterResult(
+            accepted=False, sender=sender_username, reason="sender not in allow-list"
+        )
 
     # 3. For channels: require @mention (unless listen-all mode or agent sender)
     if config.require_mention and not is_agent and room_type != "dm":
@@ -172,8 +220,9 @@ def filter_mm_message(
 
     # 5. Agent chain turn budget
     agent_chain_turn = 0
+    agent_chain_token = 0
     if is_agent and turn_store is not None:
-        allowed, agent_chain_turn = turn_store.check_and_increment(
+        allowed, agent_chain_turn, agent_chain_token = turn_store.check_and_increment(
             room_id=post.get("channel_id", ""),
             thread_id=post.get("root_id") or None,
             sender=sender_username,
@@ -200,6 +249,7 @@ def filter_mm_message(
         msg_ts=msg_ts,
         is_agent_chain=is_agent,
         agent_chain_turn=agent_chain_turn,
+        agent_chain_token=agent_chain_token,
         agent_chain_max_turns=config.agent_chain.max_turns,
     )
 

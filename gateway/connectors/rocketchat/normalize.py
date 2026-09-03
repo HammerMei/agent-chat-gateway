@@ -20,6 +20,7 @@ from typing import TYPE_CHECKING
 
 from ...core.adapter_utils import ts_to_float as _ts_to_float
 from ...core.connector import Attachment, IncomingMessage, Room, User, UserRole
+from ...core.sender_policy import sender_allowed
 from .mentions import is_room_wide_mention
 
 if TYPE_CHECKING:
@@ -63,6 +64,10 @@ class FilterResult:
     reason: str = ""  # debug only
     is_agent_chain: bool = False   # True when sender is a known ACG agent
     agent_chain_turn: int = 0      # current turn (1-based, after increment)
+    # Names the increment rather than counting it. `agent_chain_turn` is the live count
+    # and moves in both directions, so it cannot identify a delivery; releasing a turn
+    # needs this. Zero when no turn was taken.
+    agent_chain_token: int = 0
     agent_chain_max_turns: int = 5  # from config
 
 
@@ -72,6 +77,8 @@ def filter_rc_message(
     room_type: str,
     last_processed_ts: str | None,
     turn_store: "TurnStore | None" = None,
+    bot_user_id: str = "",
+    bot_username: str = "",
 ) -> FilterResult:
     """Decide whether a raw RC DDP message document should be processed.
 
@@ -87,26 +94,82 @@ def filter_rc_message(
 
     Returns a FilterResult describing the outcome.
     """
-    sender = doc.get("u", {}).get("username", "")
+    # 0. Skip messages carrying a type letter.
+    #
+    # Rocket.Chat marks system events with `t` on the message doc — `uj` joined, `au`
+    # added, `ru` removed, `room_changed_topic` — and delivers them over DDP like any
+    # other message. Only the REST history path filtered them, so they reached the agent
+    # as turns.
+    #
+    # **And they do not look empty.** RC puts the payload in `msg`: the joining user's
+    # name for `uj`, the added user's for `au`, the new topic for `room_changed_topic`.
+    # The history filter is the evidence — `not m.get("t") and m.get("msg")` in `rest.py`
+    # tests both, and the first clause would be redundant if a system message always had
+    # an empty body. So in a DM or a listen-all room the agent was answering a message
+    # whose text was `glin`, with nothing to mark it as machinery.
+    #
+    # The letter is not exclusively for system events: `e2e` marks an
+    # end-to-end-encrypted body (every user message in such a room carries it, and this
+    # turns unreadable ciphertext into a clean drop — a bot cannot complete the key
+    # exchange anyway), and `discussion-created` / `message_pinned` are user actions.
+    # Dropping all of them as *turns* is the intent: none is someone talking to the
+    # agent. The letter is named in the reason so a vanished message is traceable rather
+    # than mysterious.
+    #
+    # One deliberate side effect, stated because nothing else would say it: this runs
+    # before the agent-chain step, so a system message no longer resets the chain's turn
+    # budget. A human joining a room used to hand two mid-chain agents a fresh five turns.
+    # A join is not a human turn, so not resetting is the better answer — but it is a
+    # change, not a no-op.
+    #
+    # Mattermost has gated this on the live path all along (`post.get("type")`).
+    message_type = doc.get("t")
+    if message_type:
+        return FilterResult(
+            accepted=False, reason=f"system message (t={message_type})"
+        )
 
-    # 1. Skip own messages
-    if sender == config.username:
+    sender = doc.get("u", {}).get("username", "")
+    # The canonical spelling once the connector has logged in (#112); the
+    # configured one only before that, or in tests that pass no better.
+    own_username = bot_username or config.username
+
+    # 1. Skip own messages — by id first, name only as a fallback for frames carrying no
+    #    id. Rocket.Chat's login is not spelling-exact: probed against 6.12, an account
+    #    whose canonical username is `ProbeBot9207` logs in as `probebot9207` or by email
+    #    address, and `me.username` in the response is still `ProbeBot9207`. The connector
+    #    stores what the operator configured, so `config.username` is whatever they typed
+    #    and `u.username` on every frame is the canonical spelling.
+    #
+    #    A name-only test therefore fails to recognise the bot's own posts under an
+    #    ordinary configuration. With `filter_sender` open and a DM — which skips the
+    #    mention gate entirely — the bot's own reply reads as user activity, is dispatched,
+    #    and the answer to it arrives as the next own message: an unbounded self-reply
+    #    loop, with no turn budget in the way because the bot is not in `agent_usernames`.
+    #
+    #    `_on_unrouted_message` already tests by id; this is the same rule on the tracked
+    #    path, which is the one that carries the traffic. Mattermost's filter has taken a
+    #    `bot_user_id` for exactly this all along.
+    if bot_user_id and doc.get("u", {}).get("_id") == bot_user_id:
+        return FilterResult(accepted=False, reason="own message")
+    if sender == own_username:
         return FilterResult(accepted=False, reason="own message")
 
     # Determine if sender is a known agent
     is_agent = sender in config.agent_chain.agent_usernames
 
-    # 2. Sender filter
-    if config.filter_sender:
-        # allow-list mode: only owners+guests+agents are accepted
-        if sender not in config.allow_senders and not is_agent:
-            return FilterResult(accepted=False, sender=sender, reason="sender not in allow-list")
-    # else: open mode — everyone passes; role resolved later in normalize
+    # 2. Sender filter — the shared rule, not an inline copy (#115): this was
+    # the fourth site of "may this sender start a turn", and the module's own
+    # docstring argues a second copy is one too many. The `is_agent` bypass
+    # this copy carried is inside `sender_allowed` already.
+    if not sender_allowed(config, sender):
+        return FilterResult(accepted=False, sender=sender, reason="sender not in allow-list")
+    # open mode passes everyone; role resolved later in normalize
 
     # 3. For channels/groups: require @mention (unless listen-all mode or agent sender)
     if config.require_mention and not is_agent and room_type != "dm":
         mentions = doc.get("mentions", [])
-        bot_mentioned = any(m.get("username") == config.username for m in mentions)
+        bot_mentioned = any(m.get("username") == own_username for m in mentions)
         room_wide_mentioned = any(
             is_room_wide_mention(m.get("username", "")) for m in mentions
         )
@@ -116,7 +179,7 @@ def filter_rc_message(
                 a.get("description", "") for a in doc.get("attachments", [])
             )
             searchable = (msg_text + " " + attach_descs).strip()
-            if not _mention_pattern(config.username).search(searchable):
+            if not _mention_pattern(own_username).search(searchable):
                 return FilterResult(
                     accepted=False, sender=sender, reason="bot not mentioned"
                 )
@@ -125,7 +188,7 @@ def filter_rc_message(
 
     # 4. Timestamp deduplication — run BEFORE any state mutation so replayed
     #    or reconnect-duplicated messages never corrupt turn counters.
-    msg_ts = _extract_ts(doc)
+    msg_ts = extract_ts(doc)
     msg_ts_f = _ts_to_float(msg_ts)
     last_ts_f = _ts_to_float(last_processed_ts)
     if msg_ts_f is not None and last_ts_f is not None and msg_ts_f <= last_ts_f:
@@ -139,8 +202,9 @@ def filter_rc_message(
     # 5. Agent chain turn budget (only for agent senders) — state mutation only
     #    after dedup confirms this is a fresh, previously-unseen message.
     agent_chain_turn = 0
+    agent_chain_token = 0
     if is_agent and turn_store is not None:
-        allowed, agent_chain_turn = turn_store.check_and_increment(
+        allowed, agent_chain_turn, agent_chain_token = turn_store.check_and_increment(
             room_id=doc.get("rid", ""),
             thread_id=doc.get("tmid") or None,
             sender=sender,
@@ -171,6 +235,7 @@ def filter_rc_message(
         msg_ts=msg_ts,
         is_agent_chain=is_agent,
         agent_chain_turn=agent_chain_turn,
+        agent_chain_token=agent_chain_token,
         agent_chain_max_turns=config.agent_chain.max_turns,
     )
 
@@ -217,7 +282,7 @@ async def normalize_rc_message(
         display_name=doc.get("u", {}).get("name", sender_username),
     )
 
-    text = _extract_text(doc, room.type, config.username)
+    text = _extract_text(doc, room.type, rest.bot_username or config.username)
     attachments, warnings = await _download_attachments(doc, config, rest, cache_dir)
     thread_id: str | None = doc.get("tmid") or None
 
@@ -258,7 +323,7 @@ async def normalize_rc_message(
 # ---------------------------------------------------------------------------
 
 
-def _extract_ts(doc: dict) -> str:
+def extract_ts(doc: dict) -> str:
     """Extract a sortable timestamp string from a DDP message document.
 
     RC timestamps are Unix-epoch milliseconds (numeric or inside ``{"$date": N}``).

@@ -45,6 +45,7 @@ from textual.containers import Horizontal
 from textual.css.query import NoMatches
 from textual.widgets import Button, Label, ListItem, ListView
 
+from ..formatting import markup_safe
 from ..modals import InlineToolRuleModal, MessageModal, PresetOrInlineModal, TextPromptModal
 from .tool_presets import ToolPresetsScreen
 
@@ -101,7 +102,7 @@ class ToolListEditorMixin:
 
     def _tool_list_items(self, key: str) -> list[ListItem]:
         return [
-            ListItem(Label(format_tool_rule(item)), name=str(i))
+            ListItem(Label(markup_safe(format_tool_rule(item))), name=str(i))
             for i, item in enumerate(self._tool_lists[key])
         ]
 
@@ -116,7 +117,7 @@ class ToolListEditorMixin:
         prev_index = list_view.index
         list_view.clear()
         for i, item in enumerate(self._tool_lists[key]):
-            list_view.append(ListItem(Label(format_tool_rule(item)), name=str(i)))
+            list_view.append(ListItem(Label(markup_safe(format_tool_rule(item))), name=str(i)))
         # Re-`.append()`ing items after `.clear()` does NOT restore an
         # auto-selection the way a `ListView` composed WITH its children up
         # front does (see `on_list_view_highlighted()`'s own comment on
@@ -250,7 +251,8 @@ class ToolListEditorMixin:
             if name in self.cfg.tool_presets_raw:
                 await self.app.push_screen_wait(
                     MessageModal(
-                        f"A tool preset named '{name}' already exists.", title="Could not create"
+                        f"A tool preset named '{markup_safe(name)}' already exists.",
+                        title="Could not create",
                     )
                 )
                 return

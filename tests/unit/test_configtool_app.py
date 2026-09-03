@@ -30,9 +30,9 @@ from gateway.configtool.modals import ConfirmModal, MessageModal
 from gateway.configtool.screens.agent_detail import AgentDetailScreen
 from gateway.configtool.screens.connector_detail import ConnectorDetailScreen
 from gateway.configtool.screens.overview import OverviewScreen
+from gateway.configtool.screens.rule_detail import RuleDetailScreen
 from gateway.configtool.screens.template_detail import TemplateDetailScreen
 from gateway.configtool.screens.tool_presets import ToolPresetsScreen
-from gateway.configtool.screens.watcher_detail import WatcherDetailScreen
 
 
 def _write_config(tmp_path: Path, yaml_text: str) -> str:
@@ -65,10 +65,13 @@ def _valid_config_text(work_dir: Path) -> str:
           my-agent:
             inherits: standard
             working_directory: {work_dir}
-        watchers:
-          - connector: rc-home
+        watcher_rules:
+          - name: my-rooms
+            connector: rc-home
             agent: my-agent
-            rooms: [general, dev, "@alice"]
+            rooms:
+              include: [general, dev]
+              direct: true
     """
 
 
@@ -93,11 +96,12 @@ class TestOverviewRender:
 
             banner = app.screen.query_one("#banner", Static)
             assert "valid" in str(banner.render())
-            assert "3 watcher" in str(banner.render())
+            assert "1 rule" in str(banner.render())
 
             assert app.screen.query_one("#connectors-table", DataTable).row_count == 1
             assert app.screen.query_one("#agents-table", DataTable).row_count == 1
-            assert app.screen.query_one("#watchers-table", DataTable).row_count == 3
+            # One row per RULE, straight off the raw document.
+            assert app.screen.query_one("#rules-table", DataTable).row_count == 1
             # 1 connector_templates entry + 1 agent_templates entry (no
             # watcher_templates in this fixture).
             assert app.screen.query_one("#templates-table", DataTable).row_count == 2
@@ -185,8 +189,10 @@ class TestOverviewRender:
               default:
                 type: claude
                 working_directory: {work_dir}
-            watchers:
+            watcher_rules:
               - name: w1
+                connector: rc-home
+                agent: default
                 room: general
         """)
         app = ConfigToolApp(config_path)
@@ -216,8 +222,10 @@ class TestOverviewRender:
               default:
                 type: claude
                 working_directory: {work_dir}
-            watchers:
+            watcher_rules:
               - name: w1
+                connector: rc-home
+                agent: default
                 room: general
         """)
         app = ConfigToolApp(config_path)
@@ -250,36 +258,27 @@ class TestOverviewRender:
             # Tables must be empty, not crash the screen.
             assert app.screen.query_one("#connectors-table", DataTable).row_count == 0
 
-    async def test_invalid_config_from_file_failure_does_not_crash_watchers_table(
+    async def test_invalid_config_from_file_failure_does_not_crash_rules_table(
         self, tmp_path, work_dir
     ):
-        """Regression: a config that parses as YAML but fails per-entity
-        validation (here: an agent missing working_directory) must not
-        crash while populating the watchers table via expanded_watchers().
-
-        Pre-collect_config(), this exact fixture used to collapse the WHOLE
-        watchers table to a single "(unavailable)" placeholder row, since
-        expanded_watchers() called the strict GatewayConfig.from_file()
-        internally and the first failure anywhere aborted the whole thing.
-        Now collect_config() is fault-tolerant: the broken agent doesn't
-        take connectors/other agents down with it — but it DOES mean
-        `agents={}`, so the only watcher's implicit `agent:` (falling back
-        to a now-empty default_agent) can't resolve, and that watcher's own
-        row is simply dropped — same "only the broken row disappears, no
-        crash, no blanket placeholder" behavior TestStatusColumnPerEntity
-        pins. The blanket "(unavailable)" placeholder still exists, but
-        only fires when collect_config() returns None entirely (see the
-        does-not-exist.yaml test above)."""
-        config_path = _write_config(tmp_path, """\
+        """A config that parses as YAML but fails per-entity validation
+        (a leftover static-shape watcher entry) must not crash while
+        populating the Rules table — and unlike the old Watchers tab, the
+        broken entry still gets its row, wearing its error in the Status
+        column instead of silently disappearing."""
+        config_path = _write_config(tmp_path, f"""\
             connectors:
               - name: rc
                 type: rocketchat
-                server: {url: "http://localhost:3000", username: bot, password: pw}
+                server: {{url: "http://localhost:3000", username: bot, password: pw}}
             agents:
               default:
                 type: claude
-            watchers:
+                working_directory: {work_dir}
+            watcher_rules:
               - name: w1
+                connector: rc
+                agent: default
                 room: general
         """)
         app = ConfigToolApp(config_path)
@@ -287,22 +286,27 @@ class TestOverviewRender:
             await pilot.pause()
             banner = app.screen.query_one("#banner", Static)
             assert "error" in str(banner.render()).lower()
-            watchers_table = app.screen.query_one("#watchers-table", DataTable)
-            assert watchers_table.row_count == 0
+            rules_table = app.screen.query_one("#rules-table", DataTable)
+            assert rules_table.row_count == 1
+            assert "error" in str(rules_table.get_row_at(0)[5]).lower()
 
     async def test_refresh_action_picks_up_on_disk_changes(self, tmp_path, work_dir):
         config_path = _write_config(tmp_path, _valid_config_text(work_dir))
         app = ConfigToolApp(config_path)
         async with app.run_test() as pilot:
             await pilot.pause()
-            assert app.screen.query_one("#watchers-table", DataTable).row_count == 3
+            assert app.screen.query_one("#agents-table", DataTable).row_count == 1
 
+            # Appending to the END of the file lands under `watchers:` —
+            # a second RULE, reflected in the banner count and the table.
             with open(config_path, "a") as f:
-                f.write("  - connector: rc-home\n    agent: my-agent\n    room: extra\n")
+                f.write("  - name: extra\n    connector: rc-home\n"
+                        "    agent: my-agent\n    rooms:\n      include: [extra]\n")
 
             await pilot.press("r")
             await pilot.pause()
-            assert app.screen.query_one("#watchers-table", DataTable).row_count == 4
+            banner = str(app.screen.query_one("#banner", Static).render())
+            assert "2 rule" in banner
 
     async def test_lint_findings_counted_in_banner_only_when_lint_enabled(
         self, tmp_path, work_dir
@@ -317,8 +321,10 @@ class TestOverviewRender:
                 type: claude
                 working_directory: {work_dir}
                 timeout: 360
-            watchers:
+            watcher_rules:
               - name: w1
+                connector: rc
+                agent: default
                 room: general
         """)
         app_no_lint = ConfigToolApp(config_path, lint=False)
@@ -360,10 +366,12 @@ class TestStatusColumnPerEntity:
               working-agent:
                 type: claude
                 working_directory: {work_dir}
-            watchers:
-              - connector: rc
+            watcher_rules:
+              - name: w1
+                connector: rc
                 agent: working-agent
-                room: general
+                rooms:
+                  include: [general]
         """)
         app = ConfigToolApp(config_path)
         async with app.run_test() as pilot:
@@ -377,18 +385,13 @@ class TestStatusColumnPerEntity:
             assert "ERROR" in rows["broken-agent"][3]
             assert "OK" in rows["working-agent"][3]
 
-    async def test_watcher_with_a_real_problem_shows_error_others_still_display(
+    async def test_rule_with_a_real_problem_shows_error_others_still_display(
         self, tmp_path, work_dir
     ):
-        """EditableConfig.expanded_watchers() used to populate the Watchers
-        table via a SEPARATE, still-strict GatewayConfig.from_file() call —
-        a single broken watcher entry collapsed the WHOLE table to the
-        "(unavailable)" placeholder, same failure mode agents/connectors had
-        before this change. Now uses collect_config() + _parse_one_watcher_entry()
-        directly per raw entry, so only the broken entry's OWN rows are
-        dropped from the table (its explanation is still available via the
-        Overview banner's 'v' details view) — every other watcher still
-        expands and displays its real Status normally."""
+        """The old Watchers tab dropped a broken entry's rows entirely (no
+        row, no explanation anywhere on the tab) and its Status keys never
+        matched a rule's finding spellings, so what DID render showed OK.
+        Every entry is a row now; the broken one wears its own error."""
         config_path = _write_config(tmp_path, f"""\
             connectors:
               - name: rc
@@ -398,27 +401,26 @@ class TestStatusColumnPerEntity:
               default:
                 type: claude
                 working_directory: {work_dir}
-            watchers:
-              - name: good-watcher
+            watcher_rules:
+              - name: good-rule
                 connector: rc
                 agent: default
-                room: general
-              - name: bad-watcher
+                rooms:
+                  include: [general]
+              - name: bad-rule
                 connector: rc
                 agent: nonexistent-agent
-                room: dev
+                rooms:
+                  include: [dev]
         """)
         app = ConfigToolApp(config_path)
         async with app.run_test() as pilot:
             await pilot.pause()
-            table = app.screen.query_one("#watchers-table", DataTable)
-            # bad-watcher's own entry failed to parse entirely — it never
-            # becomes a row at all (there's no WatcherConfig to attach a
-            # Status badge to); good-watcher is unaffected and shows OK.
-            assert table.row_count == 1
-            row = table.get_row_at(0)
-            assert row[0] == "good-watcher"
-            assert "OK" in row[4]
+            table = app.screen.query_one("#rules-table", DataTable)
+            assert table.row_count == 2
+            rows = {table.get_row_at(i)[1]: table.get_row_at(i) for i in range(2)}
+            assert "ERROR" in str(rows["bad-rule"][5])
+            assert "OK" in str(rows["good-rule"][5])
 
             banner = str(app.screen.query_one("#banner", Static).render())
             assert "1 error(s)" in banner
@@ -442,7 +444,7 @@ class TestStatusColumnPerEntity:
               agent2:
                 type: claude
                 working_directory: {broken_dir_2}
-            watchers:
+            watcher_rules:
               - connector: rc
                 agent: agent1
                 room: general
@@ -486,10 +488,12 @@ class TestValidationDetailsModal:
               - name: rc
                 type: rocketchat
                 server: {{url: "http://localhost:3000", username: bot, password: pw}}
-            watchers:
-              - connector: rc
+            watcher_rules:
+              - name: w1
+                connector: rc
                 agent: working-agent
-                room: general
+                rooms:
+                  include: [general]
         """)
         app = ConfigToolApp(config_path)
         async with app.run_test() as pilot:
@@ -528,10 +532,12 @@ class TestValidationDetailsModal:
               - name: view-details-hint-test-conn-9f3a1c
                 type: rocketchat
                 server: {{url: "http://localhost:3000", username: bot, password: pw}}
-            watchers:
-              - connector: view-details-hint-test-conn-9f3a1c
+            watcher_rules:
+              - name: w1
+                connector: view-details-hint-test-conn-9f3a1c
                 agent: clean-agent
-                room: general
+                rooms:
+                  include: [general]
         """)
         app = ConfigToolApp(config_path)
         async with app.run_test() as pilot:
@@ -589,7 +595,7 @@ class TestArrowKeyTabSwitching:
         app = ConfigToolApp(config_path)
         async with app.run_test() as pilot:
             await pilot.pause()
-            app.screen.query_one("TabbedContent").active = "tab-watchers"
+            app.screen.query_one("TabbedContent").active = "tab-rules"
             await pilot.pause()
 
             await pilot.press("left")
@@ -696,40 +702,25 @@ class TestDetailScreenNavigation:
             assert "from 'standard'" in body
             assert "preset: readonly" in body
 
-    async def test_watcher_row_pushes_detail_with_group_banner(self, tmp_path, work_dir):
-        config_path = _write_config(tmp_path, _valid_config_text(work_dir))
-        app = ConfigToolApp(config_path)
-        async with app.run_test() as pilot:
-            await pilot.pause()
-            table = app.screen.query_one("#watchers-table", DataTable)
-            table.focus()
-            table.move_cursor(row=0)
-            await pilot.press("enter")
-            await pilot.pause()
-            assert isinstance(app.screen, WatcherDetailScreen)
-            body = str(app.screen.query_one("#watcher-detail-body", Static).render())
-            assert "shared rooms: group" in body
-
-    async def test_selecting_watcher_row_after_config_becomes_invalid_does_not_crash(
+    async def test_selecting_a_rule_row_after_config_becomes_invalid_does_not_crash(
         self, tmp_path, work_dir
     ):
-        """Regression: on_data_table_row_selected's watchers-table branch
-        used to call cfg.expanded_watchers() with no try/except at all,
-        unlike repaint_from_memory()'s equivalent call — selecting a row (any
-        row, including the keyless placeholder shown once the config is
-        already known-broken) after an external edit invalidated the file
-        crashed the whole app instead of being a no-op."""
+        """Regression (inherited from the Watchers tab): selecting a row
+        after an external edit invalidated the file on disk used to crash
+        the whole app. The Rules tab reads the raw in-memory document — no
+        loader call sits on the selection path at all — so selection keeps
+        working against the state the table was painted from, exactly like
+        the Connectors/Agents tabs; save()'s validate gate remains the
+        write-side backstop."""
         config_path = _write_config(tmp_path, _valid_config_text(work_dir))
         app = ConfigToolApp(config_path)
         async with app.run_test() as pilot:
             await pilot.pause()
-            table = app.screen.query_one("#watchers-table", DataTable)
-            assert table.row_count == 3
+            table = app.screen.query_one("#rules-table", DataTable)
+            assert table.row_count == 1
 
             # Invalidate the file on disk without going through the app's
-            # own reload path (mirrors an external process/editor) — drop
-            # the required working_directory so GatewayConfig.from_file()
-            # fails validation.
+            # own reload path (mirrors an external process/editor).
             with open(config_path) as f:
                 text = f.read()
             text = text.replace(f"working_directory: {work_dir}", "")
@@ -742,9 +733,9 @@ class TestDetailScreenNavigation:
             await pilot.pause()
 
             assert app.is_running is True
-            assert isinstance(app.screen, OverviewScreen)  # no detail screen pushed
+            assert isinstance(app.screen, RuleDetailScreen)
 
-    async def test_watcher_row_without_group_has_no_group_banner(self, tmp_path, work_dir):
+    async def test_rule_row_pushes_detail_view(self, tmp_path, work_dir):
         config_path = _write_config(tmp_path, f"""\
             connectors:
               - name: rc
@@ -754,20 +745,26 @@ class TestDetailScreenNavigation:
               default:
                 type: claude
                 working_directory: {work_dir}
-            watchers:
+            watcher_rules:
               - name: standalone
-                room: dev
+                connector: rc
+                agent: default
+                rooms:
+                  include: [dev]
         """)
         app = ConfigToolApp(config_path)
         async with app.run_test() as pilot:
             await pilot.pause()
-            table = app.screen.query_one("#watchers-table", DataTable)
+            table = app.screen.query_one("#rules-table", DataTable)
             table.focus()
             table.move_cursor(row=0)
             await pilot.press("enter")
             await pilot.pause()
-            body = str(app.screen.query_one("#watcher-detail-body", Static).render())
-            assert "shared rooms: group" not in body
+            assert isinstance(app.screen, RuleDetailScreen)
+            assert app.screen.mode == "view"
+            body = str(app.screen.query_one("#rule-detail-body", Static).render())
+            assert "standalone" in body
+            assert "dev" in body
 
     async def test_template_row_pushes_detail_with_used_by_and_blast_radius(
         self, tmp_path, work_dir
@@ -848,14 +845,17 @@ class TestEditorEscapeHatch:
         app = ConfigToolApp(config_path)
         async with app.run_test() as pilot:
             await pilot.pause()
-            assert app.screen.query_one("#watchers-table", DataTable).row_count == 3
+            banner = str(app.screen.query_one("#banner", Static).render())
+            assert "1 rule" in banner
 
             with open(config_path, "a") as f:
-                f.write("  - connector: rc-home\n    agent: my-agent\n    room: extra\n")
+                f.write("  - name: extra\n    connector: rc-home\n"
+                        "    agent: my-agent\n    rooms:\n      include: [extra]\n")
 
             app.reload_config()
             await pilot.pause()
-            assert app.screen.query_one("#watchers-table", DataTable).row_count == 4
+            banner = str(app.screen.query_one("#banner", Static).render())
+            assert "2 rule" in banner
 
 
 class TestDirtyQuitGating:

@@ -28,7 +28,7 @@ from gateway.configtool.modals import (
 )
 from gateway.configtool.screens.agent_detail import AgentDetailScreen
 from gateway.configtool.screens.overview import OverviewScreen
-from gateway.configtool.screens.watcher_detail import WatcherDetailScreen
+from gateway.configtool.screens.rule_detail import RuleDetailScreen
 
 
 def _write_config(tmp_path: Path, yaml_text: str) -> str:
@@ -64,7 +64,7 @@ def _config_with_two_templates(work_dir: Path) -> str:
           - name: rc
             type: rocketchat
             server: {{url: "http://localhost:3000", username: bot, password: pw}}
-        watchers:
+        watcher_rules:
           - connector: rc
             agent: existing-agent
             room: general
@@ -94,7 +94,7 @@ def _config_with_one_agent(work_dir: Path, agent_extra: str = "") -> str:
           - name: rc
             type: rocketchat
             server: {{url: "http://localhost:3000", username: bot, password: pw}}
-        watchers:
+        watcher_rules:
           - connector: rc
             agent: existing-agent
             room: general
@@ -124,20 +124,20 @@ class TestNewAgentEntryPoint:
             await pilot.pause()
             assert isinstance(app.screen, TypePickerModal)
 
-    async def test_n_key_on_watchers_tab_opens_the_create_form(self, tmp_path, work_dir):
-        """Config TUI Phase 3: watcher creation is now supported — 'n' opens
-        WatcherDetailScreen directly in create mode, no type picker/detour
-        (connector/agent are plain Select dropdowns in that same form)."""
+    async def test_n_key_on_rules_tab_opens_the_create_form(self, tmp_path, work_dir):
+        """'n' on the Rules tab opens RuleDetailScreen directly in create
+        mode, no type picker/detour (connector/agent are plain Select
+        dropdowns in that same form)."""
         config_path = _write_config(tmp_path, _config_with_one_agent(work_dir))
         app = ConfigToolApp(config_path)
         async with app.run_test() as pilot:
             await pilot.pause()
-            app.screen.query_one("TabbedContent").active = "tab-watchers"
+            app.screen.query_one("TabbedContent").active = "tab-rules"
             await pilot.pause()
 
             await pilot.press("n")
             await pilot.pause()
-            assert isinstance(app.screen, WatcherDetailScreen)
+            assert isinstance(app.screen, RuleDetailScreen)
             assert app.screen.mode == "create"
 
     async def test_cancelling_the_type_picker_returns_to_overview(self, tmp_path, work_dir):
@@ -380,27 +380,24 @@ class TestEditAgent:
             entry = app.editable_config.agents_raw["existing-agent"]
             assert "lazy_instruction_loading" not in entry
 
-    async def test_session_idle_and_expire_days_fields_are_editable_and_save(
+    async def test_the_session_ttl_fields_are_not_offered_on_an_agent(
         self, tmp_path, work_dir
     ):
-        """docs/design/dynamic-watcher-design.md: AgentConfig.session_idle_days/
-        session_expire_days must be reachable through the TUI form, not just
-        by hand-editing config.yaml — same as every other AgentConfig field."""
+        """The TTLs moved to the watcher rule (design §5.4), so the agent form must
+        not offer them: writing either through this form would produce a config the
+        loader now rejects outright. Asserted as an absence rather than deleted with
+        the fields, so re-adding them to the form without loader support fails here.
+        """
         config_path = _write_config(tmp_path, _config_with_one_agent(work_dir))
         app = ConfigToolApp(config_path)
         async with app.run_test() as pilot:
             await pilot.pause()
             await _open_agent_in_edit_mode(pilot, app)
 
-            app.screen.query_one("#field-session_idle_days", Input).value = "7"
-            app.screen.query_one("#field-session_expire_days", Input).value = "30"
-            await pilot.pause()
-            await pilot.press("ctrl+s")
-            await pilot.pause()
-
-            entry = app.editable_config.agents_raw["existing-agent"]
-            assert entry["session_idle_days"] == 7
-            assert entry["session_expire_days"] == 30
+            for field in ("session_idle_days", "session_expire_days"):
+                assert not app.screen.query(f"#field-{field}"), (
+                    f"the agent form still offers {field}, which the loader rejects"
+                )
 
     async def test_permissions_checkbox_subfield_write(self, tmp_path, work_dir):
         config_path = _write_config(tmp_path, _config_with_one_agent(work_dir))
@@ -847,7 +844,7 @@ def _config_with_two_agents(work_dir: Path) -> str:
           - name: rc
             type: rocketchat
             server: {{url: "http://localhost:3000", username: bot, password: pw}}
-        watchers:
+        watcher_rules:
           - connector: rc
             agent: existing-agent
             room: general
@@ -1091,10 +1088,16 @@ class TestResetFieldToInherited:
         dict out of the entry, diverging from what apply_update() actually
         does at Save (only remove the one sub-key, keep the parent dict —
         and its still-explicit sibling sub-keys — if anything remains).
-        With 'enabled'/'skip_owner_approval' left explicit, resetting only
-        'timeout' must NOT flip the label to inherited/default — the
-        'permissions' dict survives the reset (siblings keep it non-empty),
-        so it's still explicit, exactly like Save would leave it."""
+
+        What this asserts is the surviving half of that finding, which is what
+        its name says: the SIBLINGS are untouched, and Save keeps the parent
+        dict holding them. It used to assert instead that the reset field's own
+        label stayed "(explicit)" — true only because provenance was computed
+        per whole top-level field, so every sub-key of a partly-set block read
+        explicit whatever the template supplied. Provenance is per sub-key now
+        (the granularity `_deep_merge` actually has), so the reset field
+        reports what Save will really leave it as, and the assertion that
+        mattered — the siblings — is strengthened rather than dropped."""
         config_path = _write_config(
             tmp_path,
             _config_with_one_agent(
@@ -1109,14 +1112,35 @@ class TestResetFieldToInherited:
 
             field = app.screen.query_one("#field-permissions-timeout", Input)
             prov = app.screen.query_one("#prov-field-permissions-timeout", Static)
+            siblings = {
+                key: app.screen.query_one(f"#prov-field-permissions-{key}", Static)
+                for key in ("enabled", "skip_owner_approval")
+            }
             assert "explicit" in str(prov.render())
+            for key, widget in siblings.items():
+                assert "explicit" in str(widget.render()), key
 
             field.focus()
             await pilot.pause()
             await pilot.press("ctrl+r")
             await pilot.pause()
 
-            assert "explicit" in str(prov.render())
+            # The reset field falls to the dataclass default: this template
+            # sets no `permissions` at all, so there is nothing to inherit.
+            assert "explicit" not in str(prov.render())
+            assert "default" in str(prov.render())
+            # The finding's actual subject — untouched.
+            for key, widget in siblings.items():
+                assert "explicit" in str(widget.render()), key
+
+            await pilot.press("ctrl+s")
+            await pilot.pause()
+
+        entry = yaml.safe_load(Path(config_path).read_text())["agents"]["existing-agent"]
+        assert entry["permissions"] == {"enabled": True, "skip_owner_approval": False}, (
+            "the parent dict survives with its explicit siblings; only the "
+            "reset sub-key is removed"
+        )
 
     async def test_ctrl_r_on_a_non_field_widget_is_a_safe_no_op(self, tmp_path, work_dir):
         """Name/Description inputs aren't tagged with field_key (no
@@ -1209,7 +1233,7 @@ class TestInheritsPicker:
               - name: rc
                 type: rocketchat
                 server: {{url: "http://localhost:3000", username: bot, password: pw}}
-            watchers:
+            watcher_rules:
               - connector: rc
                 agent: existing-agent
                 room: general

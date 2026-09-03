@@ -8,6 +8,13 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
+from gateway.core.bot_identity import (
+    BotIdentity,
+    ConnectorIdentityError,
+    DmClaim,
+    DuplicateBotIdentityError,
+    canonical_origin,
+)
 from gateway.service import GatewayService
 
 
@@ -19,7 +26,19 @@ def _make_service() -> GatewayService:
     service._runtime_manager = MagicMock()
     service._control = MagicMock()
     service._entries = []
+    service._dm_owner_connectors = set()
     return service
+
+
+def _accountless():
+    """A connector declaring no shared bot account, which is what these tests are.
+
+    `bot_identity()` returning None is the base class's answer for a connector with no
+    account other connectors could also authenticate as — see gateway/core/connector.py.
+    """
+    connector = MagicMock()
+    connector.bot_identity = MagicMock(return_value=None)
+    return connector
 
 
 class TestGatewayServiceRun(unittest.IsolatedAsyncioTestCase):
@@ -29,9 +48,12 @@ class TestGatewayServiceRun(unittest.IsolatedAsyncioTestCase):
         service._runtime_manager.has_active_brokers = False
         service._runtime_manager.unavailable_agents = set()
         sm = MagicMock()
-        sm.run_once = AsyncMock(return_value=[])
+        sm.connect_only = AsyncMock()
+        sm.sync_only = AsyncMock(return_value=[])
         sm.shutdown = AsyncMock()
-        service._entries = [SimpleNamespace(name="script", session_manager=sm)]
+        service._entries = [
+            SimpleNamespace(name="script", session_manager=sm, connector=_accountless())
+        ]
         service._control.start = AsyncMock(side_effect=RuntimeError("control boom"))
         service._control.stop = AsyncMock()
         service._runtime_manager.stop_all = AsyncMock()
@@ -86,10 +108,13 @@ class TestGatewayServiceRun(unittest.IsolatedAsyncioTestCase):
         good_run_once_finished = asyncio.Event()
         good_shutdown_called_before_finished = False
 
-        async def slow_good_run_once(**kwargs):
+        async def slow_good_connect(**kwargs):
             nonlocal good_shutdown_called_before_finished
             # Simulate a real RC/Mattermost connect() taking longer than a
             # bad connector's near-instant DNS/connection-refused failure.
+            # The slowness belongs to the CONNECT phase specifically: that is
+            # where a login plus handshake actually is slow, and it is the
+            # phase whose failure the identity barrier now sits behind.
             await asyncio.sleep(0.05)
             good_run_once_finished.set()
             return []
@@ -100,16 +125,26 @@ class TestGatewayServiceRun(unittest.IsolatedAsyncioTestCase):
                 good_shutdown_called_before_finished = True
 
         good_sm = MagicMock()
-        good_sm.run_once = AsyncMock(side_effect=slow_good_run_once)
+        good_sm.connect_only = AsyncMock(side_effect=slow_good_connect)
+        good_sm.sync_only = AsyncMock(return_value=[])
         good_sm.shutdown = AsyncMock(side_effect=good_shutdown)
 
         bad_sm = MagicMock()
-        bad_sm.run_once = AsyncMock(side_effect=ConnectionError("bad url: test"))
+        bad_sm.connect_only = AsyncMock(side_effect=ConnectionError("bad url: test"))
+        bad_sm.sync_only = AsyncMock(return_value=[])
         bad_sm.shutdown = AsyncMock()
 
         service._entries = [
-            SimpleNamespace(name="good-existing-connector", session_manager=good_sm),
-            SimpleNamespace(name="bad-new-connector", session_manager=bad_sm),
+            SimpleNamespace(
+                name="good-existing-connector",
+                session_manager=good_sm,
+                connector=_accountless(),
+            ),
+            SimpleNamespace(
+                name="bad-new-connector",
+                session_manager=bad_sm,
+                connector=_accountless(),
+            ),
         ]
 
         with self.assertRaises(ConnectionError):
@@ -127,6 +162,216 @@ class TestGatewayServiceRun(unittest.IsolatedAsyncioTestCase):
             "state — this is the orphaned-task race that wipes out session "
             "IDs for a connector that was never actually part of the failure.",
         )
+
+
+class TestTheExpiryExemptionOracleIsGone(unittest.TestCase):
+    """What was removed, and why nothing replaced it.
+
+    `_has_pending_jobs` answered "does a pending scheduled job target this
+    watcher", and the sweep used it to exempt that room from expiry. Codex round
+    10 had made it honour the scheduler's own connector fallback, so the two
+    agreed about which jobs claimed a watcher.
+
+    Both are gone (owner, 2026-08-31). The exemption existed because "expiry
+    deletes the record the recreation reads from, leaving the job pointing at
+    nothing" — and a job now records the room it targets and resurrects it, so
+    there is no record to protect. The cancel-side rule the oracle's fallback
+    logic was shared with is still live and still tested (see
+    `TestTheCancellationClaimRule` below).
+    """
+
+    def test_the_service_no_longer_answers_it(self):
+        from gateway.service import GatewayService
+
+        self.assertFalse(hasattr(GatewayService, "_has_pending_jobs"))
+
+
+class TestTheCancellationClaimRule(unittest.TestCase):
+    """`_cancel_jobs_for` — the cancel side, which is STILL LIVE.
+
+    Restored after a review found it had lost its only test: the previous attempt
+    deleted five tests when the exemption oracle went, and one of them covered
+    this. `_cancel_jobs_for` is production code, wired to the membership-remove
+    handler, and it carries Codex round 11's claim rule — a job with an empty or
+    stale `connector` is DELIVERABLE to this watcher through the scheduler's
+    fallback scan, so it must also be CANCELLABLE through it, or a reclaim leaves
+    it orphaned: failing resolution forever if active, listed permanently if
+    paused.
+    """
+
+    def _service_with_jobs(self, jobs):
+        """`jobs` items are `(id, watcher, connector)` or `(id, watcher,
+        connector, room_id)`. A job with no room id is a pre-schema-2 one, which
+        is matched by handle."""
+        from gateway.schedule_types import JobStatus, ScheduledJob
+
+        service = _make_service()
+        entry = MagicMock()
+        entry.name = "rc"
+        service._entries = [entry]
+        service._job_store = MagicMock()
+        service._job_store.list_jobs = MagicMock(return_value=[
+            ScheduledJob(id=spec[0], watcher=spec[1], connector=spec[2],
+                         room_id=(spec[3] if len(spec) > 3 else ""),
+                         status=JobStatus.ACTIVE)
+            for spec in jobs
+        ])
+        service._job_store.cancel = MagicMock(return_value=True)
+        return service
+
+    def test_a_job_on_this_connector_is_cancelled(self):
+        service = self._service_with_jobs([("acg-1", "rc:general", "rc")])
+
+        service._cancel_jobs_for("rc", "room-1", legacy_handle="rc:general")
+
+        service._job_store.cancel.assert_called_once()
+
+        self.assertEqual(service._job_store.cancel.call_args.args[0], "acg-1")
+        self.assertEqual(service._job_store.cancel.call_args.kwargs["reason"],
+                         "the bot was removed from the room, so the job could never deliver")
+
+    def test_a_job_with_no_connector_is_cancelled_too(self):
+        """The fallback claim: the scheduler would deliver it here, so a reclaim
+        must be able to cancel it here."""
+        service = self._service_with_jobs([("acg-1", "rc:general", "")])
+
+        service._cancel_jobs_for("rc", "room-1", legacy_handle="rc:general")
+
+        service._job_store.cancel.assert_called_once()
+
+        self.assertEqual(service._job_store.cancel.call_args.args[0], "acg-1")
+
+    def test_a_job_naming_a_connector_that_no_longer_exists_is_cancelled(self):
+        service = self._service_with_jobs([("acg-1", "rc:general", "retired")])
+
+        service._cancel_jobs_for("rc", "room-1", legacy_handle="rc:general")
+
+        service._job_store.cancel.assert_called_once()
+
+        self.assertEqual(service._job_store.cancel.call_args.args[0], "acg-1")
+
+    def test_another_configured_connectors_job_is_left_alone(self):
+        """The one case the fallback must NOT swallow: `mm` is configured, so its
+        job is deliverable there and is not this reclaim's business."""
+        service = self._service_with_jobs([("acg-1", "rc:general", "mm")])
+        other = MagicMock()
+        other.name = "mm"
+        service._entries.append(other)
+
+        service._cancel_jobs_for("rc", "room-1", legacy_handle="rc:general")
+
+        service._job_store.cancel.assert_not_called()
+
+    def test_another_watchers_job_is_left_alone(self):
+        service = self._service_with_jobs([("acg-1", "rc:dev", "rc")])
+
+        service._cancel_jobs_for("rc", "room-1", legacy_handle="rc:general")
+
+        service._job_store.cancel.assert_not_called()
+class TestIdentityBarrier(unittest.IsolatedAsyncioTestCase):
+    """The barrier's value is its *position*, so these assert ordering, not just refusal.
+
+    A check that rejects duplicates after one connector has subscribed prevents nothing:
+    that connector is already receiving and answering. `find_identity_conflicts` is unit
+    tested elsewhere; what cannot be tested there is that startup runs it between the
+    two phases, because a SessionManager owns one connector and can never see the pair.
+    """
+
+    def _service_with(self, *identities, dms=None):
+        service = _make_service()
+        service._runtime_manager.start_all = AsyncMock(return_value=[])
+        service._runtime_manager.has_active_brokers = False
+        service._runtime_manager.unavailable_agents = set()
+        service._runtime_manager.stop_all = AsyncMock()
+        service._control.start = AsyncMock()
+        service._control.stop = AsyncMock()
+        service._dm_claims = dict(dms or {})
+
+        entries = []
+        for i, identity in enumerate(identities):
+            sm = MagicMock()
+            sm.connect_only = AsyncMock()
+            sm.sync_only = AsyncMock(return_value=[])
+            sm.shutdown = AsyncMock()
+            connector = MagicMock()
+            connector.bot_identity = MagicMock(return_value=identity)
+            entries.append(
+                SimpleNamespace(name=f"c{i}", session_manager=sm, connector=connector))
+        service._entries = entries
+        return service
+
+    async def test_a_shared_account_is_refused_before_anything_subscribes(self):
+        same = BotIdentity("rocketchat", "https://chat.example.com", "user-abc")
+        service = self._service_with(same, same)
+
+        with self.assertRaises(DuplicateBotIdentityError):
+            await service.run(startup_fd=-1)
+
+        for entry in service._entries:
+            entry.session_manager.connect_only.assert_awaited_once()
+            entry.session_manager.sync_only.assert_not_awaited()
+
+    async def test_distinct_accounts_reach_the_second_phase(self):
+        """Otherwise the test above would pass against a barrier that refuses always."""
+        service = self._service_with(
+            BotIdentity("rocketchat", "https://chat.example.com", "user-a"),
+            BotIdentity("rocketchat", "https://chat.example.com", "user-b"),
+        )
+        service._control.start = AsyncMock(side_effect=RuntimeError("stop here"))
+
+        with self.assertRaisesRegex(RuntimeError, "stop here"):
+            await service.run(startup_fd=-1)
+
+        for entry in service._entries:
+            entry.session_manager.sync_only.assert_awaited_once()
+
+    async def test_the_url_spelling_does_not_decide_it(self):
+        """Two operators writing one server differently is a duplicate, not two."""
+        service = self._service_with(
+            BotIdentity("rocketchat", canonical_origin("https://chat.example.com/"), "user-abc"),
+            BotIdentity("rocketchat", canonical_origin("https://chat.example.com:443"), "user-abc"),
+        )
+
+        with self.assertRaises(DuplicateBotIdentityError):
+            await service.run(startup_fd=-1)
+
+    async def test_a_connector_that_cannot_identify_itself_stops_startup(self):
+        """Fail-closed: unanswerable cannot be compared, so it does not start."""
+        service = self._service_with(BotIdentity("rocketchat", "https://s", "u1"))
+        service._entries[0].connector.bot_identity = MagicMock(
+            side_effect=ConnectorIdentityError("whoami failed"))
+
+        with self.assertRaises(ConnectorIdentityError):
+            await service.run(startup_fd=-1)
+
+        service._entries[0].session_manager.sync_only.assert_not_awaited()
+
+    async def test_two_overlapping_dm_claims_across_teams_are_refused(self):
+        """The exception's condition, wired: the claims come from the service's own map,
+        derived from both watcher shapes at construction."""
+        service = self._service_with(
+            BotIdentity("mattermost", "https://mm.example.com", "user-abc", scope="team-1"),
+            BotIdentity("mattermost", "https://mm.example.com", "user-abc", scope="team-2"),
+            dms={"c0": DmClaim(direct=True), "c1": DmClaim(direct=True)},
+        )
+
+        with self.assertRaises(DuplicateBotIdentityError) as cm:
+            await service.run(startup_fd=-1)
+        self.assertIn("direct message", str(cm.exception).lower())
+
+    async def test_different_teams_without_dm_overlap_start_normally(self):
+        service = self._service_with(
+            BotIdentity("mattermost", "https://mm.example.com", "user-abc", scope="team-1"),
+            BotIdentity("mattermost", "https://mm.example.com", "user-abc", scope="team-2"),
+            dms={"c0": DmClaim(direct=True)},
+        )
+        service._control.start = AsyncMock(side_effect=RuntimeError("stop here"))
+
+        with self.assertRaisesRegex(RuntimeError, "stop here"):
+            await service.run(startup_fd=-1)
+
+        for entry in service._entries:
+            entry.session_manager.sync_only.assert_awaited_once()
 
 
 class TestGatewayServiceShutdown(unittest.IsolatedAsyncioTestCase):
@@ -511,10 +756,6 @@ class TestServiceRunFatalHandshake(unittest.IsolatedAsyncioTestCase):
         self.assertIn("ok", payload)
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 # ── Appended from test_round7_fixes.py ────────────────────────────────────────
 
 
@@ -557,3 +798,151 @@ class TestStartupFdOnCancel(unittest.IsolatedAsyncioTestCase):
 
         fds_written = [fd for fd, _ in write_signal_calls]
         self.assertIn(5, fds_written, "startup_fd must be written/closed in finally on CancelledError")
+
+class TestCancellationRequiresOwnershipNotJustTheRoom(unittest.TestCase):
+    """Cancelling by ROOM alone let one connector delete another's job.
+
+    `_claims_this_room` matched a job by `room_id`, and the surrounding filter
+    admitted it when `j.connector not in configured` — a clause added so a job
+    with a stale connector, deliverable through the scheduler's fallback scan,
+    stayed cancellable too. But a room id does not name an owner: ids are
+    per-server, and the canonical multi-agent setup is one account per agent in
+    the same rooms. So a job belonging to a connector that had been renamed away
+    was deleted by a DIFFERENT connector's membership event, under an audit line
+    saying the bot had been removed from the room. It had not been removed from
+    that agent's account.
+
+    Cancellation is destructive and unappealable, so ambiguity must not resolve
+    to "delete". The job is left instead: it fails loudly at its next fire, which
+    an operator can still repair.
+    """
+
+    def _service_with_jobs(self, jobs):
+        from gateway.schedule_types import JobStatus, ScheduledJob
+
+        service = _make_service()
+        entry = MagicMock()
+        entry.name = "rc"
+        service._entries = [entry]
+        service._job_store = MagicMock()
+        service._job_store.list_jobs = MagicMock(return_value=[
+            ScheduledJob(id=spec[0], watcher=spec[1], connector=spec[2],
+                         room_id=(spec[3] if len(spec) > 3 else ""),
+                         status=JobStatus.ACTIVE)
+            for spec in jobs
+        ])
+        service._job_store.cancel = MagicMock(return_value=True)
+        return service
+
+    def _removed(self, service):
+        return [c.args[0] for c in service._job_store.cancel.call_args_list]
+
+    def test_another_connectors_job_in_the_same_room_is_left_alone(self):
+        service = self._service_with_jobs([
+            ("acg-mine", "rc:general", "rc", "room-1"),
+            ("acg-theirs", "alice:general", "alice", "room-1"),
+        ])
+
+        service._cancel_jobs_for("rc", "room-1", legacy_handle="rc:general")
+
+        self.assertEqual(self._removed(service), ["acg-mine"])
+
+    def test_a_retired_connectors_job_is_left_alone_too(self):
+        """The exact case the removed escape clause admitted: `alice` is not in
+        `configured`, so the old filter treated its job as fair game."""
+        service = self._service_with_jobs([
+            ("acg-theirs", "alice:general", "alice", "room-1"),
+        ])
+
+        service._cancel_jobs_for("rc", "room-1", legacy_handle="rc:general")
+
+        self.assertEqual(self._removed(service), [])
+
+    def test_a_pre_schema_2_job_is_still_cancelled_by_its_handle(self):
+        """The case the escape clause existed for, kept: the job's `connector`
+        field is empty, so ownership comes from the handle's prefix — which is
+        this connector. Note the handle alone is NOT enough when the connector
+        field names a configured connector; see
+        `TestTheCancellationClaimRule::test_another_configured_connectors_job_is_left_alone`,
+        because delivery reads that field first."""
+        service = self._service_with_jobs([
+            ("acg-old", "rc:general", ""),
+        ])
+
+        service._cancel_jobs_for("rc", "room-1", legacy_handle="rc:general")
+
+        self.assertEqual(self._removed(service), ["acg-old"])
+
+    def test_a_pre_schema_2_job_under_another_connectors_handle_is_left_alone(self):
+        service = self._service_with_jobs([
+            ("acg-old", "alice:general", ""),
+        ])
+
+        service._cancel_jobs_for("rc", "room-1", legacy_handle="rc:general")
+
+        self.assertEqual(self._removed(service), [])
+
+
+class TestCancellationMatchesByRoomNotByHandle(unittest.TestCase):
+    """Found by the sweep, after the same defect class appeared three times.
+
+    A handle can be taken over by another room once the original's record is
+    reclaimed — which this branch made routine by removing the expiry exemption
+    for job-bearing rooms. Matching jobs by handle was then wrong in BOTH
+    directions, and both were silent:
+
+    * a live room's job was deleted under the audit line "the bot was removed
+      from the room", which is false for that room;
+    * this room's own job, if its handle had since moved, was left firing at a
+      room the bot had left.
+    """
+
+    def _service(self, jobs):
+        from gateway.schedule_types import JobStatus, ScheduledJob
+
+        service = _make_service()
+        entry = MagicMock()
+        entry.name = "rc"
+        service._entries = [entry]
+        service._job_store = MagicMock()
+        service._job_store.list_jobs = MagicMock(return_value=[
+            ScheduledJob(id=jid, watcher=w, connector="rc", room_id=r,
+                         status=JobStatus.ACTIVE)
+            for jid, w, r in jobs
+        ])
+        service._job_store.cancel = MagicMock(return_value=True)
+        return service
+
+    def test_another_rooms_job_under_the_same_handle_survives(self):
+        """Room B holds the handle and is alive; the bot was removed from A."""
+        service = self._service([("acg-b", "rc:general", "room-B")])
+
+        service._cancel_jobs_for("rc", "room-A", legacy_handle="rc:general")
+
+        service._job_store.cancel.assert_not_called()
+
+    def test_this_rooms_job_is_cancelled_even_under_a_moved_handle(self):
+        """A's job was created when A held `rc:general`; A has since been
+        renamed, so its record's handle differs. The room id still matches."""
+        service = self._service([("acg-a", "rc:general", "room-A")])
+
+        service._cancel_jobs_for("rc", "room-A", legacy_handle="rc:daily-standup")
+
+        service._job_store.cancel.assert_called_once()
+
+        self.assertEqual(service._job_store.cancel.call_args.args[0], "acg-a")
+
+    def test_a_pre_schema_2_job_still_matches_by_handle(self):
+        """It has no id, so the handle is the only key it has."""
+        service = self._service([("acg-old", "rc:general", "")])
+
+        service._cancel_jobs_for("rc", "room-A", legacy_handle="rc:general")
+
+        service._job_store.cancel.assert_called_once()
+
+        self.assertEqual(service._job_store.cancel.call_args.args[0], "acg-old")
+
+
+
+if __name__ == "__main__":
+    unittest.main()

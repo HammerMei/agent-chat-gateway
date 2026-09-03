@@ -47,12 +47,42 @@ def main():
     sub.add_parser("status", help="Show gateway status")
 
     # list
-    list_p = sub.add_parser("list", help="List all watchers")
+    list_p = sub.add_parser(
+        "list",
+        help="List watchers (default: every state except idle)",
+        description=(
+            "List the watchers the gateway holds state records for.  With no "
+            "state flag, shows every state except idle — the watchers an "
+            "operator is realistically about to act on."
+        ),
+    )
     list_p.add_argument(
         "--connector",
         default=None,
         metavar="NAME",
         help="Filter by connector name (default: show watchers across all connectors)",
+    )
+    # Additive flags rather than a mutually exclusive group: the states compose,
+    # and `--active --idle` is a meaningful question.  `--all` is the shorthand
+    # for naming every one of them.
+    list_p.add_argument(
+        "--active", action="store_true", help="Include active watchers"
+    )
+    list_p.add_argument(
+        "--idle",
+        action="store_true",
+        help="Include idle watchers (known rooms with nothing running)",
+    )
+    list_p.add_argument(
+        "--paused", action="store_true", help="Include paused watchers"
+    )
+    list_p.add_argument(
+        "--failed",
+        action="store_true",
+        help="Include watchers whose start failed (a record, but nothing running)",
+    )
+    list_p.add_argument(
+        "--all", action="store_true", help="Include every state"
     )
 
     # pause
@@ -69,6 +99,18 @@ def main():
         help="Reset a watcher: clear runtime state and start a fresh session",
     )
     reset_p.add_argument("watcher_name", help="Watcher name as defined in config.yaml")
+
+    # expire
+    expire_p = sub.add_parser(
+        "expire",
+        help="Expire a rule-derived watcher now: clear its session and reclaim "
+             "its record and files (overrides pause, audibly). Scheduled jobs "
+             "are KEPT — the room's next message, or the job itself, recreates "
+             "the watcher. Refused on connectors that receive no unsolicited "
+             "messages (voice, script): only a restart or a scheduled job would "
+             "bring the watcher back — use 'reset' there",
+    )
+    expire_p.add_argument("watcher_name", help="Watcher name as shown by 'list'")
 
     # onboard
     onboard_p = sub.add_parser(
@@ -101,7 +143,11 @@ def main():
         "--connector",
         default=None,
         metavar="NAME",
-        help="Connector to send through (default: first configured connector)",
+        help=(
+            "Connector to send through. Optional when exactly one is "
+            "configured; REQUIRED when there are several — the daemon refuses "
+            "to guess rather than picking one"
+        ),
     )
 
     # fetch-history
@@ -218,7 +264,8 @@ def main():
         default=None,
         metavar="TIMEZONE",
         help="IANA timezone (e.g. 'Asia/Taipei', 'America/New_York', 'UTC'). "
-             "Fallback: the watcher's connector timezone setting, then server local.",
+             "If omitted, a --starting time is read in the server's local timezone; "
+             "the connector's timezone setting applies only to schedules with no --starting.",
     )
 
     # schedule list
@@ -233,7 +280,7 @@ def main():
         "--all",
         action="store_true",
         dest="include_completed",
-        help="Also show recently completed tasks (within TTL window)",
+        help="Also show recently completed or cancelled tasks (within the TTL window)",
     )
 
     # schedule delete
@@ -245,8 +292,23 @@ def main():
     sched_pause_p.add_argument("job_id", help="Job ID")
 
     # schedule resume
-    sched_resume_p = schedule_sub.add_parser("resume", help="Resume a paused scheduled task")
+    sched_resume_p = schedule_sub.add_parser("resume", help="Resume a paused scheduled task, or restore a cancelled one")
     sched_resume_p.add_argument("job_id", help="Job ID")
+
+    # schedule migrate
+    schedule_sub.add_parser(
+        "migrate",
+        help="Bring jobs.json up to the current schema (run after upgrading)",
+        description=(
+            "Records what each scheduled job needs to keep working after an "
+            "upgrade. Safe to re-run: a job that is already up to date is left "
+            "alone, and nothing is ever guessed — a job whose room cannot be "
+            "identified is reported and left exactly as it was.\n\n"
+            "Run it BEFORE renaming any rooms. The migration finds each job's "
+            "room through its watcher name, and a name that has moved to a "
+            "different room would point the job at the wrong one."
+        ),
+    )
 
     args = parser.parse_args()
 
@@ -286,7 +348,12 @@ def main():
 
             # Get watcher count from daemon
             try:
-                result = _send_command({"cmd": "list"})
+                # Explicitly every state, not the `list` default.  `status`
+                # answers "what does this daemon know about"; `list` answers
+                # "what is an operator about to act on".  Inheriting the default
+                # would silently drop idle rooms from a count that reads as a
+                # total.
+                result = _send_command({"cmd": "list", "states": _ALL_STATES})
                 if result["ok"]:
                     count = len(result.get("data", []))
                     print(f"Watchers: {count}")
@@ -299,20 +366,28 @@ def main():
         cmd_data = {"cmd": "list"}
         if args.connector is not None:
             cmd_data["connector"] = args.connector
+        states = _requested_states(args)
+        if states is not None:
+            cmd_data["states"] = states
         result = _send_command(cmd_data)
         watchers = result.get("data", [])
         connector_errors = result.get("errors", [])
         if watchers:
-            for w in watchers:
-                status = "PAUSED" if w.get("paused") else ("active" if w.get("active") else "inactive")
-                agent_label = f"[{w.get('agent_name', '?')}]"
-                connector_label = f"({w.get('connector', '?')})"
-                print(
-                    f"{w['watcher_name']}: {connector_label} {w['room_name']} "
-                    f"{agent_label} session={w.get('session_id', '(none)')} [{status}]"
-                )
-        elif not connector_errors:
-            print("No configured watchers")
+            _print_watcher_table(watchers)
+        elif not connector_errors and result["ok"]:
+            # `result["ok"]` matters: an unknown --connector comes back as a
+            # hard failure with no `errors` list, and "no watchers, try --all"
+            # is a substantive answer to a query that never ran.
+            # Says which question was asked, because the default excludes idle:
+            # "none" and "none you asked about" are different answers.  The
+            # default branch names the excluded state rather than the
+            # included ones, so it survives a fourth state being added.  The
+            # argparse help below does NOT: it enumerates, and it has to be
+            # edited whenever `StateFilter.OPERABLE` changes.
+            if states:
+                print(f"No {'/'.join(states)} watchers")
+            else:
+                print("No watchers (idle ones are hidden by default — use --all)")
         # Surface per-connector failures (partial failure case)
         for ce in connector_errors:
             print(
@@ -340,6 +415,23 @@ def main():
         result = _send_command(cmd_data)
         if result["ok"]:
             print(f"Watcher '{args.watcher_name}' resumed")
+        else:
+            print(f"Error: {result.get('error')}", file=sys.stderr)
+            sys.exit(1)
+
+    elif args.command == "expire":
+        cmd_data = {"cmd": "expire", "watcher_name": args.watcher_name}
+        result = _send_command(cmd_data)
+        if result["ok"]:
+            # NOT "scheduled jobs reclaimed" — expire does not touch them, and
+            # this is the success line an operator actually reads. It said the
+            # opposite of the `--help` two hundred lines up, which was fixed in
+            # the same commit that claimed to have swept "all of it
+            # operator-facing". Found by review.
+            print(f"Watcher '{args.watcher_name}' expired — record, session and "
+                  f"files reclaimed. Its scheduled jobs are kept; the room's "
+                  f"next message, or a job's own next run, recreates the "
+                  f"watcher.")
         else:
             print(f"Error: {result.get('error')}", file=sys.stderr)
             sys.exit(1)
@@ -379,6 +471,86 @@ def main():
 
     elif args.command == "config":
         _run_config(args)
+
+
+# The CLI's own spelling of every state, so `status` and `--all` cannot drift
+# apart when a fourth state is added. `StateFilter.ALL` is the authority; this
+# list is what a socket client sends, and `parse_state_filter` refuses a name
+# the two do not agree on — loudly, which is why the duplication is safe here
+# and importing `gateway.core` into the client for one list is not worth it.
+_ALL_STATES = ["active", "idle", "paused", "failed"]
+
+
+def _requested_states(args) -> list[str] | None:
+    """Translate the list flags into wire state names; None means "the default".
+
+    Returning None rather than spelling out the default keeps one definition of
+    what "default" means, on the server side (``StateFilter.OPERABLE``), instead
+    of a second copy here that has to be kept in step.
+    """
+    if args.all:
+        return list(_ALL_STATES)
+    chosen = [
+        name
+        for name, wanted in (
+            ("active", args.active),
+            ("idle", args.idle),
+            ("paused", args.paused),
+            ("failed", args.failed),
+        )
+        if wanted
+    ]
+    return chosen or None
+
+
+def _print_watcher_table(watchers: list[dict]) -> None:
+    """Print the watcher rows as an aligned table (design §2.3).
+
+    The participants column is not decoration: an opaque group-DM label is only
+    acceptable because something else in the same view answers "which group is
+    this".  It therefore belongs in the default output rather than behind a
+    verbose flag.
+    """
+    columns = (
+        ("NAME", "watcher_name"),
+        ("CONNECTOR", "connector"),
+        ("ROOM", "room_name"),
+        ("ROOM ID", "room_id"),
+        ("AGENT", "agent_name"),
+        ("STATE", "state"),
+        # Kept despite the width: this is the only surface an operator can read
+        # a session id from without opening state.<connector>.json, and its
+        # remaining use is being pasted into the backend's own resume command.
+        ("SESSION", "session_id"),
+        ("PARTICIPANTS", "participants"),
+    )
+    rows = []
+    for w in watchers:
+        row = []
+        for _, key in columns:
+            value = w.get(key, "")
+            if isinstance(value, list):
+                # `str(v)`, not bare join: the loader refuses non-string
+                # elements, but a formatter is the wrong place to discover that
+                # — joining an int raises and takes down the whole table, every
+                # connector's rows with it, rather than misrendering one cell.
+                value = ", ".join(str(v) for v in value)
+            row.append(str(value) if value else "—")
+        rows.append(row)
+
+    widths = [
+        max([len(header)] + [len(row[i]) for row in rows])
+        for i, (header, _) in enumerate(columns)
+    ]
+
+    def _line(cells: list[str]) -> str:
+        # rstrip drops the last cell's ljust padding; no cell is ever empty
+        # (an absent value renders as an em dash), so this is only cosmetic.
+        return "  ".join(c.ljust(w) for c, w in zip(cells, widths)).rstrip()
+
+    print(_line([header for header, _ in columns]))
+    for row in rows:
+        print(_line(row))
 
 
 def _run_config(args) -> None:
@@ -573,7 +745,10 @@ def _run_send(args) -> None:
 def _run_schedule(args) -> None:
     """Handle 'schedule' subcommands."""
     if not hasattr(args, "schedule_cmd") or not args.schedule_cmd:
-        print("Usage: agent-chat-gateway schedule {create,list,delete,pause,resume}")
+        print(
+            "Usage: agent-chat-gateway schedule "
+            "{create,list,delete,pause,resume,migrate}"
+        )
         sys.exit(1)
 
     if args.schedule_cmd == "create":
@@ -586,6 +761,8 @@ def _run_schedule(args) -> None:
         _run_schedule_pause(args)
     elif args.schedule_cmd == "resume":
         _run_schedule_resume(args)
+    elif args.schedule_cmd == "migrate":
+        _run_schedule_migrate(args)
     else:
         print(f"Unknown schedule subcommand: {args.schedule_cmd}", file=sys.stderr)
         sys.exit(1)
@@ -771,6 +948,9 @@ def _run_schedule_list(args) -> None:
         if status == "completed":
             raw_ts = j.get("completed_at")
             next_run_str = f"done {_fmt_ts(raw_ts)}" if raw_ts else "done"
+        elif status == "cancelled":
+            raw_ts = j.get("cancelled_at")
+            next_run_str = f"cancelled {_fmt_ts(raw_ts)}" if raw_ts else "cancelled"
         else:
             next_run_str = _fmt_ts(j.get("next_run"))
         message = textwrap.shorten(j.get("message", ""), width=40, placeholder="…")
@@ -787,6 +967,60 @@ def _run_schedule_delete(args) -> None:
     else:
         print(f"Error: {result.get('error')}", file=sys.stderr)
         sys.exit(1)
+
+
+def _run_schedule_migrate(args) -> None:
+    """Print what the migration did, per job. Silence would be the failure mode."""
+    result = _send_command({"cmd": "schedule-migrate"})
+    if not result["ok"]:
+        print(f"Error: {result.get('error')}", file=sys.stderr)
+        sys.exit(1)
+
+    # "Nothing to do" means no STEP ran — not that the versions match. A file
+    # already at the current version can still owe work: `needs_migration`
+    # also looks at the jobs, and a live job with no room id re-runs the 1→2
+    # step at version 2. Keying this on the version alone hid that run's
+    # outcomes — including jobs needing attention — behind "nothing to do",
+    # while the startup warning kept firing (Codex, PR #140 round 2).
+    if not result.get("steps") and not result.get("outcomes"):
+        print(f"jobs.json is already at schema version {result['to_version']} "
+              f"— nothing to do.")
+        return
+
+    for step in result.get("steps", []):
+        print(f"  {step}")
+    if result.get("steps"):
+        print()
+
+    outcomes = result.get("outcomes", [])
+    for outcome in outcomes:
+        mark = ("✓" if outcome["changed"]
+                else "✗" if outcome.get("needs_attention") else "·")
+        print(f"  {mark} {outcome['job_id']}  {outcome['watcher']}")
+        print(f"      {outcome['detail']}")
+
+    # The flag, not a substring of the human-readable detail — "already up to
+    # date" is not attention-worthy and a reworded sentence must not change a
+    # count.
+    unresolved = [o for o in outcomes if o.get("needs_attention")]
+    print()
+    # `stamped`, not `to_version`: the version only moves when nothing was left
+    # needing attention, so claiming the file reached `to_version` here would be
+    # contradicted by the next startup warning.
+    if result.get("stamped"):
+        print(f"jobs.json migrated {result['from_version']} → "
+              f"{result['to_version']}: {result['changed']} of {len(outcomes)} "
+              f"job(s) changed.")
+    else:
+        print(f"jobs.json is STILL at schema version {result['from_version']}: "
+              f"{result['changed']} of {len(outcomes)} job(s) changed, but the "
+              f"version does not move while any job needs attention.")
+    if unresolved:
+        # Named rather than summarised: each of these needs a decision, and the
+        # migration deliberately made none of them.
+        print(f"{len(unresolved)} job(s) need attention — see the lines above. "
+              f"Nothing was guessed for them; they work exactly as before.")
+        print("Fix those, then run 'schedule migrate' again.")
 
 
 def _run_schedule_pause(args) -> None:

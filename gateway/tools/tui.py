@@ -288,7 +288,19 @@ async def run_tui(
         return
 
     available = list(cfg.agents.keys())
-    resolved_agent = agent_name or cfg.default_agent
+    # No `default_agent:` to fall back to (removed with the loader's implicit
+    # agent resolution). A single-agent config still needs no flag; anything
+    # else has to be named, rather than picked by document order.
+    if agent_name:
+        resolved_agent = agent_name
+    elif len(available) == 1:
+        resolved_agent = available[0]
+    else:
+        err_console.print(
+            "Multiple agents are configured — pass --agent NAME.\n"
+            f"Available: {', '.join(available)}"
+        )
+        return
 
     if resolved_agent not in cfg.agents:
         err_console.print(
@@ -441,7 +453,7 @@ def main(argv: list[str] | None = None) -> None:
         "--agent",
         default=None,
         metavar="NAME",
-        help="Agent name to use (default: default_agent from config)",
+        help="Agent name to use (required unless the config has exactly one agent)",
     )
     parser.add_argument(
         "--role",

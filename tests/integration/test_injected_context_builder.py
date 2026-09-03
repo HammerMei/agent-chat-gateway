@@ -49,7 +49,6 @@ pytestmark = pytest.mark.integration
 def _make_injector() -> InjectedContextBuilder:
     config = CoreConfig(
         agents={"default": AgentConfig(timeout=10)},
-        default_agent="default",
     )
     return InjectedContextBuilder(config)
 
@@ -72,9 +71,15 @@ def _make_wc(ctx_files: list[str]) -> WatcherConfig:
 
 
 async def _run_ensure(injector, ws, session_id, agent, content="context", watcher_name="test"):
-    """Call ensure() with a pre-built content string (no file I/O involved)."""
+    """Call ensure() with a pre-built content string (no file I/O involved).
+
+    The path key is derived from the watcher name here purely so callers stay readable.
+    In production they are unrelated: the name is a label, the key is a digest of
+    (connector, room_id) — which is the whole point of the split (§2.3).
+    """
     return await injector.ensure(
-        ws, session_id, agent, "/tmp", 10, watcher_name=watcher_name, content=content,
+        ws, session_id, agent, "/tmp", 10,
+        watcher_name=watcher_name, path_key=f"key-{watcher_name}", content=content,
     )
 
 
@@ -101,7 +106,7 @@ class _FakeAgent(AgentBackend):
 
     async def ensure_durable_instructions(
         self, session_id, working_directory, timeout, content,
-        *, watcher_name, already_delivered,
+        *, path_key, already_delivered,
     ):
         return await self._send_once_as_durable_fallback(
             session_id, working_directory, timeout, content, already_delivered,
@@ -349,11 +354,13 @@ class TestConcurrentEnsureGuard(unittest.IsolatedAsyncioTestCase):
 
             async def ensure_durable_instructions(
                 self, session_id, working_directory, timeout, content,
-                *, watcher_name, already_delivered,
+                *, path_key, already_delivered,
             ):
                 await asyncio.sleep(0)
-                seen.append((watcher_name, content))
-                return f"/tmp/.acg-system-prompt/{watcher_name}.md"
+                # The backend sees the path key, not the display name — asserting on it
+                # is what pins the new contract rather than the old one.
+                seen.append((path_key, content))
+                return f"/tmp/.acg-system-prompt/{path_key}.md"
 
             async def send(self, *a, **kw):
                 raise NotImplementedError
@@ -365,11 +372,11 @@ class TestConcurrentEnsureGuard(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertEqual(len(seen), 2, "both watchers' calls must reach the backend — neither dropped")
-        self.assertIn(("watcher-a", "watcher-a content"), seen)
-        self.assertIn(("watcher-b", "watcher-b content"), seen)
+        self.assertIn(("key-watcher-a", "watcher-a content"), seen)
+        self.assertIn(("key-watcher-b", "watcher-b content"), seen)
         self.assertEqual(set(results), {
-            "/tmp/.acg-system-prompt/watcher-a.md",
-            "/tmp/.acg-system-prompt/watcher-b.md",
+            "/tmp/.acg-system-prompt/key-watcher-a.md",
+            "/tmp/.acg-system-prompt/key-watcher-b.md",
         })
 
 
@@ -578,7 +585,7 @@ class TestEnsureForwardsAlreadyDelivered(unittest.IsolatedAsyncioTestCase):
 class TestContextInjectionOrdering(unittest.IsolatedAsyncioTestCase):
     """Issue #9: session maps must be registered BEFORE context injection."""
 
-    async def _run_test(self, watcher_configs, check_fn):
+    async def _run_test(self, watcher_rules, check_fn):
         from gateway.agents import AgentBackend
         from gateway.agents.response import AgentResponse
         from gateway.config import AgentConfig
@@ -610,10 +617,10 @@ class TestContextInjectionOrdering(unittest.IsolatedAsyncioTestCase):
             agent = MockAgent()
             maps = SessionMaps()
             agent_cfg = AgentConfig(timeout=10, context_inject_files=[])
-            config = CoreConfig(agents={"default": agent_cfg}, default_agent="default")
+            config = CoreConfig(agents={"default": agent_cfg})
             manager = SessionManager(
-                connector, {"default": agent}, "default", config,
-                watcher_configs=watcher_configs, session_maps=maps,
+                connector, {"default": agent}, config,
+                watcher_rules=watcher_rules, session_maps=maps,
             )
             await check_fn(manager, connector, agent, maps)
             await manager.shutdown()
@@ -623,10 +630,11 @@ class TestContextInjectionOrdering(unittest.IsolatedAsyncioTestCase):
 
     async def test_maps_registered_before_injection(self):
         """session maps must be populated before ensure() runs."""
-        from gateway.config import WatcherConfig
+
+        from tests.helpers import make_rule
 
         maps_at_injection: dict = {}
-        wc = WatcherConfig(name="script", connector="script", room="script", agent="default")
+        wc = make_rule("script")
 
         async def check_fn(manager, connector, agent, maps):
             original_ensure = manager._lifecycle._injector.ensure
@@ -652,7 +660,6 @@ class TestContextInjectionOrdering(unittest.IsolatedAsyncioTestCase):
 
     async def test_injection_failure_rolls_back_maps(self):
         """If build()/ensure() fails, session maps must be cleaned up."""
-        from gateway.config import WatcherConfig
         from gateway.core.session_maps import SessionMaps
 
         _patch_load = patch("gateway.core.state_store.load_state", return_value=[])
@@ -683,15 +690,14 @@ class TestContextInjectionOrdering(unittest.IsolatedAsyncioTestCase):
             agent = MockAgent()
             maps = SessionMaps()
 
-            wc = WatcherConfig(
-                name="script", connector="script", room="script", agent="default",
-                context_inject_files=["/nonexistent/context.md"],
-            )
+            from tests.helpers import make_rule
+            rule = make_rule("script",
+                             context_inject_files=["/nonexistent/context.md"])
             agent_cfg = AgentConfig(timeout=10, context_inject_files=[])
-            config = CoreConfig(agents={"default": agent_cfg}, default_agent="default")
+            config = CoreConfig(agents={"default": agent_cfg})
             manager = SessionManager(
-                connector, {"default": agent}, "default", config,
-                watcher_configs=[wc], session_maps=maps,
+                connector, {"default": agent}, config,
+                watcher_rules=[rule], session_maps=maps,
             )
 
             errors = await manager.run_once()
@@ -742,7 +748,7 @@ class TestAsyncFileIOInContextInjection(unittest.IsolatedAsyncioTestCase):
                 f.write("test context content")
                 ctx_file = f.name
 
-            wc = WatcherConfig(
+            WatcherConfig(
                 name="script",
                 connector="script",
                 room="script",
@@ -750,10 +756,12 @@ class TestAsyncFileIOInContextInjection(unittest.IsolatedAsyncioTestCase):
                 context_inject_files=[ctx_file],
             )
             agent_cfg = AgentConfig(timeout=10)
-            config = CoreConfig(agents={"default": agent_cfg}, default_agent="default")
+            config = CoreConfig(agents={"default": agent_cfg})
 
+            from tests.helpers import make_rule
+            rule = make_rule("script", context_inject_files=[ctx_file])
             manager = SessionManager(
-                connector, {"default": agent}, "default", config, watcher_configs=[wc]
+                connector, {"default": agent}, config, watcher_rules=[rule]
             )
 
             to_thread_calls = []

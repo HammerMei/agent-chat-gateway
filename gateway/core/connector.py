@@ -19,9 +19,13 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Awaitable, Callable, Literal
+from typing import TYPE_CHECKING, Any, Awaitable, Callable, Literal
 
 from ..agents.response import AgentEvent, AgentResponse
+from .bot_identity import BotIdentity  # noqa: F401 — used in an annotation
+
+if TYPE_CHECKING:  # `watcher_manager` imports this module, so a runtime
+    from .watcher_manager import RoomRef  # import here would cycle.
 
 # ---------------------------------------------------------------------------
 # Roles
@@ -54,6 +58,33 @@ class Attachment:
     size_bytes: int = 0
 
 
+@dataclass(frozen=True)
+class HistoryPage:
+    """One page of history, and whether the server had more to give.
+
+    `raw_count` counts what the server returned *before* system and empty-body events were
+    dropped, because the limit is applied before that filtering. A page of two hundred
+    joins comes back as an empty `messages` list with `raw_count == limit`, and a caller
+    that cannot tell that from a genuinely empty window will report an outage as read when
+    every user message in it is still waiting behind that page.
+
+    In `core` rather than beside either REST client because the distinction is ACG's, not a
+    platform's: every connector filters something out of a page it did not size, so every
+    connector's replay can be handed an empty list that is not an empty window. *What* gets
+    filtered stays per-platform — Rocket.Chat drops `t`-typed events, Mattermost drops
+    `type`-tagged posts — and each client counts before its own filter.
+    """
+
+    messages: list[dict]
+    raw_count: int
+    limit: int
+
+    @property
+    def was_full(self) -> bool:
+        return self.raw_count >= self.limit
+
+
+
 @dataclass
 class Room:
     """Platform-agnostic channel / conversation descriptor.
@@ -61,12 +92,35 @@ class Room:
     id   — opaque platform identifier used when sending replies (RC room _id,
             Slack channel ID, Discord channel snowflake, etc.)
     name — human-readable label (#channel, @username, "script", …)
-    type — "channel" | "group" | "dm" | "thread" | "script"
+    type — "channel" | "group" | "dm" | "group_dm" | "thread" | "script".
+            "group_dm" only ever comes from the creation path, which types the
+            room from its classified kind (§2.2) — platform resolvers that
+            cannot tell the two DM kinds apart keep answering "dm", and the
+            mention gate treats only "dm" as exempt (§6.4).
     """
 
     id: str
     name: str
     type: str = "channel"
+
+
+# The sender id `SessionManager.inject_message` stamps on a scheduled job's
+# message. One name, so the connectors' prompt-prefix `to:` field and the turn
+# runner can recognise a scheduled turn without three copies of a string.
+SCHEDULER_SENDER_ID = "scheduler"
+
+
+def is_scheduled_message(msg: "IncomingMessage") -> bool:
+    """Did this message come from the scheduler rather than a person or an agent?
+
+    Load-bearing for two decisions. The prompt prefix renders it `to: me` — a
+    scheduled job is addressed to the agent it was created against, and a
+    mention-derived `to: *` told the agent it was an unaddressed broadcast in a
+    channel, which the routing rules say to answer with silence. And the turn
+    runner warns when the reply to one is empty after stripping the termination
+    token, because that silence was the whole symptom of a job "not working".
+    """
+    return msg.sender.id == SCHEDULER_SENDER_ID
 
 
 @dataclass
@@ -120,11 +174,77 @@ class IncomingMessage:
 # so that a dropped message is not silently marked as processed.
 MessageHandler = Callable[[IncomingMessage], Awaitable[bool]]
 
-# Capacity check: quick preflight to determine whether the core pipeline has
-# room to accept a message for a given room_id.  Connectors call this BEFORE
-# expensive work (normalize, attachment download) to short-circuit when the
-# queue is already full.  Returns True if at least one processor has capacity.
-CapacityCheck = Callable[[str], bool]  # (room_id: str) -> bool
+class RoomCapacity(Enum):
+    """Why a room can or cannot take a message right now.
+
+    Lives here rather than beside the dispatcher because it is part of the *connector*
+    contract — `dispatch.py` already imports this module, so the reverse would be a
+    cycle, and the enum is what a connector is handed.
+    """
+
+    AVAILABLE = "available"   # a processor is running with queue space
+    FULL = "full"             # a processor exists; its queue is full or it is draining
+    UNROUTED = "unrouted"     # no processor serves this room
+
+
+# Capacity check: a quick preflight, called BEFORE expensive work (normalize,
+# attachment download) to short-circuit when a message cannot be accepted.
+# (room_id) -> RoomCapacity. Three-valued rather than a bool because a room with no
+# processor and a room whose queue is full call for different behaviour: the first is a
+# routing miss, the second is backpressure, and reporting the first as the second made
+# an idle gateway announce that it was busy (§2.7).
+CapacityCheck = Callable[[str], RoomCapacity]
+
+
+@dataclass(frozen=True)
+class MembershipHook:
+    """The callbacks a connector fires for the bot's own membership events (§2.7).
+
+    `added` takes the classified room (a `RoomRef` — annotated loosely because
+    `watcher_manager` imports this module); `removed` takes only the room id,
+    since a room the bot was removed from may no longer be resolvable. A pair
+    of named callables rather than two registration methods so a connector
+    cannot end up holding one half of the contract.
+    """
+
+    added: Callable[[Any], Awaitable[None]]
+    removed: Callable[[str], Awaitable[None]]
+
+
+# Connector *types* whose transport delivers unsolicited inbound — the load-time
+# twin of `Connector.supports_unsolicited_inbound()` below, which is the
+# declaration; this is what the config loader can actually read.
+#
+# It has to be a set of type strings rather than a lookup through the connector
+# classes: enforcement happens in `gateway/config.py`, which only ever sees a
+# `ConnectorConfig` (a type string, no instance), and `gateway/connectors/` imports
+# `gateway.config`, so reading the classes from there would invert the dependency
+# and pull the whole websocket stack into `agent-chat-gateway config validate`.
+#
+# Two declarations of one fact is the shape that has bitten this loader repeatedly,
+# so they are bound by a test that walks every type the connector factory knows and
+# asserts the set agrees with the class — rather than a comment asking the next
+# person to remember. Membership (not absence) is the test, so an unrecognised type
+# is restricted, matching the method's fail-closed default.
+# Every connector type `connector_factory` knows how to build. Lives here rather
+# than beside the factory because `gateway.config` needs it and
+# `gateway.connectors` imports `gateway.config` — the other direction would be a
+# cycle.
+#
+# The factory's error message is built from this tuple, and a test binds the two
+# so a fifth connector type cannot be added to one and forgotten in the other.
+# Order is the order a human should read them in, not alphabetical.
+SUPPORTED_CONNECTOR_TYPES: tuple[str, ...] = (
+    "rocketchat",
+    "mattermost",
+    "voice",
+    "script",
+)
+
+TYPES_WITH_UNSOLICITED_INBOUND: frozenset[str] = frozenset({
+    "rocketchat",
+    "mattermost",
+})
 
 
 # ---------------------------------------------------------------------------
@@ -178,7 +298,14 @@ class Connector(ABC):
         Webhook platforms   : start HTTP server, or no-op if server is external.
         Script connector    : no-op.
 
-        Must be called once before the Connector can receive or send messages.
+        Must be called once before the Connector can send messages or subscribe.
+
+        **It does not, by itself, mean messages will arrive.** Startup is two phases —
+        `connect()`, then `subscribe_room()` for each room, then `start_inbound()` — and
+        a connector whose transport delivers every room the account can see defers
+        reading until that last call, because events for a room it has no state for are
+        discarded and never replayed. Callers embedding a connector directly must make
+        that third call; `SessionManager` makes it at the end of its sync phase.
         """
         ...
 
@@ -211,6 +338,38 @@ class Connector(ABC):
 
         The default implementation is a no-op — connectors that don't perform
         expensive pre-dispatch work (e.g. ScriptConnector) need not override.
+
+        The check returns a `RoomCapacity`, not a bool: `FULL` is backpressure and
+        deserves the "server busy" reply, while `UNROUTED` means no watcher serves this
+        room, which is not something to tell the room's members about.
+        """
+
+    async def membership_snapshot(self) -> set[str] | None:
+        """Room ids this account is currently a member of, or None for unknown.
+
+        The periodic membership reconciliation's probe (§2.7): a dormant
+        record whose room id is absent from an answered snapshot has
+        unambiguously lost its membership and is reclaimed. **None means the
+        question could not be answered** — unsupported on this connector, or
+        the lookup failed — and the caller must keep everything: an empty set
+        is a claim ("member of nothing"), and a connector that cannot answer
+        must never make it. The base returns None, so a connector without a
+        membership stream needs no carve-out here either.
+        """
+        return None
+
+    def register_membership_hook(self, hook: "MembershipHook") -> None:
+        """Register the callbacks for the bot's own membership events (§2.7).
+
+        Implemented only where a membership stream exists (Rocket.Chat's
+        subscriptions-changed notification, Mattermost's user_added/user_removed
+        events). The base is a no-op, so a connector without one needs no
+        carve-out — the caller registers unconditionally alongside the router.
+
+        The hook's `added` receives the room the bot was added to, classified
+        exactly as a router offer would be; `removed` receives only the room id,
+        because a room the bot was removed from may no longer be resolvable at
+        all. Both fire for the *bot's own* membership only, never other users'.
         """
 
     # ── Outbound ─────────────────────────────────────────────────────────────
@@ -308,6 +467,34 @@ class Connector(ABC):
         """
         ...
 
+    async def room_ref_by_id(self, room_id: str) -> "RoomRef | None":
+        """The room this id names, described well enough to create a watcher for.
+
+        The inverse of `resolve_room`, and the direction that survives a rename:
+        a name freed by a rename can be reused by a different room, so anything
+        rebuilding a watcher for a room it has seen before must ask by id. The
+        record layer already works this way — `WatcherState.room_name` is
+        documented "display only: resolution goes by `room_id`".
+
+        Returns a `RoomRef`, not a `Room`, because creating a watcher needs the
+        **kind** (it selects the label form and decides whether `require_mention`
+        applies) and, for the DM kinds, the **participants** — a direct room has
+        no name, so they are the only thing that identifies it to a human.
+
+        **`None` means answered-and-absent, and an implementation must not raise
+        instead.** No such room, one this connector does not serve, or one this
+        account is no longer a member of: all three are final answers a caller
+        acts on by giving up on this room. A TRANSPORT failure raises, because
+        that is the one case where retrying later can change the answer (§2.2).
+        Collapsing the two makes a deleted room look like a network blip
+        forever — the same distinction `RocketChatRest.is_room_member` builds
+        three answers for.
+
+        The default is `None`: a connector that cannot look a room up by id
+        cannot resurrect one, and its callers degrade rather than break.
+        """
+        return None
+
     # ── Per-room subscription (pull-based platforms) ─────────────────────────
     # Rocket.Chat DDP requires explicit per-room WebSocket subscriptions.
     # Slack / Discord / WhatsApp / webhook connectors: default no-op.
@@ -355,6 +542,29 @@ class Connector(ABC):
         """
         pass
 
+    # ── Transport capability ──────────────────────────────────────────────────
+
+    def supports_unsolicited_inbound(self) -> bool:
+        """Return True if this transport delivers messages for rooms not asked for.
+
+        The single property design §2.6 derives idle eligibility, eager-versus-lazy
+        watcher creation and black-hole behaviour from, instead of branching per
+        connector. Mattermost receives every channel the bot belongs to on one
+        socket; Rocket.Chat can subscribe-all via ``__my_messages__``. Script's
+        messages arrive by direct injection that bypasses the connector, and Voice's
+        rooms arrive as HTTP path segments — neither has a stream to discover rooms
+        from.
+
+        Default: False. A connector that cannot discover rooms may only be given
+        rules naming **literal** rooms, enforced at config load (see
+        ``TYPES_WITH_UNSOLICITED_INBOUND``), so defaulting to False means a new
+        connector type is restricted until it declares otherwise. That direction is
+        deliberate: a pattern rule on a connector that cannot discover rooms fails
+        *silently* — the rule simply never materializes — while the restriction
+        applied wrongly fails *loudly*, at load, naming the field.
+        """
+        return False
+
     # ── Attachment support ────────────────────────────────────────────────────
 
     def supports_history(self) -> bool:
@@ -368,6 +578,79 @@ class Connector(ABC):
         (e.g. RocketChatConnector).
         """
         return False
+
+    async def probe_missed_since(self, room: Room, after_ts: str) -> bool:
+        """Whether this room holds a message the gateway has not processed.
+
+        The startup replay's cheap question, asked before a watcher is
+        recreated (§2.2): recreating every recorded room at every boot would
+        pay a session resume per room for nothing, which is precisely the eager
+        cost the lazy model exists to avoid.
+
+        Two exclusions decide the answer, and both need platform knowledge,
+        which is why this lives on the connector rather than in the replay loop:
+
+        * **The bot's own messages.** History includes them by design (the
+          agent is shown what it said), but the watermark only advances on
+          *accepted inbound*, so the agent's own last reply always sits above
+          it — and a naive probe therefore reports a gap for every room that
+          ended with the agent speaking, which is nearly all of them. Compared
+          **by id, not by username**: an account whose canonical spelling
+          differs from the configured one is a real and documented case here.
+        * **The boundary message itself.** ``after_ts`` is an inclusive lower
+          bound, so the very message that set the watermark comes back — and it
+          is a user message, so the own-message rule does not remove it.
+
+        ``after_ts`` is epoch milliseconds, like every timestamp inside ACG
+        (§5.2).
+
+        Default: ``False`` — a connector with no history API has nothing to
+        probe, and a startup replay over its records must be harmless.
+        """
+        return False
+
+    async def replay_room_since(
+        self, room_id: str, after_ts: str | None = None
+    ) -> None:
+        """Replay one tracked room's missed messages.
+
+        The per-room half of the reconnect replay, exposed so other recoveries
+        can drive it room by room (§2.2, "abort is only retryable if something
+        replays"): reconnect iterates live subscriptions, startup iterates
+        persisted records, and a recreation replays the interval its own room
+        parked. This is the fetch-and-inject all three share. The room must
+        already be tracked — recreation restores the watermark it reads.
+
+        ``after_ts`` names the window explicitly; without it the room's own
+        marks are used. A caller that names a window is asking about an
+        interval it froze earlier, so the room's replay boundary is left
+        undischarged — that mark belongs to the room's own accounting.
+
+        Default: no-op. Connectors with no history API have nothing to replay,
+        and a startup replay over their records must be harmless.
+        """
+        return None
+
+    def trigger_history_bound(self, trigger: Any) -> str | None:
+        """A router trigger frame's timestamp, for bounding history handoff.
+
+        Epoch milliseconds as a string, like every timestamp inside ACG (§5.2):
+        its consumer compares it against a room's watermark and forwards it as
+        a `fetch_room_history` bound, and both of those are epoch-ms.
+
+        `register_router` passes the platform-native frame that prompted an offer;
+        the creation path needs one thing from it — an exclusive upper bound for
+        `fetch_room_history`, so the trigger itself is not fetched as history and
+        then delivered a second time as the live prompt (§2.7). Each connector
+        knows its own frame shape, which is why this lives here and not in the
+        routing layer.
+
+        Default: ``None`` (no bound) — connectors that never offer rooms to a
+        router need not override it, and an unparseable frame answers None rather
+        than raising, because the cost of no bound is one duplicated message
+        while the cost of raising is a failed creation.
+        """
+        return None
 
     async def fetch_room_history(
         self,
@@ -397,14 +680,18 @@ class Connector(ABC):
         Args:
             room     : Resolved ``Room`` object (provides ``id`` and ``type``).
             count    : Maximum number of messages to retrieve.
-            before_ts: ISO 8601 exclusive upper-bound timestamp.  When provided,
-                       only messages older than this timestamp are returned.
-                       Maps to the platform ``latest`` parameter.
-            after_ts : ISO 8601 inclusive lower-bound timestamp.  When provided,
-                       only messages newer than or equal to this timestamp are
-                       returned.  Maps to the platform ``oldest`` parameter.
-                       Connectors that do not support this parameter may silently
-                       ignore it.
+            before_ts: Exclusive upper bound, **epoch milliseconds as a string**
+                       — the internal representation for every timestamp
+                       crossing an ACG interface (§5.2). Only messages older
+                       than it are returned. Maps to the platform's own
+                       upper-bound parameter, which each connector converts to
+                       if its API wants something else.
+            after_ts : Inclusive lower bound, epoch milliseconds as a string.
+                       Connectors that do not support it may silently ignore it.
+
+        Note the asymmetry, which is deliberate: the *bounds* are epoch-ms
+        because ACG compares them, while the ``ts`` field of each returned dict
+        is ISO because an agent reads it.
         """
         return []
 
@@ -491,6 +778,47 @@ class Connector(ABC):
         """
         return "direct"
 
+    async def start_inbound(self) -> None:
+        """Begin consuming inbound events. Called after watchers are restored.
+
+        Separate from `connect()` because authenticating and *receiving* are different
+        moments, and a connector that starts both at once drops everything arriving
+        before its rooms are known. Mattermost's socket delivers every channel the
+        account can see and its handler discards events for channels with no state yet,
+        so each such message is lost with no watermark to recover it from.
+
+        The gap is not new — it already spanned each connector's own watcher restore,
+        which creates sessions and fetches history — but the identity barrier widens it
+        by every other connector's login, and this closes both: the socket is open
+        during the wait, so the client library buffers what arrives, and the listen loop
+        starts once the channels those events belong to exist.
+
+        A no-op by default. A connector whose delivery is gated per room (Rocket.Chat
+        subscribes room by room) has nothing to defer.
+        """
+        return None
+
+    def bot_identity(self) -> "BotIdentity | None":
+        """Who this connector is authenticated as, or ``None`` if it has no account.
+
+        Called once after ``connect()`` and before any subscription, so that two
+        connectors on one bot account are refused before either can start answering
+        (§4.5). Override in every connector that authenticates as an account on a
+        server other connectors could also reach.
+
+        ``None`` is a claim, not a default to fall through: it says this connector has
+        no shared account to collide over — a local stdin/stdout or script connector.
+        `tests/unit/test_bot_identity_coverage.py` enumerates the connectors in this
+        package and fails when a new one neither overrides this nor is listed there, so
+        a platform connector cannot inherit the accountless answer by omission.
+
+        Raise `ConnectorIdentityError` when the connector *does* have an account but
+        cannot establish it — a whoami that failed, an id the login response omitted.
+        Fail-closed: an unanswerable identity cannot be compared, and starting anyway is
+        the situation this check exists to prevent.
+        """
+        return None
+
     @property
     def agent_username(self) -> str:
         """The bot's own username on this platform, or ``""`` if not applicable.
@@ -544,28 +872,6 @@ class Connector(ABC):
         return ""
 
     # ── Optional status notifications ─────────────────────────────────────────
-
-    async def notify_online(self, room_id: str, text: str) -> None:
-        """Post a status message when the agent comes online in a room.
-
-        Args:
-            room_id: Opaque platform room ID.
-            text   : Message text to post (watcher-configured, may include emoji/markdown).
-
-        Default: no-op.  Override for platforms that support status messages.
-        """
-        pass
-
-    async def notify_offline(self, room_id: str, text: str) -> None:
-        """Post a status message when the agent goes offline in a room.
-
-        Args:
-            room_id: Opaque platform room ID.
-            text   : Message text to post (watcher-configured, may include emoji/markdown).
-
-        Default: no-op.  Override for platforms that support status messages.
-        """
-        pass
 
     async def notify_agent_event(
         self,

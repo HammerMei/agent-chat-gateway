@@ -83,11 +83,11 @@ def _make_doc(
 class TestTurnStore(unittest.TestCase):
     def test_check_and_increment_within_budget(self):
         store = TurnStore()
-        allowed, turn = store.check_and_increment("room1", None, "agentA", max_turns=5)
+        allowed, turn, _tok = store.check_and_increment("room1", None, "agentA", max_turns=5)
         self.assertTrue(allowed)
         self.assertEqual(turn, 1)
 
-        allowed2, turn2 = store.check_and_increment("room1", None, "agentA", max_turns=5)
+        allowed2, turn2, _tok = store.check_and_increment("room1", None, "agentA", max_turns=5)
         self.assertTrue(allowed2)
         self.assertEqual(turn2, 2)
 
@@ -96,7 +96,7 @@ class TestTurnStore(unittest.TestCase):
         for _ in range(3):
             store.check_and_increment("room1", None, "agentA", max_turns=3)
 
-        allowed, turn = store.check_and_increment("room1", None, "agentA", max_turns=3)
+        allowed, turn, _tok = store.check_and_increment("room1", None, "agentA", max_turns=3)
         self.assertFalse(allowed)
         self.assertEqual(turn, 3)  # current count (not incremented)
 
@@ -107,7 +107,7 @@ class TestTurnStore(unittest.TestCase):
 
         store.reset_sender("room1", None, "agentA")
 
-        allowed, turn = store.check_and_increment("room1", None, "agentA", max_turns=3)
+        allowed, turn, _tok = store.check_and_increment("room1", None, "agentA", max_turns=3)
         self.assertTrue(allowed)
         self.assertEqual(turn, 1)
 
@@ -381,3 +381,375 @@ class TestFilterRcMessageAgentChain(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestReleasingATurnTakenByAMessageNotDelivered(unittest.TestCase):
+    """The budget counts turns an agent *took*, not messages the filter looked at.
+
+    The filter spends a turn before anything knows whether the message can be delivered,
+    and a message handed back for a later retry re-enters it. Without a release, retrying
+    the same document exhausts a budget it never used — after which the filter rejects it
+    as complete, the replay reports success, and the window closes over a message nobody
+    saw.
+    """
+
+    def setUp(self):
+        from gateway.core.agent_chain import TurnStore
+
+        self.store = TurnStore()
+
+    def test_a_released_turn_is_available_again(self):
+        allowed, turn, _tok = self.store.check_and_increment("r1", None, "agent-a", max_turns=2)
+        self.assertTrue(allowed)
+        self.assertEqual(turn, 1)
+
+        self.assertEqual(self.store.release_turn("r1", None, "agent-a", turn, 0), 0)
+
+        allowed, turn, _tok = self.store.check_and_increment("r1", None, "agent-a", max_turns=2)
+        self.assertTrue(allowed)
+        self.assertEqual(turn, 1, "the retry takes the same turn, not the next one")
+
+    def test_retrying_a_handed_back_message_does_not_exhaust_the_budget(self):
+        """The scenario, in the small: the same document retried more times than the
+        budget allows must still be deliverable."""
+        for _ in range(5):
+            allowed, _, tok = self.store.check_and_increment(
+                "r1", None, "agent-a", max_turns=2)
+            self.assertTrue(allowed, "a retried message must never be refused for budget")
+            self.store.release_turn("r1", None, "agent-a", tok, 0)
+
+        allowed, turn, _tok = self.store.check_and_increment("r1", None, "agent-a", max_turns=2)
+        self.assertTrue(allowed)
+        self.assertEqual(turn, 1)
+
+    def test_a_second_release_of_the_same_turn_does_nothing(self):
+        """A caller bug must not corrupt the counter — the second release no longer owns
+        the number it names."""
+        _, taken, _tok = self.store.check_and_increment("r1", None, "agent-a", max_turns=2)
+        self.store.release_turn("r1", None, "agent-a", taken, 0)
+        self.store.release_turn("r1", None, "agent-a", taken, 0)
+
+        self.assertEqual(self.store.current_turns("r1", None, "agent-a"), 0)
+
+    def test_an_earlier_delivery_can_release_after_a_later_one_took_its_turn(self):
+        """Overlapping deliveries, no reset — and the earlier one must still be able to
+        hand its turn back.
+
+        This assertion used to say the opposite, on the reasoning that a moved counter
+        meant the release no longer owned anything. That reasoning loses the message: the
+        budget stays spent on something never sent, `check_and_increment` then refuses the
+        retry as exhausted, the filter reports it complete, and the replay closes its
+        window over it. A turn is owned by the delivery that took it, not by the position
+        of the count.
+        """
+        gen = self.store.generation("r1", None, "agent-a")
+        _, _, mine = self.store.check_and_increment("r1", None, "agent-a", max_turns=5)
+        self.store.check_and_increment("r1", None, "agent-a", max_turns=5)  # a later one
+
+        self.store.release_turn("r1", None, "agent-a", mine, gen)
+
+        self.assertEqual(
+            self.store.current_turns("r1", None, "agent-a"), 1,
+            "the later delivery keeps its turn; only the earlier one is given back",
+        )
+
+    def test_a_released_token_cannot_be_released_twice(self):
+        gen = self.store.generation("r1", None, "agent-a")
+        _, _, mine = self.store.check_and_increment("r1", None, "agent-a", max_turns=5)
+        self.store.check_and_increment("r1", None, "agent-a", max_turns=5)
+
+        self.store.release_turn("r1", None, "agent-a", mine, gen)
+        self.store.release_turn("r1", None, "agent-a", mine, gen)
+
+        self.assertEqual(self.store.current_turns("r1", None, "agent-a"), 1)
+
+    def test_a_budget_full_of_handed_back_turns_still_admits_a_retry(self):
+        """The failure the finding describes, end to end: every turn taken and handed
+        back, then a retry must still be allowed."""
+        gen = self.store.generation("r1", None, "agent-a")
+        tokens = []
+        for _ in range(2):
+            allowed, _, tok = self.store.check_and_increment(
+                "r1", None, "agent-a", max_turns=2)
+            self.assertTrue(allowed)
+            tokens.append(tok)
+        for tok in tokens:
+            self.store.release_turn("r1", None, "agent-a", tok, gen)
+
+        allowed, _, _ = self.store.check_and_increment("r1", None, "agent-a", max_turns=2)
+        self.assertTrue(allowed, "a budget spent only on undelivered messages is not spent")
+
+    def test_a_reset_between_take_and_release_is_respected(self):
+        """The case a turn number alone cannot see.
+
+        A reset starts the next count at one again, so an in-flight delivery holding
+        "I took turn 1" matches a turn 1 that belongs to a different message. The numbers
+        are deliberately identical here; only the generation separates them.
+        """
+        gen = self.store.generation("r1", None, "agent-a")
+        _, mine, _tok = self.store.check_and_increment("r1", None, "agent-a", max_turns=5)
+        self.assertEqual(mine, 1)
+
+        self.store.reset_all("r1", None)                       # a human spoke
+        _, theirs, _tok = self.store.check_and_increment("r1", None, "agent-a", max_turns=5)
+        self.assertEqual(theirs, 1, "the fresh count starts at the same number")
+
+        self.store.release_turn("r1", None, "agent-a", mine, gen)
+
+        self.assertEqual(
+            self.store.current_turns("r1", None, "agent-a"), 1,
+            "taking this turn away would let the chain run past max_turns on a count "
+            "that belongs to a delivery which succeeded",
+        )
+
+    def test_a_sender_reset_between_take_and_release_is_respected(self):
+        """`reset_sender` is the other reset, and it had the same hole."""
+        gen = self.store.generation("r1", None, "agent-a")
+        _, mine, _tok = self.store.check_and_increment("r1", None, "agent-a", max_turns=5)
+
+        self.store.reset_sender("r1", None, "agent-a")
+        self.store.check_and_increment("r1", None, "agent-a", max_turns=5)
+
+        self.store.release_turn("r1", None, "agent-a", mine, gen)
+
+        self.assertEqual(self.store.current_turns("r1", None, "agent-a"), 1)
+
+    def test_releasing_an_unknown_sender_is_a_no_op(self):
+        self.assertEqual(self.store.release_turn("r1", None, "nobody", 1, 0), 0)
+
+    def test_a_delivered_turn_is_not_released(self):
+        """The near miss: releasing unconditionally would make the budget unenforceable."""
+        for expected in (1, 2):
+            allowed, turn, _tok = self.store.check_and_increment(
+                "r1", None, "agent-a", max_turns=2)
+            self.assertTrue(allowed)
+            self.assertEqual(turn, expected)
+
+        allowed, _, _tok = self.store.check_and_increment("r1", None, "agent-a", max_turns=2)
+        self.assertFalse(allowed, "the budget still stops a genuine chain")
+
+
+class TestExpiryDoesNotReissueAnInFlightIdentity(unittest.TestCase):
+    """A context can be garbage-collected while a delivery still holds a turn from it.
+
+    Nothing bounds a delivery by the store's TTL — normalization, an attachment download
+    and a handler are not on that clock — so the context can expire, a later message can
+    recreate the key, and the old delivery's release would then land on a fresh count.
+    This is the reset case arriving through expiry, and the generation has to survive the
+    entry it belonged to.
+    """
+
+    def setUp(self):
+        from gateway.core.agent_chain import TurnStore
+
+        self.store = TurnStore(ttl_seconds=0.0)   # everything is expired on the next call
+
+    def test_a_token_from_an_expired_context_is_not_honoured(self):
+        gen = self.store.generation("r1", None, "agent-a")
+        _, _, mine = self.store.check_and_increment("r1", None, "agent-a", max_turns=5)
+
+        # A later message: `_gc` drops the quiet context, and this recreates the key.
+        self.store.check_and_increment("r1", None, "agent-a", max_turns=5)
+
+        self.store.release_turn("r1", None, "agent-a", mine, gen)
+
+        self.assertEqual(
+            self.store.current_turns("r1", None, "agent-a"), 1,
+            "the fresh count belongs to the message that started it",
+        )
+
+    def test_the_generation_keeps_climbing_across_expiry(self):
+        first = self.store.generation("r1", None, "agent-a")
+        self.store.check_and_increment("r1", None, "agent-a", max_turns=5)
+        self.store.check_and_increment("r1", None, "agent-a", max_turns=5)   # gc + recreate
+
+        self.assertGreater(
+            self.store.generation("r1", None, "agent-a"), first,
+            "a number that resets is a number that can be matched by a stale delivery",
+        )
+
+    def test_a_live_delivery_can_still_release_within_one_generation(self):
+        """The near miss: bumping on every call would make every release a no-op."""
+        from gateway.core.agent_chain import TurnStore
+
+        store = TurnStore()          # a normal TTL: nothing expires here
+        gen = store.generation("r1", None, "agent-a")
+        _, _, mine = store.check_and_increment("r1", None, "agent-a", max_turns=5)
+
+        store.release_turn("r1", None, "agent-a", mine, gen)
+
+        self.assertEqual(store.current_turns("r1", None, "agent-a"), 0)
+
+
+class TestReleasedTokenBookkeepingIsBounded(unittest.TestCase):
+    """A retry loop hands the same message back indefinitely, and the TTL cannot help.
+
+    Every attempt takes a fresh token and gives it back, and every attempt's *increment*
+    refreshes `last_updated` — so `_gc` never reclaims the context and the bookkeeping
+    would grow for as long as the processor stays full.
+
+    The first version of this test released every token in order, which is the one
+    interleaving a prefix counter handles — so it passed while the mechanism was broken
+    for every real chain. The interleaving that matters has a **delivered** token in it:
+    delivered tokens are never released, and a prefix stops dead at the first one.
+    """
+
+    def setUp(self):
+        from gateway.core.agent_chain import TurnStore
+
+        self.store = TurnStore()
+
+    def _ctx(self):
+        return self.store._store[self.store._key("r1", None, "agent-a")]
+
+    def _take(self):
+        return self.store.check_and_increment("r1", None, "agent-a", max_turns=5)[2]
+
+    def _give_back(self, token):
+        return self.store.release_turn("r1", None, "agent-a", token, generation=0)
+
+    def test_a_retry_loop_behind_a_delivered_turn_stays_bounded(self):
+        """The case the prefix could not reach: token 1 is delivered and never comes back."""
+        from gateway.core.agent_chain import _RELEASED_TOKENS_REMEMBERED
+
+        self._take()                                  # token 1 — delivered, never released
+        for _ in range(_RELEASED_TOKENS_REMEMBERED * 3):
+            self._give_back(self._take())
+
+        ctx = self._ctx()
+        self.assertEqual(ctx.issued, _RELEASED_TOKENS_REMEMBERED * 3 + 1)
+        self.assertLessEqual(len(ctx.released), _RELEASED_TOKENS_REMEMBERED)
+        self.assertEqual(
+            len(ctx.released_set), len(ctx.released),
+            "the index must not outlive what the queue remembers",
+        )
+
+    def test_a_retry_loop_never_exhausts_the_budget(self):
+        """What the release is *for*, independent of how it is remembered."""
+        for _ in range(500):
+            token = self._take()
+            self.assertNotEqual(token, 0, "each release frees the turn the retry takes")
+            self._give_back(token)
+
+        self.assertEqual(self.store.current_turns("r1", None, "agent-a"), 0)
+
+    def test_a_recently_released_token_is_refused_a_second_release(self):
+        self._take()                                  # delivered
+        token = self._take()
+        self._give_back(token)
+        live = self.store.current_turns("r1", None, "agent-a")
+
+        self._give_back(token)
+
+        self.assertEqual(
+            self.store.current_turns("r1", None, "agent-a"), live,
+            "a second release may not take a turn a live delivery is using",
+        )
+
+    def test_an_out_of_order_release_is_still_refused_twice(self):
+        """Releases do not arrive in issue order — replay and live traffic overlap."""
+        a, b, c = self._take(), self._take(), self._take()
+        self._give_back(c)
+        self._give_back(a)
+        after = self.store.current_turns("r1", None, "agent-a")
+
+        self._give_back(c)
+        self._give_back(a)
+
+        self.assertEqual(self.store.current_turns("r1", None, "agent-a"), after)
+        self.assertEqual(after, 1, "only b's turn is still held")
+        self.assertTrue(self._ctx().is_released(b) is False)
+
+    def test_a_reset_forgets_every_token_of_the_previous_count(self):
+        for _ in range(5):
+            self._give_back(self._take())
+
+        self.store.reset_sender("r1", None, "agent-a")
+        gen = self._ctx().generation
+        token = self._take()
+
+        self.assertEqual(token, 1, "a fresh count reissues from one")
+        self.assertEqual(
+            self.store.release_turn("r1", None, "agent-a", token, generation=gen), 0,
+            "stale bookkeeping would report this token as already given back",
+        )
+
+    def test_reset_all_forgets_them_too(self):
+        for _ in range(5):
+            self._give_back(self._take())
+
+        self.store.reset_all("r1", None)
+        gen = self._ctx().generation
+        token = self._take()
+
+        self.assertEqual(
+            self.store.release_turn("r1", None, "agent-a", token, generation=gen), 0,
+            "the room-wide reset carries the same rule as the per-sender one",
+        )
+
+
+class TestGenerationTombstonesAreBounded(unittest.TestCase):
+    """The key includes a thread id, so "one per room" was never the bound.
+
+    A long-lived connector meets an unbounded number of threads, and a tombstone per
+    sender in each would outlive every context and defeat the reclamation the TTL exists
+    for. A tombstone only has to outlive a delivery still in flight.
+    """
+
+    def test_tombstones_do_not_accumulate_for_dead_threads(self):
+        import time as _time
+
+        from gateway.core.agent_chain import TurnStore
+
+        store = TurnStore(ttl_seconds=0.0)
+        for i in range(50):
+            store.check_and_increment("r1", f"thread-{i}", "agent-a", max_turns=5)
+
+        # Every context has expired, and so has every tombstone's grace period.
+        _time.sleep(0.01)
+        store.check_and_increment("r1", "thread-final", "agent-a", max_turns=5)
+
+        self.assertLessEqual(
+            len(store._generations), 2,
+            "a tombstone per thread, kept forever, is the leak this replaced",
+        )
+
+    def test_a_tombstone_survives_long_enough_to_matter(self):
+        """The near miss: pruning immediately would put the expiry hole straight back.
+
+        The context has to actually **expire** for this to test anything. An earlier
+        version used `reset_all`, which leaves the context in `_store` — so `release_turn`
+        found it and compared generations off the live object, and `_generations` was never
+        read at all. It passed with `_TOMBSTONE_TTL_FACTOR = 0`, which is literally the
+        thing its own docstring says it guards against.
+        """
+        from unittest.mock import patch
+
+        from gateway.core.agent_chain import _TOMBSTONE_TTL_FACTOR, TurnStore
+
+        ttl = 60.0
+        store = TurnStore(ttl_seconds=ttl)
+        t0 = time.monotonic()
+
+        with patch("gateway.core.agent_chain.time.monotonic", return_value=t0):
+            gen = store.generation("r1", None, "agent-a")
+            _, _, mine = store.check_and_increment("r1", None, "agent-a", max_turns=5)
+
+        # Long enough for the context to expire and be deleted, but inside the tombstone's
+        # grace period — the window this delivery is still in flight in.
+        mid = t0 + ttl * (1 + _TOMBSTONE_TTL_FACTOR) / 2
+        with patch("gateway.core.agent_chain.time.monotonic", return_value=mid):
+            store._gc()
+            self.assertNotIn(
+                store._key("r1", None, "agent-a"), store._store,
+                "the context must be gone, or the tombstone is not what answers",
+            )
+            # A new chain starts under the same key and takes a turn of its own.
+            store.check_and_increment("r1", None, "agent-a", max_turns=5)
+            # The in-flight delivery from the dead context finally comes back.
+            store.release_turn("r1", None, "agent-a", mine, gen)
+
+        self.assertEqual(
+            store.current_turns("r1", None, "agent-a"), 1,
+            "a token from an expired context may not take the new chain's turn",
+        )

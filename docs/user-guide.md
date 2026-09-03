@@ -77,10 +77,11 @@ agents:
       enabled: true
       timeout: 300
 
-watchers:
+watcher_rules:
   - name: general
     connector: rc-home
-    room: general
+    rooms:
+      include: [general]
     agent: claude
 ```
 
@@ -133,8 +134,6 @@ connectors:
         - charlie
         - dan
 
-default_agent: claude
-
 agents:
   claude:
     type: claude
@@ -163,24 +162,27 @@ agents:
       enabled: true
       timeout: 300
 
-watchers:
+watcher_rules:
   - name: general
     connector: rc-company
-    room: general
+    rooms:
+      include: [general]
     agent: claude
     context_inject_files:
       - contexts/team-assistant.md    # team-specific system prompt
 
   - name: dev
     connector: rc-company
-    room: dev
+    rooms:
+      include: [dev]
     agent: opencode
     context_inject_files:
       - contexts/engineering-context.md
 
   - name: support
     connector: rc-company
-    room: support
+    rooms:
+      include: [support]
     agent: claude
     context_inject_files:
       - contexts/support-runbook.md
@@ -214,8 +216,6 @@ connectors:
       owners:
         - alice          # Only you — no guests
 
-default_agent: claude
-
 agents:
   claude:
     type: claude
@@ -225,16 +225,18 @@ agents:
     permissions:
       enabled: false     # Skip approval prompts for personal use
 
-watchers:
+watcher_rules:
   - name: my-assistant
     connector: rc-personal
-    room: "@alice"       # DM room — only you can see it
+    rooms:
+      direct: true       # 1:1 DMs — only people in `owners`/`guests` get through
     agent: claude
-    online_notification: "✅ Agent ready"
 ```
 
 **Key settings for this use case:**
-- Use `room: "@username"` to watch a DM room instead of a channel — keeps it private
+- Use `rooms.direct: true` to serve DMs instead of a channel — a DM has no
+  room name for a pattern to match, and the connector's `owners` list gates
+  who can talk
 - Set `permissions.enabled: false` for personal use where approval friction isn't needed
 - Set yourself as the sole owner; omit `guests` entirely
 
@@ -242,75 +244,83 @@ watchers:
 
 ---
 
-### Use Case 3 — Continue an Existing Agent Session Remotely
+### Use Case 3 — Carry an Existing Agent Session's Context into Chat
 
-If you have a long-running agent session already in progress (e.g., a Claude session you started locally), pin a watcher to that session ID so your messaging app picks up exactly where you left off. The session context, memory, and history are all preserved.
+If you have a long-running agent session already in progress (e.g. a Claude session
+you started locally), hand its context over to a watcher so your messaging app picks
+up where you left off.
 
 > **Similar to Claude Code's Remote Control:** Claude Code's [Remote Control](https://code.claude.com/docs/en/remote-control) feature (`claude --remote-control`) lets you drive a local session from `claude.ai/code` or the Claude mobile app. `agent-chat-gateway` takes a complementary approach: instead of a personal remote interface, your session becomes accessible from your team's shared chat room — with RBAC and permission approval so others can interact safely too.
 
-**Example: Resume an existing Claude session by session ID**
+**Use a handoff, not a pinned session id.** Earlier versions accepted
+`watchers[].session_id` to attach a watcher to one specific backend session.
+That field has been removed, and setting it is now a config error. Two reasons:
 
-```yaml
-connectors:
-  - name: rc-home
-    type: rocketchat
-    server:
-      url: "${RC_URL}"
-      username: "${RC_BOT_USER}"
-      password: "${RC_BOT_PASS}"
-    allowed_users:
-      owners:
-        - alice
+- **It could not survive the backend.** A pinned id names a session the backend is
+  free to expire — Claude Code's default `cleanupPeriodDays` is 30 days. Once that
+  happens the id refers to nothing, and the watcher starts empty with no warning.
+- **There is nothing to pin it to.** A watcher is created per room as rooms are
+  discovered, so a single id in config cannot say which room it belongs to.
 
-default_agent: claude
+A handoff has neither problem: it is a file, so it outlives any session, and each
+watcher reads it on its own session start.
 
-agents:
-  claude:
-    type: claude
-    command: claude
-    working_directory: ~/my-project
-    timeout: 360
-    permissions:
-      enabled: true
-      timeout: 300
-
-watchers:
-  - name: my-project
-    connector: rc-home
-    room: "@alice"
-    agent: claude
-    session_id: "ses_abc123def456"    # Pin to your existing session
-```
-
-**How to find your existing session ID:**
-
-For Claude CLI, session IDs appear in the output when you run `claude -p`:
-```
-{"type": "result", "session_id": "ses_abc123def456", ...}
-```
-
-Or check your Claude session history directly.
-
-**Key settings for this use case:**
-- Set `session_id` to your existing session's ID to resume it from your messaging app
-- The gateway will never overwrite a sticky `session_id` — it survives daemon restarts and `reset` commands
-- If you want to start fresh later, either remove the `session_id` field or run `agent-chat-gateway reset <watcher>` (only affects non-sticky sessions)
-
-**Tip — Resume workflow:**
+**Example: hand off a local session's context**
 
 ```bash
-# 1. Start a session locally and note the session ID
-claude -p "Let's start working on the auth module"
-# → {"session_id": "ses_abc123def456", ...}
+# 1. Resume the existing session, have it PRINT the summary, and redirect that to
+#    the file yourself.
+#
+#    Two details that both bite silently if you skip them:
+#    - `--resume <id>` (or `-c` for the most recent session) is required. A bare
+#      `claude -p` starts a NEW session — that is exactly how this project creates
+#      one — so it would summarise nothing, successfully.
+#    - Redirect stdout rather than asking Claude to write the file. In
+#      non-interactive `-p` mode the `Write` tool needs prior approval, so a run
+#      without it finishes without creating anything.
+claude --resume ses_abc123def456 -p "Summarise everything we have established in
+this session — decisions, constraints, open questions, and where we left off.
+Write it for another instance of yourself with no memory of this conversation.
+Output only the summary." > /Users/me/project/HANDOFF.md
 
-# 2. Add that session ID to your config.yaml under the watcher
-# 3. Start the gateway
-agent-chat-gateway start
+# Session ids are printed by `claude -p --output-format json`; `claude -c -p`
+# resumes the most recent session without needing one.
 
-# 4. Continue the conversation from Rocket.Chat on your phone or another machine
+# Check the contents, not just that the file is there: `>` creates the file before
+# the command runs, so a failed or wrong-session run still leaves one behind.
+wc -l /Users/me/project/HANDOFF.md && head -5 /Users/me/project/HANDOFF.md
 ```
 
----
+```yaml
+# 2. Point the watcher at that file. Context files are read and sent to the agent
+#    on session start, so it begins with the context rather than discovering it.
+watcher_rules:
+  - name: my-project
+    connector: rc-home
+    rooms:
+      direct: true
+    agent: claude
+    context_inject_files:
+      - /Users/me/project/HANDOFF.md
+```
+
+```bash
+# 3. Start the gateway and continue from your messaging app.
+agent-chat-gateway start
+```
+
+**Notes:**
+
+- `context_inject_files` paths are resolved relative to `config.yaml`'s directory, so
+  a relative path written from a project shell will not resolve — use an absolute
+  path, or write the handoff next to `config.yaml`.
+- Context files are re-read on every watcher start, so rewriting `HANDOFF.md` takes
+  effect the next time the watcher starts. Run `agent-chat-gateway reset <watcher>`
+  as well if you want the updated context to open a *fresh* conversation instead of
+  continuing the existing one.
+- Session *continuity* across daemon restarts needs no configuration: the gateway
+  persists each watcher's runtime session id in its state file and resumes it. The
+  removed field was only ever about pinning a session id chosen by hand.
 
 ## Configuration Reference
 
@@ -318,15 +328,14 @@ agent-chat-gateway start
 
 | Field | Type | Required | Default | Description |
 |-------|------|----------|---------|-------------|
-| `default_agent` | string | No | (none) | Default agent for watchers that don't specify one |
 | `max_queue_depth` | integer | No | 100 | Per-room message queue size; 0 = unlimited |
 | `connectors` | list | Yes | (none) | Chat platform connections |
 | `agents` | dict | Yes | (none) | AI agent backend definitions |
-| `watchers` | list | Yes | (none) | Room→agent mappings |
+| `watcher_rules` | list | Yes | (none) | Rules declaring which rooms an agent serves — see [Watchers](#watchers) |
 | `tool_presets` | dict | No | `{}` | Named, reusable tool-rule lists — see [Tool Allow-Lists](#tool-allow-lists) |
 | `connector_templates` | dict | No | `{}` | Named, reusable field blocks for connectors — each entry opts in via its own `inherits: <name>` |
 | `agent_templates` | dict | No | `{}` | Named, reusable field blocks for agents — each entry opts in via its own `inherits: <name>` |
-| `watcher_templates` | dict | No | `{}` | Named, reusable field blocks for watchers — each entry opts in via its own `inherits: <name>` |
+| `watcher_templates` | dict | No | `{}` | Named, reusable field blocks for watcher rules — each entry opts in via its own `inherits: <name>`. May set `rooms:`, with rules that are easy to get wrong — see [Templates and `rooms` inheritance](#templates-and-rooms-inheritance). Cannot set `name` |
 
 None of the four templates/preset fields above are required — a single
 connector/agent/watcher setup rarely needs them. They exist to avoid
@@ -342,6 +351,20 @@ Check your config any time with `agent-chat-gateway config validate --lint`.
 Each connector represents a connection to one chat platform. Rocket.Chat and Mattermost
 are both fully supported today; a daemon can run one, the other, or both at once (see
 [Multi-Connector Setup](#multi-connector-setup)).
+
+> ⚠️ **One bot account per connector.** Two connectors that log in as the same account
+> on the same server receive the *identical* message stream, so any room they both cover
+> gets two agents replying to every message. The daemon checks this after logging in —
+> against the account id the server reports, not what config says, because a token can
+> authenticate an account without naming it — and refuses to start before either
+> connector subscribes to anything. Give each connector its own bot account.
+>
+> **Mattermost is the one exception**: two connectors on one account are allowed when
+> each is scoped to a **different team**, since each ignores the other team's channels.
+> Even then their direct messages must not overlap — a DM belongs to no team, so the
+> server delivers it to every connection the account has open. Watching `@alice` on one
+> and `@bob` on the other is fine; the same person on both is not, and a rule with
+> `direct:` takes *every* DM, which overlaps with any of them.
 
 ```yaml
 connectors:
@@ -460,60 +483,165 @@ agents:
 | `permissions.enabled` | boolean | No | Enable human-in-the-loop tool approval |
 | `permissions.timeout` | integer | No | Seconds before auto-denying unanswered requests (must be < agent `timeout`) |
 | `permissions.skip_owner_approval` | boolean | No | If `true`, owners bypass approval prompts (guests still enforced); only use in trusted sandbox environments |
-| `session_idle_days` | integer | No | **Schema defined, not yet acted on at runtime** (see `docs/design/dynamic-watcher-design.md`). Will control how many days of inactivity before a watcher's in-memory object is dropped (session kept). Must be strictly less than `session_expire_days` when both are set. |
-| `session_expire_days` | integer | No | **Schema defined, not yet acted on at runtime** — same design doc. Will control how many days of inactivity before the session itself is dropped too. |
 
 ### Watchers
 
-Each watcher binds one chat room/channel (on whichever connector it names) to an AI agent backend.
+A `watcher_rules:` entry is a **rule**: it declares which rooms an agent serves,
+and the gateway creates each room's watcher on demand — on the room's first
+message for Rocket.Chat and Mattermost, or eagerly at startup for connectors
+with no inbound stream (voice, script — their rules must name literal rooms).
 
 ```yaml
-watchers:
-  - name: general-assistant
+watcher_rules:
+  - name: general-assistant     # the RULE's name — required
     connector: rc-main
-    room: general
+    rooms:
+      include: [general]        # glob patterns work: [eng-*, general]
+      # except_for: [eng-private]  # subtracted from this rule's include
+      # direct: true               # also serve 1:1 DMs
+      # group_direct: true         # also serve multi-party DMs (mentions required)
     agent: claude
 ```
 
-Binding the same connector+agent to several rooms at once: use `rooms:`
-instead of `room:` — it expands into one watcher per room, with the name
-auto-derived as `<connector>-<room>` (a `@username` DM room becomes
-`<connector>-dm-<username>`) unless you set `name:` explicitly:
+Each created watcher is named `<connector>:<room>` — that derived name is
+what `list` shows and what `pause`/`resume`/`reset`/`expire` act on. It follows
+the room on Rocket.Chat and Mattermost: rename a channel or private group and,
+from the next message in it, `list` shows the new name and the old one no longer
+resolves (the log carries an `AUDIT` line).
 
-```yaml
-watchers:
-  - connector: rc-main
-    agent: claude
-    rooms: [general, dev, "@alice"]
-    # -> rc-main-general, rc-main-dev, rc-main-dm-alice
+**"Name" here is the room's URL name, not its display name.** On Mattermost that
+is the channel `name` — the last segment of `…/channels/<name>`, editable in the
+channel's rename/settings dialog under *URL* — and on Rocket.Chat the room
+`name` (not `fname`). Changing only the Display Name does **not** rename the
+watcher, by design: display names admit any character and two rooms may share
+one, while the URL name is restricted and unique within a team, which is what
+makes a watcher handle unambiguous. DM labels keep the counterpart's name as of
+creation, and a new name still held by another room's stale record is not taken
+until that record goes. Scripts should not store a watcher name; the room is the
+identity. Rules
+match top-down; the first rule that claims a room wins, and `agent-chat-gateway config
+validate` warns when an earlier rule shadows a later one completely.
+
+A quiet room is dropped after `session_idle_days` (default 15 — the session
+is kept and the next message resumes it) and reclaimed entirely after a
+further `session_expire_days` (default 15). Pause a watcher to exempt it from
+both timers.
+
+**A config written for the old static watchers fails at load, and the first
+error is the key name.** The list used to be called `watchers:`, which this
+gateway no longer has a use for, so it is reported the way any unrecognised
+top-level key is:
+
+```
+config.yaml sets 'watchers', which this gateway does not use.
+Valid top-level keys are: ... 'watcher_rules', 'watcher_templates'.
 ```
 
-`name:` and `session_id:` may only be set when the entry has exactly one
-room (via `room:`, or a single-item `rooms:`) — they pin a specific
-watcher's identity, which is ambiguous across an expanded multi-room entry.
+Rename the key first; only then do the per-entry errors become visible
+(`room: general` is refused as an unknown key of a rule, and a list-shaped
+`rooms:` is refused as the wrong type). See
+[docs/migration-dynamic-watchers.md](migration-dynamic-watchers.md) for the
+rest of the rewrite.
 
-> ⚠️ **Watcher names are persistent identifiers** — they key session state
-> in `state.<connector>.json`, attachment cache directories, and injected
-> system-prompt files, and they're what you type into
-> `agent-chat-gateway pause|resume|reset`. Renaming a watcher (including by
-> switching it from an explicit `name:` to auto-generated `rooms:`) starts a
-> fresh session under the new name and orphans the old one. See
-> `docs/migration-0.2.md` for the safe way to rename a watcher that already
-> has state you care about.
+> ⚠️ **One watcher per room, per connector.** Two rules cannot both serve a
+> room — first-match precedence gives it to the earlier rule, and validate
+> warns about the shadowed one. To put two agents in one room, give each its
+> own bot account and its own connector, which is the supported multi-agent
+> setup.
 
-**Watcher Fields:**
+> ℹ️ **A watcher's name is display only.** State is keyed by the room id, so a
+> room rename keeps the session, the message watermark, the attachment workspace
+> and the system-prompt file; only the handle `list` shows (and that you type into
+> `pause|resume|reset|expire`) changes, from the next message in the room.
+
+**Watcher Rule Fields:**
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
-| `name` | string | No | Watcher identifier used in CLI commands; auto-derived from `connector`+room if omitted. Only settable on a single-room entry. |
-| `connector` | string | Yes | Must match a connector name above |
-| `room` | string | One of `room`/`rooms` | Room/channel name (as known to the `connector` named above) or `@username` for DMs |
-| `rooms` | list[string] | One of `room`/`rooms` | Bind this connector+agent pair to several rooms at once; expands into one watcher per room |
-| `agent` | string | No | Agent backend to use; falls back to `default_agent` if omitted |
-| `session_id` | string | No | Optional sticky session ID (e.g., `ses_abc123`); `null` = auto-create. Only settable on a single-room entry. |
-| `context_inject_files` | list | No | Watcher-specific context files |
-| `online_notification` | string | No | Message posted when this watcher starts; default `null` (no message) |
-| `offline_notification` | string | No | Message posted when this watcher stops; default `null` (no message) |
+| `name` | string | Yes | Rule identifier (frozen into each created watcher's record) |
+| `connector` | string | **Yes*** | Must match a connector name above. *Required on the rule as it is finally resolved — a rule may take it from its `inherits:` template instead of stating it. There is no implicit default |
+| `rooms.include` | list[string] | Yes* | Room-name globs this rule claims (e.g. `[eng-*, general]`). *May be empty only when a DM flag below is set |
+| `rooms.except_for` | list[string] | No | Globs subtracted from this rule's `include` |
+| `rooms.direct` | bool | No | Also serve 1:1 DMs (whole class) |
+| `rooms.group_direct` | bool | No | Also serve group DMs (whole class; mentions required) |
+| `agent` | string | **Yes*** | Agent backend this rule's rooms run on. *Required on the rule as it is finally resolved — a rule may take it from its `inherits:` template instead of stating it. There is no implicit default |
+| `session_idle_days` | int | No | Days without a message before the room's runtime is dropped (session kept); default 15 |
+| `session_expire_days` | int | No | Days idle before the record and session are reclaimed entirely; default 15 |
+| `context_inject_files` | list | No | Rule-specific context files (frozen into each created watcher) |
+
+#### Templates and `rooms` inheritance
+
+A `watcher_templates:` entry can carry `rooms:`, and every subkey of it is
+inheritable — `include`, `except_for`, `direct` and `group_direct`. What makes
+this worth its own section is that `rooms:` is a **matcher**, not a settings
+block, so two rules inheriting the same matcher can end up fighting over the
+same room. Each rule below behaves the way it does for that reason.
+
+**A rule's own `rooms:` merges over the template's, key by key.** Keys the rule
+does not mention are inherited as-is:
+
+```yaml
+watcher_templates:
+  channels:
+    connector: rc-main
+    rooms: {direct: true}
+watcher_rules:
+  - {name: eng, inherits: channels, rooms: {include: ['eng-*']}}
+  # -> include: [eng-*]  AND  direct: true — both survive
+```
+
+**A list the rule sets replaces the template's list outright; the two are not
+concatenated.** A template `include: [a-*]` under a rule that sets
+`include: [b-*]` yields `[b-*]` only. Same for `except_for`. If you want both
+patterns, list both in the rule.
+
+**To switch off an inherited flag, write `false` — not `null`.** The field is
+read as a boolean, and `null` is a load error (*"'rooms.direct' must be true or
+false"*), not a way to unset it.
+
+**A template cannot supply `except_for` on its own.** `except_for` subtracts
+from `include`, so a rule that inherits only an exclusion matches nothing and
+is refused:
+
+```
+Watcher rule at index 0 ('r1') can never match any room: 'rooms.include'
+is empty and neither 'rooms.direct' nor 'rooms.group_direct' is set.
+```
+
+**An inherited `except_for` pattern must be able to match something the
+inheriting rule includes.** An exclusion that cannot overlap the rule's
+`include` looks like protection but removes nothing, so it is a hard error
+rather than a silent no-op:
+
+```yaml
+watcher_templates:
+  channels: {connector: rc-main, rooms: {except_for: ['*-secret']}}
+watcher_rules:
+  - {name: eng, inherits: channels, rooms: {include: ['eng-*']}}   # ok: eng-secret overlaps
+  - {name: ops, inherits: channels, rooms: {include: ['ops-*']}}   # ok: ops-secret overlaps
+```
+
+Written as `except_for: ['ops-secret']` instead, the same template would break
+the `eng` rule — no room named `eng-*` can ever be called `ops-secret`:
+
+```
+'rooms.except_for' entry 'ops-secret' does nothing here, because this rule's
+'include' never matches a room by that name.
+```
+
+So a shared exclusion has to be phrased broadly enough (a suffix like
+`*-secret`) to bite on every rule that inherits it.
+
+**Do not put `direct: true` or `group_direct: true` in a template several rules
+inherit.** Only the first rule that matches a room serves it, and the DM classes
+are not name-matched, so the first inheriting rule takes every DM and the DM half
+of the later ones is dead. It loads, and `config validate` warns:
+
+> Watcher rule 'ops' will never see one-to-one direct messages, because those
+> are already handled by 'eng', which is listed above it.
+
+Give DMs their own rule that does not inherit the template, as in the
+[migration guide's example](migration-dynamic-watchers.md#the-rewrite).
 
 ### Tool Allow-Lists
 
@@ -614,18 +742,81 @@ agent-chat-gateway status
 All commands require the daemon to be running.
 
 ```bash
-# List all active watchers
+# List watchers — active, failed and paused by default
 agent-chat-gateway list [--connector NAME]
 
+# Include idle watchers (released on purpose, nothing running),
+# or ask for one state at a time
+agent-chat-gateway list --all
+agent-chat-gateway list --idle
+agent-chat-gateway list --failed
+agent-chat-gateway list --active --paused
+
 # Pause a watcher (stops processing messages)
-agent-chat-gateway pause <watcher-name> [--connector NAME]
+agent-chat-gateway pause <watcher-name>
 
 # Resume a paused watcher
-agent-chat-gateway resume <watcher-name> [--connector NAME]
+agent-chat-gateway resume <watcher-name>
 
 # Reset a watcher (clear state, create new session)
-agent-chat-gateway reset <watcher-name> [--connector NAME]
+agent-chat-gateway reset <watcher-name>
+
+# Expire a watcher now: reclaim its record and files; the room's next message
+# recreates it. Refused on voice/script connectors — nothing arrives on its
+# own there to bring the watcher back — use `reset` on those instead.
+agent-chat-gateway expire <watcher-name>
 ```
+
+`list` reports the watchers the gateway has **state records** for, not the
+entries in `config.yaml`.
+
+**The rule is simply: a watcher appears if a state record exists for it.**
+Nothing more — not whether it started, not how far it got.
+
+That is worth stating as a rule rather than as a list of failures, because the
+list has too many cases to keep straight. A record is written partway through
+starting a watcher; some later failures keep it, so the watcher shows as
+`failed`, and others roll it back deliberately, so that a half-built watcher
+cannot be resumed as though it were whole. A watcher that has run successfully
+**before** has a record on disk regardless, so the same fault can show as
+`failed` on one machine and as nothing at all on another that has never got it
+running.
+
+Two consequences to hold on to:
+
+* **No row does not mean "the start never got far".** It means there is nothing
+  left to act on — no session, no watermark. The startup errors and the gateway
+  log are where you find out what actually failed; `list` only shows what
+  survived.
+* **A `failed` row does not mean the failure was recent.** It may be a record
+  from a boot weeks ago that has not started successfully since.
+
+A failed watcher is retried on **every daemon start**. If the underlying problem
+is unfixed it fails again and says so again — deliberately, so the gateway never
+quietly settles for a broken watcher.
+
+**To recover one:** `resume` or `reset` retries the start in place, which is
+what you want when the fault was outside the gateway — a room that had gone, a
+server that was down. **If the agent backend itself was unavailable, restart the
+daemon instead:** agent availability is decided once at startup, and `resume`
+and `reset` deliberately refuse rather than start a watcher whose permission
+broker never came up.
+
+To stop a watcher being retried at all, `pause` it; that is also how a watcher
+with no record is kept from being started, since pausing one creates a paused
+record.
+
+The four states are:
+
+| State | Meaning |
+|---|---|
+| `active` | A record exists and a processor is running for it |
+| `failed` | A record exists and nothing is running — a start that got as far as writing the record and then raised. **The one state that means something is wrong**, so it is in the default view |
+| `paused` | Muted by `pause`, waiting on a human decision — shown by default for that reason |
+| `idle` | The gateway knows the room, but it was released on purpose and nothing is running |
+
+`status` counts every state; `list` shows the three an operator is likely to
+act on — everything except `idle` — unless asked otherwise.
 
 ### Direct Messaging
 
@@ -776,10 +967,11 @@ connectors:
     context_inject_files:
       - contexts/rc-gateway-context.md   # Gateway behavior rules — shared across all rooms
 
-watchers:
+watcher_rules:
   - name: general
     connector: rc-main
-    room: general
+    rooms:
+      include: [general]
     agent: claude
     context_inject_files:
       - contexts/rc-room-profiles.md     # Room member profiles — specific to this room
@@ -788,7 +980,7 @@ watchers:
 Restart or reset the watcher to load the new context:
 
 ```bash
-agent-chat-gateway reset general
+agent-chat-gateway reset rc-main:general
 ```
 
 > **Tip:** `contexts/rc-gateway-context.md` (included in the repo) sets up baseline gateway
@@ -881,7 +1073,7 @@ message headers, roles, `to:` addressing, injection-protection rules, and gatewa
 
 1. **Connector-level** (`connectors[].context_inject_files`) — Shared across all watchers on this connector
 2. **Agent-level** (`agents[].context_inject_files`) — Applied to all sessions using this agent
-3. **Watcher-level** (`watchers[].context_inject_files`) — Specific to this watcher's session
+3. **Watcher-level** (`watcher_rules[].context_inject_files`) — Specific to this watcher's session
 
 Files are injected in this order, so watcher-level context overrides agent-level, which overrides connector-level.
 
@@ -924,8 +1116,12 @@ agents:
     context_inject_files:
       - docs/system-prompt.txt       # Layer 2: agent instructions
 
-watchers:
+watcher_rules:
   - name: general
+    connector: rc-main
+    agent: claude
+    rooms:
+      include: [general]
     context_inject_files:
       - docs/domain-context.txt      # Layer 3: room-specific context
 ```
@@ -967,10 +1163,11 @@ connectors:
   - name: rc-main
     ...
 
-watchers:
+watcher_rules:
   - name: general
     connector: rc-main
-    room: general
+    rooms:
+      include: [general]
     agent: claude
     context_inject_files:
       - contexts/rc-room-profiles.md     # Room member profiles — specific to this room
@@ -1029,36 +1226,42 @@ Files are cached globally in the `cache_dir` and symlinked into each watcher's w
 
 By default, each watcher creates its own persistent session with the agent backend. The session ID is stored in `~/.agent-chat-gateway/state.<connector>.json` and reused across daemon restarts.
 
-```yaml
-watchers:
-  - name: general
-    session_id: null  # Gateway auto-creates and persists
-```
+The session is reused only while the agent still resolves to the same **backend type and physical working directory** — the pair that scopes where the backend keeps its sessions. Change either one and the watcher starts a fresh session and logs why, rather than replaying an id into a store that never issued it, where it would find nothing or, worse, an unrelated session with the same id. The earlier conversation is not deleted; it stays in the backend it was created against. The gateway will not re-attach it, though — the state record now holds the new session, so changing the setting back starts a third session rather than returning to the first. Recovering that conversation means resuming it with the backend's own tooling (for Claude Code, `claude --resume <id>` from the original working directory), using the id from the log line that reported the change.
 
-### Sticky Sessions
+> ⚠️ **If `working_directory` points through a symlink** — a `current -> release-N`
+> deploy link, say — repointing that link swaps the session too, even though
+> `config.yaml` did not change. This is not incidental: a process launched there
+> reports the physical path, so the backend genuinely keeps its sessions per target
+> directory. Point `working_directory` at a stable path if you want conversations to
+> survive a deploy.
 
-You can explicitly tie a watcher to a specific session (e.g., a long-running agent session):
+No configuration is involved: a watcher's session id is assigned by the backend and
+persisted by the gateway, never written by hand.
 
-```yaml
-watchers:
-  - name: research
-    session_id: "ses_abc123def456"  # Always use this session
-```
+### Pinned Sessions Are Removed
 
-Sticky sessions are never cleared by the `reset` command — the watcher will reconnect to the same session if it's still alive.
+`watchers[].session_id` used to tie a watcher to one specific backend session.
+Setting it is now a config error. A pinned id names a session the backend is free to
+expire (Claude Code's default `cleanupPeriodDays` is 30 days), after which the
+watcher silently starts empty — and with watchers created per room, one id in config
+cannot say which room it belongs to.
+
+To carry context into a session, use a handoff file instead — see
+[Use Case 3](#use-case-3--carry-an-existing-agent-sessions-context-into-chat).
 
 ### Resetting State
 
 To clear a watcher's state and create a fresh session:
 
 ```bash
-agent-chat-gateway reset <watcher-name> [--connector NAME]
+agent-chat-gateway reset <watcher-name>
 ```
 
 This:
-- Clears the stored session ID (if not sticky)
-- Creates a new session on the next message
-- Preserves watcher configuration
+- Clears the stored session ID
+- Starts a fresh session immediately (the watcher is restarted)
+- Preserves the watcher's record and its frozen configuration
+- Is refused while the watcher is paused — resume it first
 
 ### Viewing Runtime State
 
@@ -1126,7 +1329,6 @@ cat ~/.agent-chat-gateway/state.rc-main.json | jq .
 1. Check agent logs for repeated context injection: `grep "context_inject" ~/.agent-chat-gateway/gateway.log`
 2. Reduce context file sizes (keep under 256 KB per file, 512 KB total)
 3. Consider disabling context for specific watchers: set `context_inject_files: []`
-4. Use sticky sessions (`session_id: "ses_..."`) to maintain conversation history
 
 ### Connection failures
 
@@ -1187,19 +1389,26 @@ agents:
       enabled: true
       timeout: 300
 
-watchers:
+watcher_rules:
+  # Each rule names its own connector and agent — neither has a default.
   - name: general
+    connector: rc-main
     agent: claude          # General discussions
+    rooms: {include: [general]}
   - name: development
+    connector: rc-main
     agent: opencode        # Code development
+    rooms: {include: [dev]}
   - name: research
+    connector: rc-main
     agent: claude          # Research tasks
+    rooms: {include: [research]}
 ```
 
 ### Multi-Connector Setup
 
 Connectors are independent — run several instances of the same platform, or mix
-platforms entirely, in one daemon. `connector` names in `watchers` are what tie a
+platforms entirely, in one daemon. `connector` names in `watcher_rules` are what tie a
 room/channel to a specific connector instance.
 
 For teams using multiple Rocket.Chat servers or workspaces:
@@ -1225,15 +1434,17 @@ connectors:
       owners:
         - charlie
 
-watchers:
+watcher_rules:
   - name: company-general
     connector: rc-company
-    room: general
+    rooms:
+      include: [general]
     agent: claude
 
   - name: partner-collab
     connector: rc-partner
-    room: general
+    rooms:
+      include: [general]
     agent: claude
 ```
 
@@ -1260,15 +1471,17 @@ connectors:
     allowed_users:
       owners: [bob]
 
-watchers:
+watcher_rules:
   - name: rc-general
     connector: rc-main
-    room: general
+    rooms:
+      include: [general]
     agent: claude
 
   - name: mm-general
     connector: mm-main
-    room: town-square
+    rooms:
+      include: [town-square]
     agent: claude
 ```
 

@@ -122,14 +122,26 @@ class TestStatePersistence(unittest.TestCase):
         loaded = load_state("rc")
         self.assertEqual(loaded, [])
 
-    # ── Legacy format migration ───────────────────────────────────────────────
+    # ── Legacy format refusal (was: migration) ────────────────────────────────
 
-    def test_load_legacy_format_migrates_watcher_id_to_watcher_name(self):
-        """Legacy records with 'watcher_id' are migrated to 'watcher_name'."""
-        from gateway.core.state import _state_file, load_state
+    def test_a_legacy_watcher_id_record_is_refused_not_migrated(self):
+        """Inverted with the removal of the legacy branch (design §5.3).
+
+        These two tests asserted that a `watcher_id`-era record was best-effort
+        migrated by using `room_name` as the watcher name. That reader is deleted
+        rather than extended, because it cannot supply any of the fields on-the-fly
+        watchers need — no agent, no materialized config, no originating rule — so
+        extending it would manufacture incomplete records and bypass the refusal that
+        is the actual contract.
+
+        Kept as tests rather than deleted: what mattered about them is that a legacy
+        file is *noticed*, and that is still the property under test — only the answer
+        changed from "migrate it" to "refuse to start".
+        """
+        from gateway.core.state import LegacyStateError, _state_file, load_state
 
         state_file = _state_file("rc")
-        legacy_data = {
+        state_file.write_text(json.dumps({
             "watchers": [
                 {
                     "watcher_id": "wid-001",
@@ -141,39 +153,28 @@ class TestStatePersistence(unittest.TestCase):
                     "last_processed_ts": "",
                 }
             ]
-        }
-        state_file.write_text(json.dumps(legacy_data))
+        }))
 
-        loaded = load_state("rc")
+        with self.assertRaises(LegacyStateError) as cm:
+            load_state("rc")
+        # The operator has to be able to find the file and the procedure.
+        self.assertIn(str(state_file), str(cm.exception))
 
-        self.assertEqual(len(loaded), 1)
-        # Legacy migration: watcher_name = room_name
-        self.assertEqual(loaded[0].watcher_name, "support")
-        self.assertEqual(loaded[0].session_id, "sess-legacy")
-        # paused defaults to False for legacy records
-        self.assertFalse(loaded[0].paused)
+    def test_a_previous_current_format_record_is_refused_too(self):
+        """The refusal is a file-level version check, not record-shape sniffing — so
+        the format immediately before this one is refused as well, even though every
+        one of its records looks perfectly well-formed."""
+        from gateway.core.state import LegacyStateError, _state_file, load_state
 
-    def test_load_legacy_fallback_uses_watcher_id_when_no_room_name(self):
-        """Legacy record without room_name falls back to watcher_id as name."""
-        from gateway.core.state import _state_file, load_state
-
-        state_file = _state_file("rc")
-        legacy_data = {
+        _state_file("rc").write_text(json.dumps({
             "watchers": [
-                {
-                    "watcher_id": "wid-fallback",
-                    "session_id": "",
-                    "room_id": "r1",
-                    "room_type": "channel",
-                    "context_injected": False,
-                    "last_processed_ts": "",
-                }
+                {"watcher_name": "support", "session_id": "s", "room_id": "r",
+                 "room_type": "channel", "context_injected": True, "paused": False,
+                 "last_processed_ts": ""}
             ]
-        }
-        state_file.write_text(json.dumps(legacy_data))
-
-        loaded = load_state("rc")
-        self.assertEqual(loaded[0].watcher_name, "wid-fallback")
+        }))
+        with self.assertRaises(LegacyStateError):
+            load_state("rc")
 
     # ── Error resilience ──────────────────────────────────────────────────────
 
@@ -188,11 +189,19 @@ class TestStatePersistence(unittest.TestCase):
         self.assertEqual(result, [])
 
     def test_load_missing_watcher_name_field_skipped(self):
-        """Records with neither watcher_name nor watcher_id are skipped silently."""
-        from gateway.core.state import _state_file, load_state
+        """A record with no watcher_name is skipped, in an otherwise current file.
+
+        The file needs its version marker now, or the refusal fires first and this
+        stops testing what it says it does — the record-level skip, not the
+        file-level check.
+        """
+        from gateway.core.state import STATE_FORMAT_VERSION, _state_file, load_state
 
         state_file = _state_file("rc")
-        data = {"watchers": [{"session_id": "s1", "room_id": "r1"}]}
+        data = {
+            "version": STATE_FORMAT_VERSION,
+            "watchers": [{"session_id": "s1", "room_id": "r1"}],
+        }
         state_file.write_text(json.dumps(data))
 
         loaded = load_state("rc")
