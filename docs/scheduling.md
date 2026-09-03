@@ -56,11 +56,10 @@ daemon logs a WARNING naming the room when that happens.
 
 | Option | Description |
 |---|---|
-| `--every INTERVAL` | Recurring interval. Accepted values: `1m`, `5m`, `10m`, `15m`, `30m`, `1h`, `2h`, `3h`, `6h`, `12h`, `1d`, `1w` |
+| `--every INTERVAL` | Recurring interval: any `Nm` (1–59 minutes), any `Nh` (1–23 hours), `1d`, `1w` |
 | `--starting TIME` | Time anchor / start time. With `--every`: sets the first run and (for `1d`/`1w`) pins the cron time-of-day. Without `--every`: one-shot specific datetime. Accepts smart partial inputs: `"09:00"`, `"Apr 15 09:00"`, `"04-15 09:00"`, `"Mon 09:00"`, `"2026-05-01 09:00"`. |
 | `--times N` | Max number of runs. `0` means run forever (default). `1` means run once then mark completed. |
-| `--tz TIMEZONE` | IANA timezone, e.g. `"America/New_York"`, `"Europe/Berlin"`, `"UTC"`. The `--starting` time is interpreted in this timezone. Defaults to the `timezone` setting of the watcher's connector, or the ACG server's local timezone if unset. Only relevant for daily/weekly schedules — omit for sub-hourly intervals. |
-| `--connector NAME` | Which connector to use. Auto-detected when only one connector is configured. |
+| `--tz TIMEZONE` | IANA timezone, e.g. `"America/New_York"`, `"Europe/Berlin"`, `"UTC"`. The `--starting` time is interpreted in this timezone; if omitted, a `--starting` time is read in the ACG server's local timezone. The connector's `timezone` setting applies only to schedules with no `--starting`. Only relevant for daily/weekly schedules — omit for sub-hourly intervals. |
 
 ### Smart date inference for `--starting`
 
@@ -175,8 +174,11 @@ watcher_rules:
 ```
 
 ```bash
-agent-chat-gateway schedule create cron "Check disk usage and log anything over 80%." --every 1h
+agent-chat-gateway schedule create headless:cron "Check disk usage and log anything over 80%." --every 1h
 ```
+
+The watcher is `headless:cron` — connector name, colon, room — not the rule
+name; `schedule create` refuses a rule name.
 
 The job fires exactly like any other — `SessionManager.inject_message()`
 runs the agent turn the same way regardless of connector type — but the
@@ -201,12 +203,12 @@ Output:
 ```
 ID              WATCHER               STATUS      CRON              RUNS          NEXT RUN (UTC)          MESSAGE
 acg-bb47e7f4    rc:general            active      0 9 * * 1-5       3/∞           2026-04-10 09:00:00     Run daily standup
-acg-2f6cb289    rc:ops                paused      */30 * * * *      12/∞          -                       Check server health
+acg-2f6cb289    rc:ops                paused      */30 * * * *      12/∞          2026-04-10 09:30:00     Check server health
 acg-b8c2a409    rc:general            completed   * * * * *         1/1           done 2026-04-09 07:23   提醒：去刷牙
 ```
 
 - **RUNS** shows `run_count / max_runs` (∞ means no limit).
-- **NEXT RUN** shows `-` for paused jobs and `done <timestamp>` for completed ones.
+- **NEXT RUN** shows `done <timestamp>` for completed jobs and `cancelled <timestamp>` for cancelled ones. A paused job still shows the time it would have fired; it is not consulted while paused.
 
 ### Filter by connector
 
@@ -226,7 +228,7 @@ agent-chat-gateway schedule list --all
 agent-chat-gateway schedule pause acg-bb47e7f4
 ```
 
-Paused jobs do not fire until resumed. The `NEXT RUN` column shows `-`.
+Paused jobs do not fire until resumed. The `NEXT RUN` column keeps the time the job would have fired; it is not consulted while paused.
 
 A job does not keep its watcher's room from being reclaimed, and does not need
 to. A job that **records the room it targets** resolves that room on its next run
@@ -379,7 +381,9 @@ Each job record contains:
 | Field | Description |
 |---|---|
 | `id` | Unique job identifier, format `acg-xxxxxxxx` |
-| `watcher` | The watcher name the job targets |
+| `watcher` | The watcher handle as of creation (display; `schedule list` shows the current one) |
+| `connector` | The connector that owns the job |
+| `room_id` | The platform room the job fires into — the identity a fire resolves through; empty on a pre-schema-2 job until `schedule migrate` records it |
 | `cron` | The cron expression derived from `--every` or `--starting` |
 | `timezone` | IANA timezone string |
 | `times` | Max runs (`0` = forever) |
@@ -395,7 +399,7 @@ You can inspect or back up `data/jobs.json` directly. Do not edit it while ACG i
 
 ## Timezone Handling
 
-All times you specify with `--starting` are interpreted in the timezone given by `--tz`. If `--tz` is omitted, the timezone falls back to the `timezone` setting on the watcher's connector, then to the ACG server's local timezone.
+All times you specify with `--starting` are interpreted in the timezone given by `--tz`. If `--tz` is omitted, a `--starting` time is read in the **ACG server's local timezone**. The connector's `timezone` setting is used only for schedules with no `--starting` (a bare `--every 1d` fires at 09:00 in the connector's zone).
 
 Set a connector's default timezone in `config.yaml`:
 
@@ -411,7 +415,7 @@ connectors:
 # Fires at 09:00 Taipei time every day
 agent-chat-gateway schedule create rc:general "Morning briefing" --every 1d --starting "09:00" --tz "Asia/Taipei"
 
-# Fires at 09:00 UTC every day (same as no --tz)
+# Fires at 09:00 in the ACG server's local timezone every day (no --tz)
 agent-chat-gateway schedule create rc:general "Morning briefing" --every 1d --starting "09:00"
 ```
 

@@ -161,7 +161,7 @@ When you migrate servers, do one of:
   the new server.
 
 Session content does not survive a server move either way; export anything
-that matters first (checklist step 3).
+that matters first (checklist step 5).
 
 ## Mattermost DM watchers created before the `@` strip
 
@@ -194,10 +194,8 @@ agent-chat-gateway expire 'mm-e2e:dm:%40test_user'   # quoted for legibility, no
 Accepted losses, the same ones the rest of this document takes: the session is
 fresh (history handoff refetches recent messages) and the watermark resets
 once. The durable-instructions prompt file is **not** left behind — `expire`
-reclaims the room, and reclamation deletes that file under the name the record
-still holds. (A prompt file is keyed partly on the watcher name, so a rename
-performed any other way would orphan one; going through `expire` is what
-avoids it.)
+reclaims the room, and reclamation deletes that file (it is keyed by the room,
+so no rename can orphan it).
 
 Leaving the encoded name in place is also a legitimate choice. It is ugly in
 `list` and awkward to type, and that is the whole of the cost.

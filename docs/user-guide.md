@@ -549,17 +549,10 @@ rest of the rewrite.
 > own bot account and its own connector, which is the supported multi-agent
 > setup.
 
-> ⚠️ **Watcher names are persistent identifiers** — they key session state in
-> `state.<connector>.json` and they're what you type into
-> `agent-chat-gateway pause|resume|reset`. Renaming a watcher (including by switching it
-> from an explicit `name:` to auto-generated `rooms:`) starts a fresh session under the
-> new name and orphans the old one. See `docs/migration-0.2.md` for the safe way to
-> rename a watcher that already has state you care about.
->
-> Names no longer name the per-room files directly. The attachment cache directory is
-> keyed on the room, so renaming a watcher does not disturb it; the injected
-> system-prompt file is keyed on the watcher *within* its room, so a rename leaves the
-> old file behind — internal, and safe to delete.
+> ℹ️ **A watcher's name is display only.** State is keyed by the room id, so a
+> room rename keeps the session, the message watermark, the attachment workspace
+> and the system-prompt file; only the handle `list` shows (and that you type into
+> `pause|resume|reset|expire`) changes, from the next message in the room.
 
 **Watcher Rule Fields:**
 
@@ -987,7 +980,7 @@ watcher_rules:
 Restart or reset the watcher to load the new context:
 
 ```bash
-agent-chat-gateway reset general
+agent-chat-gateway reset rc-main:general
 ```
 
 > **Tip:** `contexts/rc-gateway-context.md` (included in the repo) sets up baseline gateway
@@ -1080,7 +1073,7 @@ message headers, roles, `to:` addressing, injection-protection rules, and gatewa
 
 1. **Connector-level** (`connectors[].context_inject_files`) — Shared across all watchers on this connector
 2. **Agent-level** (`agents[].context_inject_files`) — Applied to all sessions using this agent
-3. **Watcher-level** (`watchers[].context_inject_files`) — Specific to this watcher's session
+3. **Watcher-level** (`watcher_rules[].context_inject_files`) — Specific to this watcher's session
 
 Files are injected in this order, so watcher-level context overrides agent-level, which overrides connector-level.
 
@@ -1266,8 +1259,9 @@ agent-chat-gateway reset <watcher-name>
 
 This:
 - Clears the stored session ID
-- Creates a new session on the next message
-- Preserves watcher configuration
+- Starts a fresh session immediately (the watcher is restarted)
+- Preserves the watcher's record and its frozen configuration
+- Is refused while the watcher is paused — resume it first
 
 ### Viewing Runtime State
 

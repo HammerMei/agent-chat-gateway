@@ -484,8 +484,8 @@ load-bearing and every change to it destructive: the old file and symlink are
 orphaned, and a collision repoints one room's attachment path at another's
 files.
 
-**Both move to a derived key, not to the raw `room_id`.** The display name
-then becomes purely cosmetic: free to change, free to be ugly, free to be
+**Both key on a derived digest, not on the raw `room_id`** (`paths.room_path_key`,
+`paths.watcher_prompt_key` — done). The display name is then purely cosmetic: free to change, free to be ugly, free to be
 absent. This costs a little debugging convenience — a directory listing no
 longer reads as room names — which `list` offsets by showing both.
 
@@ -600,9 +600,9 @@ mm-eng:dm:alice          iwihkhk9jpf3tngp14ushkx6pe  idle    @alice
 mm-eng:gdm:a3f9c1b2d4e5f607  cib3hjsrgpydtf6tyac7frcu6o  active  @alice, @bob
 ```
 
-`resolve()` (§2.8) accepts the label **or** the room id, so an operator always
-has a stable handle even for a room whose label is a hash — and pasting an id
-straight from `list` always works.
+The verbs take the handle. `list` shows the room id and the participants beside
+it, so a group DM can be told apart even though its label is a digest, but
+`pause`/`resume`/`reset`/`expire` do not accept a room id.
 
 **The participants column is not decoration; it is how a group DM is
 identified.** An opaque label is only acceptable because something else in the
@@ -626,8 +626,10 @@ The member list is strictly better here — it is what makes the agent's own
 sense of place accurate, and it is what makes the answer useful when an
 operator asks. The hash remains the label; the header describes the room.
 
-**The header sources that description from the state record, not the frozen
-config.** The materialized config is a snapshot taken at creation (§2.4), so a
+**The header should source that description from the state record, not the
+frozen config; today it renders the frozen `config.room`** (the one rewrite is
+`MessageProcessor.rename`, on a named-room rename). The materialized config is a
+snapshot taken at creation (§2.4), so a
 group DM whose membership later changes would keep announcing its original
 members forever. `state.participants` is *intended* to be refreshed from
 inbound messages, so reading the header from there keeps the agent's stated
@@ -650,9 +652,9 @@ Both changes above are forward-looking rather than fixes for a present fault.
 Both connectors derive room names from platform *slugs*, and both slug
 character sets already sit inside the safe set — Mattermost's are lowercase
 alphanumeric plus `-`/`_`, Rocket.Chat's default validation is
-`[0-9a-zA-Z-_.]+` — so the sanitizer is currently the identity function, and
-neither a collision nor the raise is reachable. They become reachable with the
-first connector whose platform permits unicode channel names.
+`[0-9a-zA-Z-_.]+` — so on those two platforms the encoder is the identity
+function. It is exercised today by voice rooms, whose names come from URL paths
+(`/ask/a/b` → `a/b`); a collision truncates and digests rather than raising.
 
 Note how much the decoupling reduces the stakes. Before it, a label collision
 meant one session serving two rooms, a system prompt naming the wrong room,
@@ -709,7 +711,9 @@ things: the field itself, the priority-1 branch in `_provision_session`, and
 `reset_watcher`'s pinned-session handling. Leaving them would mean carrying
 branches that nothing can reach and a future reader cannot tell are dead.
 
-`session_id` in `config.yaml` becomes a hard load error naming the replacement.
+`session_id` in `config.yaml` fails to load as an unknown key — a removed field
+does not earn its own rejection path; the replacement is documented here, not in
+the error.
 **The replacement is a handoff, not a pin**: have the agent summarise its
 session to a file and read that file back in the next one. That is strictly
 more robust than pinning — it survives the backend expiring the session, which
@@ -1154,7 +1158,8 @@ rules per connector is load-bearing rather than a convenience: two rules
 with literal room patterns on one voice connector serve two agents on one
 port. Voice additionally needs default-deny on unknown rooms — a typo'd path
 must not spawn a fresh context-less session — and its unmatched-room reply
-must say no route is configured rather than reporting backpressure.
+must say no route is configured rather than reporting backpressure. *(Not yet
+done: voice answers `_BUSY_REPLY` for an unrouted room; default-deny holds.)*
 
 ### 2.7 Creation path
 
@@ -1234,9 +1239,10 @@ block contains the very message that triggered creation, which is then
 delivered twice: once inside a history turn whose response is discarded, and
 again as the live prompt. Buffering alone does not fix this.
 
-**Notifications are suppressed on idle and reactive paths**, reserved for
-operator-initiated pause and resume. Otherwise every idle room announces the
-agent offline each idle period and online on each burst.
+**No online/offline notification is posted on any path**, including pause and
+resume — the `online_notification`/`offline_notification` settings were removed
+with the cutover. Otherwise every idle room would announce the agent offline
+each idle period and online on each burst.
 
 **DMs are opt-in per rule**, with 1:1 and group DMs distinguished — because
 the two behave differently, not merely because they look different.
@@ -1249,8 +1255,8 @@ Classifying them is asymmetric (§6.4). Mattermost marks a group DM
 `channel_type: "G"`, distinct from `"D"`. Rocket.Chat reports **both** as
 `roomType: "d"` with no participant information in the frame at all, so
 honouring `group_direct` there needs a participant-count lookup the first time
-a DM room is seen — cacheable, but a lookup, and a DM that later gains members
-has to be re-classified rather than served from a stale cache.
+a DM room is seen — cacheable permanently: a DM's member set cannot change
+(§6.4), so a different member set is a different room id, never a stale cache.
 
 Two things make DMs structurally unlike channels, both verified in §6.3:
 
@@ -1483,7 +1489,9 @@ Three properties this must have:
   event naming the room and noting that a pause was overridden, since that is
   the one case where an operator's explicit setting is discarded and it should
   never be silent. Pending jobs for the room are cancelled with a stated
-  reason rather than left pointing at nothing.
+  reason rather than left pointing at nothing — cancelled, not deleted: the job
+  stays in `jobs.json` as `cancelled` with `cancelled_at`/`cancel_reason`, is
+  purged after the completed-job TTL, and `schedule resume` restores it.
 
   Two consequences worth stating. Reclamation must be idempotent, because
   Mattermost's socket has no replay and a removal event can be *missed* —
@@ -1517,6 +1525,13 @@ are unaffected.
 
 One class owns the lifecycle. Callers ask whether a watcher exists and get
 one; they never drive creation, idling or expiry.
+
+The block below is the *shape*, not the code's signatures. In the code, creation
+and recreation live in `WatcherManager.get_or_create`; the verbs are
+`SessionManager.pause_watcher`/`resume_watcher`/`reset_watcher`/`expire_watcher`
+(by handle); `list` is `WatcherLifecycle.list_watchers`; and a residency probe does
+exist — `WatcherLifecycle.processor_for_room` — which `inject_message` consults
+before `get_or_create`.
 
 ```python
 WatcherKey = tuple[str, str]          # (connector, room_id)
@@ -1650,8 +1665,9 @@ The seam, so a reader can check it rather than rediscover it: a fire resolves
 its job **once** in `JobScheduler._resolve_target`, which answers
 `(manager, room_id)`; everything downstream — `SessionManager.inject_message`,
 `SessionManager.notify_watcher_room`, the pause check, and
-`GatewayService._cancel_jobs_for` — takes a room id and **has no parameter that
-could carry a handle**. A job written before schema 2 has only its handle, and
+`GatewayService._cancel_jobs_for` — take a room id; `_cancel_jobs_for` alone
+additionally takes a keyword-only `legacy_handle`, consulted only for a job with
+no `room_id`. A job written before schema 2 has only its handle, and
 `SessionManager.resolve_handle` is the one place on the runtime path that turns
 one into a room id. `job_migrate._resolve_room_id` reads the handle too, by
 design — recording the room is the migration's purpose.
@@ -2191,9 +2207,10 @@ Records are keyed on `(connector, room_id)`. Added to each record:
 |---|---|
 | `room_name` | a human-readable description of the room, refreshed from inbound messages: the platform's name for a named room, the counterpart or participant list for the DM kinds (§2.3). Display only — nothing keys on it |
 | `room_kind` | `channel` / `group` / `dm` / `group_dm` — decides the label form and whether `require_mention` applies (§2.7) |
-| `participants` | DM counterparts, for the `list` column; refreshed, never part of a key |
+| `participants` | DM counterparts, for the `list` column; frozen at creation (refresh is issue #124), never part of a key |
 | `connector`, `agent` | so a rule edit cannot silently re-point a dormant session |
 | `backend_identity` | the resolved backend type + working directory the session was created against; compared before a stored `session_id` is reused, and a mismatch forces a fresh session rather than replaying the id into a different session store (§2.4) |
+| `config_schema_version` | the record-format version the record was written at; frozen at creation |
 | `created_at` | audit |
 | `last_activity_at` | the idle clock (§2.5) |
 | `dropped_at` | distinguishes was-active from was-idle at boot |
@@ -2287,7 +2304,7 @@ should the answer.
 | `last_processed_ts` watermarks | A one-off boundary effect per room: a message either side of the cut may be reprocessed or skipped once |
 | Paused state | A paused room becomes active again unless the operator decides what it was for. Pause is an operational verb — mute this watcher for now — and it is not a way to express "this room is not ours", so it does not translate into config. See "not a 1:1 rewrite" below |
 | Scheduled jobs | A job keyed on a STATIC watcher name resolves to nothing after the cutover; those are re-created in step 6. A job already keyed on a derived handle converts instead — `schedule migrate` records its room id |
-| Pinned `session_id` | The field is gone (§2.4). A config that sets it fails to load, naming the replacement: have the agent summarise its session to a file and read that back in the new one — which also survives the backend expiring a session, as pinning never did |
+| Pinned `session_id` | The field is gone (§2.4). A config that sets it fails to load as an unknown key. The replacement: have the agent summarise its session to a file and read that back in the new one — which also survives the backend expiring a session, as pinning never did |
 
 **One guard is worth the ten lines**: if the gateway finds legacy-format state
 files it **refuses to start**, naming them and pointing at the guide. This is a

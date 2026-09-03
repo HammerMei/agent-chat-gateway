@@ -264,7 +264,8 @@ def main():
         default=None,
         metavar="TIMEZONE",
         help="IANA timezone (e.g. 'Asia/Taipei', 'America/New_York', 'UTC'). "
-             "Fallback: the watcher's connector timezone setting, then server local.",
+             "If omitted, a --starting time is read in the server's local timezone; "
+             "the connector's timezone setting applies only to schedules with no --starting.",
     )
 
     # schedule list

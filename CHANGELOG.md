@@ -117,10 +117,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 - **Per-room files are named by a digest instead of the watcher name**
-  (design §2.3): the attachment workspace keys on `(connector, room id)`, the
-  system-prompt file on `(connector, room id, watcher name)`. A rename no
-  longer orphans the workspace, and two rooms can no longer collide onto one
-  path. *On upgrade:* one prompt file and one symlink per existing room are
+  (design §2.3): the attachment workspace and the system-prompt file both key
+  on `(connector, room id)`. A rename orphans neither, and two rooms can no
+  longer collide onto one path. *On upgrade:* one prompt file and one symlink per existing room are
   orphaned once; they are internal artifacts and harmless to delete — expiry
   reclaims the new ones automatically.
 - **A room with no watcher is no longer reported as backpressure.** The
