@@ -378,3 +378,39 @@ class TestSessionlessRecordsReleaseNothing(IsolatedTestCase):
         reply = await mgr.dispatch_command({"cmd": "list"})
         self.assertEqual(reply["data"], [], "expired all the same")
         self.assertFalse(any("AUDIT: session released" in line for line in logs.output), logs.output)
+
+
+class TestRecordsThatCannotBeReMatchedHonestly(IsolatedTestCase):
+
+    async def test_an_unknown_room_kind_is_kept_not_judged_as_a_channel(self):
+        """The runtime degrades an unknown kind to CHANNEL; a match that can
+        expire the record must not — a garbled DM is not a channel."""
+        eng = make_rule(room="eng-backend", name="eng", agent="a")
+        record = make_record_from_rule(eng, ROOM, session_id="sess-odd-kind",
+                                       dropped_at="2026-09-01T01:00:00-07:00")
+        record.room_kind = "channel_typo"
+        mgr, loaded = _booted([record], [])  # nothing would match a channel either
+
+        with loaded, self.assertLogs("agent-chat-gateway.core.session_manager", level="WARNING") as logs:
+            await mgr.sync_only()
+
+        row = await _listed(mgr, "eng-backend")
+        self.assertEqual(row["session_id"], "sess-odd-kind")
+        self.assertTrue(any("channel_typo" in line and "kept" in line for line in logs.output), logs.output)
+
+    async def test_re_materialization_writes_the_current_connector(self):
+        """A state file copied under a renamed connector keeps the old name in
+        every record's column, and `config_from_record` prefers the column."""
+        eng = make_rule(room="eng-backend", name="eng", agent="a")
+        record = make_record_from_rule(eng, ROOM, session_id="sess-moved",
+                                       dropped_at="2026-09-01T01:00:00-07:00",
+                                       connector="old-name")
+        renamed = make_rule(room="eng-backend", name="eng-v2", agent="a")
+        mgr, loaded = _booted([record], [renamed])
+
+        with loaded:
+            await mgr.sync_only()
+
+        row = await _listed(mgr, "eng-backend")
+        self.assertEqual(row["connector"], "default")
+        self.assertEqual(mgr._lifecycle.record_for_room("eng-backend").connector, "default")

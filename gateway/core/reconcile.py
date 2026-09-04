@@ -107,14 +107,21 @@ def rematerialized_fields(record: WatcherState, rule: WatcherRule) -> dict:
     rules were filtered to it), the agent the rule's.
     """
     wc = materialize(rule, room_ref_of(record))
+    # The rule's connector IS this manager's connector (the rules were filtered
+    # to it), and it wins over the record's column: a state file copied to a
+    # renamed connector still carries the old name, and `config_from_record`
+    # prefers the column — so a stale one would key prompt and attachment
+    # state under a connector that no longer exists.
     return rule_bound_fields(
         wc, rule,
-        connector_name=record.connector or rule.connector,
+        connector_name=rule.connector,
         agent_name=rule.agent,
     )
 
 
 NAMELESS = "no room name recorded — cannot re-match, left as it is"
+UNKNOWN_KIND = "room kind {kind!r} is not one this build knows — cannot re-match, left as it is"
+_KNOWN_KINDS = frozenset(k.value for k in RoomKind)
 
 
 def orphaned_state_files(configured: Iterable[str]) -> list[tuple[Path, str]]:
@@ -140,10 +147,11 @@ def reconcile_records(
     `rules` is the connector's ordered list (a rule names an agent that exists
     — config loading refuses one that does not — so no agent check is needed
     here). Static-era records (neither `rule_name` nor `config`) are not this
-    module's — boot prunes them before reconciling — and are skipped. A named
-    room whose record carries no name cannot be re-matched: the matcher
-    deliberately does not fall back to the opaque id, and "nothing matches"
-    is destructive here, so such a record is kept as it is, with the reason.
+    module's — boot prunes them before reconciling — and are skipped. A record
+    that cannot be re-matched honestly — a named room with no name recorded
+    (the matcher deliberately does not fall back to the opaque id), or a room
+    kind this build does not know — is kept as it is, with the reason:
+    "nothing matches" is destructive here.
     """
     plan = ReconcilePlan(connector=connector)
     for record in records:
@@ -156,6 +164,15 @@ def reconcile_records(
             session_id=record.session_id,
             from_rule=record.rule_name,
         )
+        # A kind this build does not know is degraded to CHANNEL everywhere
+        # else, which is fine for a runtime fallback and wrong for a match
+        # that can expire the record: a DM whose kind was garbled must not be
+        # judged as a channel. Kept, with the reason, like a nameless room.
+        if record.room_kind and record.room_kind not in _KNOWN_KINDS:
+            plan.actions.append(RecordAction(
+                action="keep", reason=UNKNOWN_KIND.format(kind=record.room_kind),
+                to_rule=record.rule_name, **common))
+            continue
         room = room_ref_of(record)
         if room.kind not in (RoomKind.DM, RoomKind.GROUP_DM) and not room.name:
             plan.actions.append(RecordAction(
