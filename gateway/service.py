@@ -548,7 +548,8 @@ class GatewayService:
         for path, name in orphaned_state_files(configured):
             records = load_state(name)  # format already preflighted in __init__
             try:
-                raw_count = len(json.loads(path.read_text()).get("watchers", []))
+                raw = json.loads(path.read_text()).get("watchers")
+                raw_count = len(raw) if isinstance(raw, list) else -1
             except (OSError, ValueError, AttributeError):
                 raw_count = -1
             if raw_count != len(records):

@@ -100,3 +100,18 @@ class TestOrphanedStateFiles(unittest.IsolatedAsyncioTestCase):
 
         self.assertFalse((self.runtime / "state.old-name.json").exists())
         self.assertTrue((self.runtime / "state.script.json").exists())
+
+    async def test_a_file_whose_watchers_field_is_not_a_list_is_kept_and_does_not_block_the_boot(self):
+        """`load_state` reads a null/scalar `watchers` as corrupt-but-loadable (empty);
+        the sweep must not crash the constructor on it — one stale file must never
+        keep every configured connector from starting."""
+        from gateway.service import GatewayService
+
+        (self.runtime / "state.ghost.json").write_text(json.dumps(
+            {"version": STATE_FORMAT_VERSION, "watchers": None}))
+
+        with self.assertLogs("agent-chat-gateway", level="WARNING") as logs:
+            GatewayService(write_gateway_config(self.tmp))  # no TypeError
+
+        self.assertTrue((self.runtime / "state.ghost.json").exists(), "kept for manual repair")
+        self.assertTrue(any("could not be parsed" in line for line in logs.output), logs.output)
