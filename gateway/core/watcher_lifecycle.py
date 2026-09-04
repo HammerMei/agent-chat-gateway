@@ -1851,28 +1851,29 @@ class WatcherLifecycle:
         if state and state.session_id:
             if state.backend_identity == identity and state.room_id == room_id:
                 return state.session_id, False
-            # The full id, deviating from the [:8] used for routine session logging.
-            # This record is about to be overwritten with the new session, so this line
-            # is the only place the abandoned id survives — and the one use it has left
-            # is being pasted into the backend's own resume command.
+            why = (
+                f"it belongs to room '{state.room_id}' and this watcher now "
+                f"watches '{room_id}'"
+                if state.backend_identity == identity
+                else f"it was created against backend identity "
+                     f"'{state.backend_identity}', which is now '{identity}'"
+                if state.backend_identity
+                else f"it has no recorded backend identity to check against "
+                     f"'{identity}'"
+            )
+            # The gateway lets go of this id: it is not deleted anywhere — the
+            # conversation stays in the backend it was created against and can be
+            # resumed there by hand — but the record is about to be overwritten
+            # with the new session, so it gets the same AUDIT line every released
+            # session gets (#143, owner's call on PR #148).
             logger.warning(
                 "Watcher '%s': not reusing session=%s — %s. Starting a fresh session; "
                 "the previous conversation stays in the backend it was created against "
                 "and can be resumed there by hand with this id. "
                 "Expected after changing an agent's type or working_directory.",
-                wc.name,
-                state.session_id,
-                (
-                    f"it belongs to room '{state.room_id}' and this watcher now "
-                    f"watches '{room_id}'"
-                    if state.backend_identity == identity
-                    else f"it was created against backend identity "
-                         f"'{state.backend_identity}', which is now '{identity}'"
-                    if state.backend_identity
-                    else f"it has no recorded backend identity to check against "
-                         f"'{identity}'"
-                ),
+                wc.name, state.session_id, why,
             )
+            self.release_session(state, f"abandoned at provisioning — {why}")
         session_title = (
             f"{agent_cfg.session_prefix}:{wc.room}"
             if agent_cfg.session_prefix

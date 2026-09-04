@@ -230,6 +230,9 @@ class TestSessionsAcrossReMaterialization(IsolatedTestCase):
         self.assertNotEqual(row["session_id"], "sess-old-backend-42")
         self.assertTrue(any("not reusing session=sess-old-backend-42" in line
                             for line in logs.output), logs.output)
+        lines = _audit_lines(logs, "sess-old-backend-42")
+        self.assertEqual(len(lines), 1, "an abandoned id is a released id")
+        self.assertIn("abandoned at provisioning", lines[0])
 
     async def test_a_second_boot_after_a_change_is_a_no_op(self):
         before = make_rule(room="eng-backend", name="eng", agent="a")
