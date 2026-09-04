@@ -341,9 +341,10 @@ class GatewayService:
                 # the exemption itself: a job records the room it targets and can
                 # resurrect it, so there is no record to protect on its behalf.
                 cancel_jobs=(
-                    lambda room_id, legacy_handle, _cn=cc.name, reason=None:
+                    lambda room_id, legacy_handle, *, reason, advice, _cn=cc.name:
                         self._cancel_jobs_for(
-                            _cn, room_id, legacy_handle=legacy_handle, reason=reason)
+                            _cn, room_id, legacy_handle=legacy_handle,
+                            reason=reason, advice=advice)
                 ),
             )
             self._entries.append(
@@ -366,7 +367,7 @@ class GatewayService:
 
     def _cancel_jobs_for(
         self, connector_name: str, room_id: str, *, legacy_handle: str,
-        reason: str | None = None,
+        reason: str, advice: str,
     ) -> None:
         """Cancel every scheduled job targeting a reclaimed room (§2.7).
 
@@ -430,18 +431,13 @@ class GatewayService:
 
             doomed = [j for j in self._job_store.list_jobs()
                       if _claims_this_room(j)]
-            removed = reason is None
-            reason = reason or "the bot was removed from the room, so the job could never deliver"
             for job in doomed:
                 self._job_store.cancel(job.id, reason=reason)
                 logger.warning(
                     "AUDIT: cancelled scheduled job %s (watcher '%s', room %s, "
                     "connector '%s') — %s. The record is kept; %s",
                     job.id, job.watcher, room_id, job.connector, reason,
-                    (f"'agent-chat-gateway schedule resume {job.id}' restores it."
-                     if removed else
-                     "no rule recreates this room's watcher, so recreate the "
-                     "job once a rule covers the room again."),
+                    advice.format(job_id=job.id),
                 )
         except Exception as e:
             logger.warning(
@@ -552,18 +548,24 @@ class GatewayService:
             records = load_state(name)  # format already preflighted in __init__
             try:
                 raw = json.loads(path.read_text()).get("watchers")
-                raw_count = len(raw) if isinstance(raw, list) else -1
             except (OSError, ValueError, AttributeError):
-                raw_count = -1
-            if raw_count != len(records):
+                raw = None
+            if not isinstance(raw, list):
+                logger.warning(
+                    "Orphaned state file %s kept: its records could not be read at "
+                    "all — fix or delete the file by hand (connector '%s' is no "
+                    "longer configured)", path.name, name,
+                )
+                continue
+            if len(raw) != len(records):
                 # `load_state` skips a malformed record with a warning. Deleting
                 # the file would delete that record's only session reference
                 # without a line saying so; keep the file and say why.
                 logger.warning(
-                    "Orphaned state file %s kept: %d of its record(s) could not be "
-                    "parsed and would be lost without a trace — fix or delete the "
-                    "file by hand (connector '%s' is no longer configured)",
-                    path.name, (raw_count - len(records)) if raw_count >= 0 else -1, name,
+                    "Orphaned state file %s kept: %d of its %d record(s) could not "
+                    "be parsed and would be lost without a trace — fix or delete "
+                    "the file by hand (connector '%s' is no longer configured)",
+                    path.name, len(raw) - len(records), len(raw), name,
                 )
                 continue
             try:

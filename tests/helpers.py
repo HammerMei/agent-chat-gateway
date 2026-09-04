@@ -252,15 +252,6 @@ def isolate_runtime_dir(testcase):
     return tmp, runtime
 
 
-def write_state_file(connector, records):
-    """Write `records` as `state.<connector>.json` through the real writer.
-
-    Under whatever `RUNTIME_DIR` currently is (see `isolate_runtime_dir`)."""
-    from gateway.core.state import save_state
-
-    save_state(connector, list(records))
-
-
 def write_gateway_config(tmp, connector_name="script", *, working_directory=None):
     """Write and load a minimal `config.yaml` under `tmp` — the one hand-built config.
 

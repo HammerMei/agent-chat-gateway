@@ -72,6 +72,20 @@ def _should_restore_watermark(stored: str, live: str | None) -> bool:
     return _ts_gt(stored, live)
 
 
+def _why_not_reused(prior: WatcherState, identity: str, room_id: str) -> str:
+    """Why a stored session id is not reused for this start (§2.4).
+
+    One wording for the provisioning warning and the release AUDIT line.
+    """
+    if prior.backend_identity == identity:
+        return (f"it belongs to room '{prior.room_id}' and this watcher now "
+                f"watches '{room_id}'")
+    if prior.backend_identity:
+        return (f"it was created against backend identity "
+                f"'{prior.backend_identity}', which is now '{identity}'")
+    return f"it has no recorded backend identity to check against '{identity}'"
+
+
 class WatcherLifecycle:
     """Manages watcher start/stop/pause/resume/reset and related bookkeeping.
 
@@ -1379,18 +1393,21 @@ class WatcherLifecycle:
         """The live processor for a watcher name, or None when not resident."""
         return self._processor_named(name)
 
-    def _release_if_abandoned(self, prior: "WatcherState | None", session_id: str) -> None:
+    def _release_if_abandoned(
+        self, prior: "WatcherState | None", session_id: str, identity: str, room_id: str
+    ) -> None:
         """The AUDIT line for a stored id `_provision_session` did not reuse.
 
         Called at the two points where the prior record has actually been
         replaced — a start that committed, and a subscription failure that
         keeps the new record (#143): before either, a failure rolls the prior
-        record back with its id intact and nothing was released.
-        `_provision_session` logged why the id was not reused.
+        record back with its id intact and nothing was released. The reason
+        is the same one `_provision_session` logged.
         """
         if prior is not None and prior.session_id and prior.session_id != session_id:
             self.release_session(
-                prior, "abandoned at provisioning — backend identity or room changed")
+                prior,
+                f"abandoned at provisioning — {_why_not_reused(prior, identity, room_id)}")
 
     def release_session(self, state: WatcherState, reason: str) -> None:
         """The one AUDIT line for a session this lifecycle lets go of (#143).
@@ -1788,7 +1805,7 @@ class WatcherLifecycle:
             # The prior record is gone from the index either way — `ws` is
             # what the next start reads — so an id provisioning abandoned is
             # abandoned here too (#143), even though this start failed.
-            self._release_if_abandoned(state, session_id)
+            self._release_if_abandoned(state, session_id, identity, room.id)
             raise
 
         # 9. Activate processor — starts the consumer loop and emits the
@@ -1820,7 +1837,7 @@ class WatcherLifecycle:
             agent_name,
             session_id[:8],
         )
-        self._release_if_abandoned(state, session_id)
+        self._release_if_abandoned(state, session_id, identity, room.id)
 
     async def _provision_session(
         self,
@@ -1875,16 +1892,7 @@ class WatcherLifecycle:
         if state and state.session_id:
             if state.backend_identity == identity and state.room_id == room_id:
                 return state.session_id, False
-            why = (
-                f"it belongs to room '{state.room_id}' and this watcher now "
-                f"watches '{room_id}'"
-                if state.backend_identity == identity
-                else f"it was created against backend identity "
-                     f"'{state.backend_identity}', which is now '{identity}'"
-                if state.backend_identity
-                else f"it has no recorded backend identity to check against "
-                     f"'{identity}'"
-            )
+            why = _why_not_reused(state, identity, room_id)
             # The gateway lets go of this id: it is not deleted anywhere — the
             # conversation stays in the backend it was created against and can be
             # resumed there by hand — but the record is about to be overwritten

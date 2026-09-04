@@ -30,7 +30,7 @@ from .dispatch import MessageDispatcher
 from .injected_context_builder import InjectedContextBuilder
 from .lifecycle_sweep import LifecycleSweep
 from .permission import PermissionRegistry
-from .reconcile import reconcile_records, rematerialized_fields
+from .reconcile import RecordAction, reconcile_records, rematerialized_fields
 from .session_maps import SessionMaps
 from .state import (
     StateFilter,
@@ -48,9 +48,25 @@ from .watcher_manager import (
     first_matching_rule,
     room_label,
 )
-from .watcher_rule import RoomKind
+from .watcher_rule import RoomKind, WatcherRule
 
 logger = logging.getLogger("agent-chat-gateway.core.session_manager")
+
+# Why a reclaimed room's scheduled jobs are cancelled, and what the operator can
+# do about it — `(reason, advice)`, one pair per cause, so the AUDIT line names
+# the cause that applied instead of assuming one. `{job_id}` is filled per job.
+JOBS_CANCELLED_BOT_REMOVED = (
+    "the bot was removed from the room, so the job could never deliver",
+    "'agent-chat-gateway schedule resume {job_id}' restores it once the bot is back.",
+)
+JOBS_CANCELLED_ROOM_UNSERVED = (
+    "the room is no longer available to this connector",
+    "recreate the job if the room becomes available to this connector again.",
+)
+JOBS_CANCELLED_BY_RECONCILIATION = (
+    "its watcher was expired by reconciliation — no rule in config.yaml covers the room any more",
+    "no rule recreates this room's watcher, so recreate the job once a rule covers the room again.",
+)
 
 
 # The shared degrade-don't-raise conversion lives in state.py since Codex
@@ -567,12 +583,13 @@ class SessionManager:
                 self._lifecycle._exit_verb()
         if rewritten:
             self._lifecycle.save_state()
-        logger.info(
-            "Reconciliation (%s): %d kept, %d re-materialized, %d expired",
-            self._connector_name, len(plan.of("keep")), rewritten, expired,
-        )
+        logger.info("Reconciliation (%s): %s", self._connector_name,
+                    plan.format_counts(len(plan.of("keep")), rewritten, expired))
 
-    def _apply_rematerialize(self, record: WatcherState, action, rule) -> None:
+    def _apply_rematerialize(
+        self, record: WatcherState, action: RecordAction, rule: WatcherRule
+    ) -> None:
+        """Rewrite one record's rule-derived fields from the rule that now wins it."""
         self._lifecycle.rematerialize(record, rematerialized_fields(record, rule))
         logger.info(
             "Reconciliation (%s): watcher '%s' (room %s) re-materialized "
@@ -581,9 +598,11 @@ class SessionManager:
             action.from_rule, action.to_rule,
         )
 
-    async def _apply_expire(self, record: WatcherState, action) -> int:
-        """Expire one record through the removal path's shared tail; 1 if it
-        went, 0 if the record is still installed afterwards."""
+    async def _apply_expire(self, record: WatcherState, action: RecordAction) -> int:
+        """Expire one record through the removal path's shared tail.
+
+        Returns 1 if the record went, 0 if it is still installed afterwards.
+        """
         logger.warning(
             "Reconciliation (%s): watcher '%s' (room %s) is expired — %s",
             self._connector_name, action.watcher_name, action.room_id, action.reason,
@@ -592,8 +611,7 @@ class SessionManager:
             action.room_id,
             reason=f"reconciliation: {action.reason}",
             expected=record,
-            job_reason="its watcher was expired by reconciliation — no "
-                       "rule in config.yaml covers the room any more",
+            jobs=JOBS_CANCELLED_BY_RECONCILIATION,
         )
         if self._lifecycle.record_for_room(action.room_id) is record:
             # The shared tail swallows a failed reclamation (a transient save
@@ -676,6 +694,7 @@ class SessionManager:
                 record.room_id,
                 reason="the room is no longer available to this connector",
                 expected=record,
+                jobs=JOBS_CANCELLED_ROOM_UNSERVED,
             )
         finally:
             self._lifecycle._exit_verb()
@@ -877,13 +896,14 @@ class SessionManager:
             await self._reclaim_removed_room(
                 room_id,
                 reason="the platform reported the bot removed from the room",
+                jobs=JOBS_CANCELLED_BOT_REMOVED,
             )
         finally:
             self._lifecycle._exit_verb()
 
     async def _reclaim_removed_room(
-        self, room_id: str, *, reason: str, expected=None,
-        require_dormant: bool = False, job_reason: str | None = None,
+        self, room_id: str, *, reason: str, jobs: tuple[str, str], expected=None,
+        require_dormant: bool = False,
     ) -> None:
         """The removal path's shared tail: reclaim the record, cancel its jobs.
 
@@ -923,7 +943,7 @@ class SessionManager:
                 # had left. Found by the sweep. A room-id job is cancellable by
                 # its room alone; only a pre-schema-2 job needs the handle, and
                 # with no record there is none to give.
-                self._cancel_jobs(room_id, name or "", reason=job_reason)
+                self._cancel_jobs(room_id, name or "", reason=jobs[0], advice=jobs[1])
             except Exception:
                 logger.exception(
                     "Could not cancel scheduled jobs for reclaimed watcher "
@@ -989,6 +1009,7 @@ class SessionManager:
                 record.room_id,
                 reason="the membership reconciliation found the bot is no "
                        "longer in the room (a removal event was missed)",
+                jobs=JOBS_CANCELLED_BOT_REMOVED,
                 # Pinned to this snapshot's record: the reclaim aborts under
                 # the lock if a wake or re-add got there first (round 2) —
                 # including an in-place resume, which clears `paused` without

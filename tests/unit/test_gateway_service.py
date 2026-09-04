@@ -15,6 +15,7 @@ from gateway.core.bot_identity import (
     DuplicateBotIdentityError,
     canonical_origin,
 )
+from gateway.core.session_manager import JOBS_CANCELLED_BOT_REMOVED as REMOVED
 from gateway.service import GatewayService
 
 
@@ -225,7 +226,8 @@ class TestTheCancellationClaimRule(unittest.TestCase):
     def test_a_job_on_this_connector_is_cancelled(self):
         service = self._service_with_jobs([("acg-1", "rc:general", "rc")])
 
-        service._cancel_jobs_for("rc", "room-1", legacy_handle="rc:general")
+        service._cancel_jobs_for("rc", "room-1", legacy_handle="rc:general",
+                                 reason=REMOVED[0], advice=REMOVED[1])
 
         service._job_store.cancel.assert_called_once()
 
@@ -238,7 +240,8 @@ class TestTheCancellationClaimRule(unittest.TestCase):
         must be able to cancel it here."""
         service = self._service_with_jobs([("acg-1", "rc:general", "")])
 
-        service._cancel_jobs_for("rc", "room-1", legacy_handle="rc:general")
+        service._cancel_jobs_for("rc", "room-1", legacy_handle="rc:general",
+                                 reason=REMOVED[0], advice=REMOVED[1])
 
         service._job_store.cancel.assert_called_once()
 
@@ -247,7 +250,8 @@ class TestTheCancellationClaimRule(unittest.TestCase):
     def test_a_job_naming_a_connector_that_no_longer_exists_is_cancelled(self):
         service = self._service_with_jobs([("acg-1", "rc:general", "retired")])
 
-        service._cancel_jobs_for("rc", "room-1", legacy_handle="rc:general")
+        service._cancel_jobs_for("rc", "room-1", legacy_handle="rc:general",
+                                 reason=REMOVED[0], advice=REMOVED[1])
 
         service._job_store.cancel.assert_called_once()
 
@@ -261,14 +265,16 @@ class TestTheCancellationClaimRule(unittest.TestCase):
         other.name = "mm"
         service._entries.append(other)
 
-        service._cancel_jobs_for("rc", "room-1", legacy_handle="rc:general")
+        service._cancel_jobs_for("rc", "room-1", legacy_handle="rc:general",
+                                 reason=REMOVED[0], advice=REMOVED[1])
 
         service._job_store.cancel.assert_not_called()
 
     def test_another_watchers_job_is_left_alone(self):
         service = self._service_with_jobs([("acg-1", "rc:dev", "rc")])
 
-        service._cancel_jobs_for("rc", "room-1", legacy_handle="rc:general")
+        service._cancel_jobs_for("rc", "room-1", legacy_handle="rc:general",
+                                 reason=REMOVED[0], advice=REMOVED[1])
 
         service._job_store.cancel.assert_not_called()
 class TestIdentityBarrier(unittest.IsolatedAsyncioTestCase):
@@ -847,7 +853,8 @@ class TestCancellationRequiresOwnershipNotJustTheRoom(unittest.TestCase):
             ("acg-theirs", "alice:general", "alice", "room-1"),
         ])
 
-        service._cancel_jobs_for("rc", "room-1", legacy_handle="rc:general")
+        service._cancel_jobs_for("rc", "room-1", legacy_handle="rc:general",
+                                 reason=REMOVED[0], advice=REMOVED[1])
 
         self.assertEqual(self._removed(service), ["acg-mine"])
 
@@ -858,7 +865,8 @@ class TestCancellationRequiresOwnershipNotJustTheRoom(unittest.TestCase):
             ("acg-theirs", "alice:general", "alice", "room-1"),
         ])
 
-        service._cancel_jobs_for("rc", "room-1", legacy_handle="rc:general")
+        service._cancel_jobs_for("rc", "room-1", legacy_handle="rc:general",
+                                 reason=REMOVED[0], advice=REMOVED[1])
 
         self.assertEqual(self._removed(service), [])
 
@@ -873,7 +881,8 @@ class TestCancellationRequiresOwnershipNotJustTheRoom(unittest.TestCase):
             ("acg-old", "rc:general", ""),
         ])
 
-        service._cancel_jobs_for("rc", "room-1", legacy_handle="rc:general")
+        service._cancel_jobs_for("rc", "room-1", legacy_handle="rc:general",
+                                 reason=REMOVED[0], advice=REMOVED[1])
 
         self.assertEqual(self._removed(service), ["acg-old"])
 
@@ -882,7 +891,8 @@ class TestCancellationRequiresOwnershipNotJustTheRoom(unittest.TestCase):
             ("acg-old", "alice:general", ""),
         ])
 
-        service._cancel_jobs_for("rc", "room-1", legacy_handle="rc:general")
+        service._cancel_jobs_for("rc", "room-1", legacy_handle="rc:general",
+                                 reason=REMOVED[0], advice=REMOVED[1])
 
         self.assertEqual(self._removed(service), [])
 
@@ -921,7 +931,7 @@ class TestCancellationMatchesByRoomNotByHandle(unittest.TestCase):
         """Room B holds the handle and is alive; the bot was removed from A."""
         service = self._service([("acg-b", "rc:general", "room-B")])
 
-        service._cancel_jobs_for("rc", "room-A", legacy_handle="rc:general")
+        service._cancel_jobs_for("rc", "room-A", legacy_handle="rc:general", reason=REMOVED[0], advice=REMOVED[1])
 
         service._job_store.cancel.assert_not_called()
 
@@ -930,7 +940,7 @@ class TestCancellationMatchesByRoomNotByHandle(unittest.TestCase):
         renamed, so its record's handle differs. The room id still matches."""
         service = self._service([("acg-a", "rc:general", "room-A")])
 
-        service._cancel_jobs_for("rc", "room-A", legacy_handle="rc:daily-standup")
+        service._cancel_jobs_for("rc", "room-A", legacy_handle="rc:daily-standup", reason=REMOVED[0], advice=REMOVED[1])
 
         service._job_store.cancel.assert_called_once()
 
@@ -940,16 +950,11 @@ class TestCancellationMatchesByRoomNotByHandle(unittest.TestCase):
         """It has no id, so the handle is the only key it has."""
         service = self._service([("acg-old", "rc:general", "")])
 
-        service._cancel_jobs_for("rc", "room-A", legacy_handle="rc:general")
+        service._cancel_jobs_for("rc", "room-A", legacy_handle="rc:general", reason=REMOVED[0], advice=REMOVED[1])
 
         service._job_store.cancel.assert_called_once()
 
         self.assertEqual(service._job_store.cancel.call_args.args[0], "acg-old")
-
-
-
-if __name__ == "__main__":
-    unittest.main()
 
 
 class TestRecordsSettleBeforeTheIdentityBarrier(unittest.IsolatedAsyncioTestCase):
@@ -980,3 +985,7 @@ class TestRecordsSettleBeforeTheIdentityBarrier(unittest.IsolatedAsyncioTestCase
             await service.run()
 
         self.assertEqual(order, ["settle", "connect", "identity", "sync"])
+
+
+if __name__ == "__main__":
+    unittest.main()

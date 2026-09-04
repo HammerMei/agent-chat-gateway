@@ -843,8 +843,9 @@ subscribed yet.
   current, so a build that changes what a config field means rewrites every
   record once, rule change or not — that is what the per-record marker is for.
 - A state file whose connector is no longer in `config.yaml` is reconciled
-  too: one AUDIT line per record, then the file is removed. Nothing would
-  ever open it again.
+  too: the file is removed, then one AUDIT line per record — announced only
+  once the removal happened; a file with a record that did not parse is kept
+  for repair by hand. Nothing would ever open it again.
 
 Reconciliation matches the room **as the record describes it** — the name the
 record carries, which the inbound stream refreshes on every frame

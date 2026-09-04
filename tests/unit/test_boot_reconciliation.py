@@ -21,6 +21,10 @@ from tests.helpers import (
 )
 
 
+# Local on purpose: these three compose the shared builders for this suite's
+# one seam (boot a real manager on given records and rules, read it back through
+# `list` and the log). Nothing outside this file boots a manager this way; the
+# reload suite (#144) should lift `_booted` into helpers when it needs it too.
 def _booted(records, rules, agents=("a", "b"), config=None):
     """A manager whose state store hands back `records` and whose config holds
     `rules`; call `sync_only()` on it to boot."""

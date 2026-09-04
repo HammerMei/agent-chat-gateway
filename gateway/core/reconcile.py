@@ -83,13 +83,15 @@ class ReconcilePlan:
         """Every action that is not a keep — what boot applies and logs."""
         return [a for a in self.actions if a.action != "keep"]
 
+    @staticmethod
+    def format_counts(kept: int, rematerialized: int, expired: int) -> str:
+        """The one rendering of a reconciliation's counts, planned or applied."""
+        return f"{kept} kept, {rematerialized} re-materialized, {expired} expired"
+
     def summary(self) -> str:
-        """One line of counts, for the log."""
-        kept = len(self.of("keep"))
-        rematerialized = len(self.of("rematerialize"))
-        expired = len(self.of("expire"))
-        return (f"{kept} kept, {rematerialized} re-materialized, "
-                f"{expired} expired")
+        """One line of the planned counts, for the log."""
+        return self.format_counts(
+            len(self.of("keep")), len(self.of("rematerialize")), len(self.of("expire")))
 
 
 def room_ref_of(record: WatcherState) -> RoomRef:
@@ -109,15 +111,14 @@ def rematerialized_fields(record: WatcherState, rule: WatcherRule) -> dict[str, 
     two writers cannot drift. `room_kind`, `participants` and `created_at` are
     frozen too but describe the room and the birth, not the rule, and stay;
     session-scoped fields and lifecycle clocks are never touched — same room,
-    same session, same idle clock. The connector is the record's own (the
-    rules were filtered to it), the agent the rule's.
+    same session, same idle clock. Connector and agent are the rule's: the
+    rule's connector IS this manager's (the rules were filtered to it) and
+    wins over the record's column — a state file copied under a renamed
+    connector still carries the old name, and `config_from_record` prefers
+    the column, so a stale one would key prompt and attachment state under a
+    connector that no longer exists.
     """
     wc = materialize(rule, room_ref_of(record))
-    # The rule's connector IS this manager's connector (the rules were filtered
-    # to it), and it wins over the record's column: a state file copied to a
-    # renamed connector still carries the old name, and `config_from_record`
-    # prefers the column — so a stale one would key prompt and attachment
-    # state under a connector that no longer exists.
     return rule_bound_fields(
         wc, rule,
         connector_name=rule.connector,

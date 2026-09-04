@@ -10,7 +10,7 @@ import json
 import unittest
 from unittest.mock import patch
 
-from gateway.core.state import STATE_FORMAT_VERSION
+from gateway.core.state import STATE_FORMAT_VERSION, save_state
 from gateway.core.watcher_manager import RoomRef
 from gateway.core.watcher_rule import RoomKind
 from tests.helpers import (
@@ -18,10 +18,11 @@ from tests.helpers import (
     make_record_from_rule,
     make_rule,
     write_gateway_config,
-    write_state_file,
 )
 
 
+# Local on purpose: the removed connector's records are specific to this suite;
+# the shared `make_record_from_rule` does the construction.
 def _ghost_record(session_id, room_id="r-old"):
     """A rule-derived record as the removed connector 'ghost' would have written it."""
     rule = make_rule(room="old-room", name="eng", connector="ghost", agent="default")
@@ -42,8 +43,8 @@ class TestOrphanedStateFiles(unittest.IsolatedAsyncioTestCase):
     async def test_records_of_an_unconfigured_connector_are_logged_and_the_file_removed(self):
         from gateway.service import GatewayService
 
-        write_state_file("ghost", [_ghost_record("sess-ghost-7777")])
-        write_state_file("script", [])
+        save_state("ghost", [_ghost_record("sess-ghost-7777")])
+        save_state("script", [])
 
         with self.assertLogs("agent-chat-gateway", level="INFO") as logs:
             GatewayService(write_gateway_config(self.tmp))
@@ -60,7 +61,7 @@ class TestOrphanedStateFiles(unittest.IsolatedAsyncioTestCase):
     async def test_a_file_that_cannot_be_removed_is_not_reported_released(self):
         from gateway.service import GatewayService
 
-        write_state_file("ghost", [_ghost_record("sess-ghost-8888")])
+        save_state("ghost", [_ghost_record("sess-ghost-8888")])
 
         with patch("pathlib.Path.unlink", side_effect=OSError("read-only")), \
                 self.assertLogs("agent-chat-gateway", level="WARNING") as logs:
@@ -94,8 +95,8 @@ class TestOrphanedStateFiles(unittest.IsolatedAsyncioTestCase):
         from gateway.service import GatewayService
 
         shared = _ghost_record("sess-shared-1", room_id="r1")
-        write_state_file("old-name", [shared])
-        write_state_file("script", [dataclasses.replace(
+        save_state("old-name", [shared])
+        save_state("script", [dataclasses.replace(
             shared, connector="script", watcher_name="script:room")])
 
         GatewayService(write_gateway_config(self.tmp))  # no DuplicateSessionError
@@ -115,4 +116,4 @@ class TestOrphanedStateFiles(unittest.IsolatedAsyncioTestCase):
             GatewayService(write_gateway_config(self.tmp))  # no TypeError
 
         self.assertTrue((self.runtime / "state.ghost.json").exists(), "kept for manual repair")
-        self.assertTrue(any("could not be parsed" in line for line in logs.output), logs.output)
+        self.assertTrue(any("could not be read at all" in line for line in logs.output), logs.output)
