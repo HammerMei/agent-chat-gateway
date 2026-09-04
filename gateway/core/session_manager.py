@@ -142,6 +142,10 @@ class SessionManager:
         # unsolicited inbound never has a room offered to it, so its rules'
         # literal rooms are walked at boot instead.
         self._watcher_rules = list(watcher_rules or [])
+        # Hydration + reconciliation happen once per boot, before connectors
+        # connect (`settle_records`); `sync_only` runs them itself when nothing
+        # did — `run_once` and the tests boot a manager on its own.
+        self._records_settled = False
 
     # ── Main entry point ──────────────────────────────────────────────────────
 
@@ -222,8 +226,7 @@ class SessionManager:
         here are per-watcher failures, not a reason to leave the connector deaf, so the
         stream starts regardless of them.
         """
-        errors = await self._lifecycle.sync_watchers(unavailable_agents=unavailable_agents)
-        await self._reconcile_records_at_boot()
+        errors = await self.settle_records(unavailable_agents=unavailable_agents)
         # Eager creation for connectors with no unsolicited inbound (§2.6):
         # nothing ever offers them a room, so their rules' literal rooms are
         # started here, before the inbound surface opens.
@@ -496,6 +499,27 @@ class SessionManager:
             for ws in self._lifecycle.states().values()
             if (ws.rule_name or ws.config) and ws.last_processed_ts
         }
+
+    async def settle_records(
+        self, unavailable_agents: set[str] | None = None
+    ) -> list[str]:
+        """Hydrate the persisted records and reconcile them against the current
+        rules (§2.4, #143) — the boot-time "reload" of this connector's fleet.
+
+        Runs before the connector connects and before the identity barrier, so
+        everything that consumes records afterwards — the DM-claim check, the
+        eager loop, the startup evaluation and replay — sees the fleet as the
+        current config describes it, not as the last run left it. Nothing here
+        needs the network: the plan is pure, re-materialization is an in-memory
+        rewrite plus a save, and an expiry's connector step (unsubscribe) is a
+        no-op for a room nothing has subscribed yet. Idempotent per boot.
+        """
+        if self._records_settled:
+            return []
+        errors = await self._lifecycle.sync_watchers(unavailable_agents=unavailable_agents)
+        await self._reconcile_records_at_boot()
+        self._records_settled = True
+        return errors
 
     async def _reconcile_records_at_boot(self) -> None:
         """Run the current rules over every hydrated record (§2.4, #143).

@@ -49,6 +49,7 @@ class TestGatewayServiceRun(unittest.IsolatedAsyncioTestCase):
         service._runtime_manager.unavailable_agents = set()
         sm = MagicMock()
         sm.connect_only = AsyncMock()
+        sm.settle_records = AsyncMock(return_value=[])
         sm.sync_only = AsyncMock(return_value=[])
         sm.shutdown = AsyncMock()
         service._entries = [
@@ -126,11 +127,13 @@ class TestGatewayServiceRun(unittest.IsolatedAsyncioTestCase):
 
         good_sm = MagicMock()
         good_sm.connect_only = AsyncMock(side_effect=slow_good_connect)
+        good_sm.settle_records = AsyncMock(return_value=[])
         good_sm.sync_only = AsyncMock(return_value=[])
         good_sm.shutdown = AsyncMock(side_effect=good_shutdown)
 
         bad_sm = MagicMock()
         bad_sm.connect_only = AsyncMock(side_effect=ConnectionError("bad url: test"))
+        bad_sm.settle_records = AsyncMock(return_value=[])
         bad_sm.sync_only = AsyncMock(return_value=[])
         bad_sm.shutdown = AsyncMock()
 
@@ -291,6 +294,7 @@ class TestIdentityBarrier(unittest.IsolatedAsyncioTestCase):
         for i, identity in enumerate(identities):
             sm = MagicMock()
             sm.connect_only = AsyncMock()
+            sm.settle_records = AsyncMock(return_value=[])
             sm.sync_only = AsyncMock(return_value=[])
             sm.shutdown = AsyncMock()
             connector = MagicMock()
@@ -946,3 +950,33 @@ class TestCancellationMatchesByRoomNotByHandle(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestRecordsSettleBeforeTheIdentityBarrier(unittest.IsolatedAsyncioTestCase):
+    """#143: the identity barrier folds persisted DM records into each connector's
+    claim, so the fleet must be reconciled before it runs — a record a deleted
+    rule left behind would otherwise refuse a legitimate two-team setup."""
+
+    async def test_settle_runs_before_connect_and_the_identity_check(self):
+        service = _make_service()
+        service._runtime_manager.start_all = AsyncMock(return_value=[])
+        service._runtime_manager.has_active_brokers = False
+        service._runtime_manager.unavailable_agents = set()
+        service._runtime_manager.stop_all = AsyncMock()
+        order = []
+        sm = MagicMock()
+        sm.settle_records = AsyncMock(side_effect=lambda **kw: order.append("settle") or [])
+        sm.connect_only = AsyncMock(side_effect=lambda: order.append("connect"))
+        sm.sync_only = AsyncMock(side_effect=lambda **kw: order.append("sync") or [])
+        sm.shutdown = AsyncMock()
+        service._entries = [
+            SimpleNamespace(name="script", session_manager=sm, connector=_accountless())
+        ]
+        service._check_bot_identities = MagicMock(side_effect=lambda: order.append("identity"))
+        service._control.start = AsyncMock(side_effect=RuntimeError("stop here"))
+        service._control.stop = AsyncMock()
+
+        with self.assertRaises(RuntimeError):
+            await service.run()
+
+        self.assertEqual(order, ["settle", "connect", "identity", "sync"])

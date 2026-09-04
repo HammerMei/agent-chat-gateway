@@ -810,10 +810,15 @@ This is what reconciliation reads. Two facts shaped it:
   the next session provisioning decides whether the stored session is reused
   or abandoned with its id logged — one place deciding session reuse.
 
-**Reconciliation** (`gateway/core/reconcile.py`, run by the session manager
-right after hydration at boot — before the eager loop and before the inbound
-stream opens, so the fleet is still): for every rule-derived record, re-run
-first-match for its room against the connector's current ordered rules.
+**Reconciliation** (`gateway/core/reconcile.py`, run by the session manager's
+`settle_records` right after hydration at boot — **before the connector
+connects and before the identity barrier**, so everything that consumes
+records afterwards, the DM-claim check included, sees the fleet as the current
+config describes it): for every rule-derived record, re-run first-match for
+its room against the connector's current ordered rules. Nothing in it needs the
+network: the plan is pure, re-materialization is an in-memory rewrite plus a
+save, and an expiry's connector step is a no-op for a room nothing has
+subscribed yet.
 
 - The same rule wins and its snapshot digest is unchanged → **keep**.
 - A rule wins whose name or content differs from what the record froze →

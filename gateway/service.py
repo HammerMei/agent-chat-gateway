@@ -654,6 +654,22 @@ class GatewayService:
             # only this loop can see the collision. Fanning `run_once()` out would let
             # connector A finish subscribing while B was still logging in, and the
             # check would then run after the duplicate had started answering.
+            # Settle the persisted records first (#143): hydrate and reconcile
+            # each connector's fleet against the current rules BEFORE anything
+            # consumes it. The identity barrier below folds persisted DM
+            # records into each connector's claim; a record a deleted rule
+            # left behind must be gone by then, or a legitimate two-team setup
+            # is refused for a conversation nothing will ever answer again.
+            await self._settle(
+                [
+                    e.session_manager.settle_records(
+                        unavailable_agents=self._runtime_manager.unavailable_agents,
+                    )
+                    for e in self._entries
+                ],
+                phase="settle",
+                startup_errors=startup_errors,
+            )
             await self._settle(
                 [e.session_manager.connect_only() for e in self._entries],
                 phase="connect",

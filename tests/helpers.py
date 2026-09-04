@@ -416,6 +416,7 @@ def make_bare_session_manager(**attrs):
     mgr._sweep = None
     mgr._cancel_jobs = None
     mgr._watcher_rules = []
+    mgr._records_settled = False
     for name, value in attrs.items():
         setattr(mgr, name, value)
     return mgr
