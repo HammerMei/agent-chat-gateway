@@ -24,6 +24,8 @@ from gateway.config import AgentConfig, WatcherConfig
 from gateway.core.config import CoreConfig
 from gateway.core.connector import Room
 from gateway.core.session_manager import SessionManager
+from gateway.core.watcher_manager import RoomRef
+from gateway.core.watcher_rule import RoomKind
 
 # Patch load_state/save_state globally so tests never touch live state files.
 _patch_load_state = patch("gateway.core.state_store.load_state", return_value=[])
@@ -221,20 +223,19 @@ def make_rule_derived_record(
     return WatcherState(**defaults)
 
 
-ENG_ROOM = None  # set below once RoomRef is importable without a cycle
-
-
 def patch_persisted(records):
-    """The state store hands back `records` at the next load — what a booted
-    manager hydrates. A context manager; the module-level `IsolatedTestCase`
-    patch returns `[]`, this one returns something."""
+    """Patch the state store to hand back `records` at the next load.
+
+    A context manager; the module-level `IsolatedTestCase` patch returns `[]`,
+    this one returns something — what a booted manager hydrates."""
     return patch("gateway.core.state_store.load_state", return_value=list(records))
 
 
 def isolate_runtime_dir(testcase):
-    """Give a test its own `RUNTIME_DIR` under a temp dir, cleaned up with the
-    test. Returns `(tmp, runtime)`. For tests that build a real
-    `GatewayService` or touch `state.*.json` files on disk."""
+    """Give a test its own `RUNTIME_DIR` under a temp dir; returns `(tmp, runtime)`.
+
+    Cleaned up with the test. For tests that build a real `GatewayService` or
+    touch `state.*.json` files on disk."""
     import tempfile
     from pathlib import Path
 
@@ -251,10 +252,20 @@ def isolate_runtime_dir(testcase):
     return tmp, runtime
 
 
+def write_state_file(connector, records):
+    """Write `records` as `state.<connector>.json` through the real writer.
+
+    Under whatever `RUNTIME_DIR` currently is (see `isolate_runtime_dir`)."""
+    from gateway.core.state import save_state
+
+    save_state(connector, list(records))
+
+
 def write_gateway_config(tmp, connector_name="script", *, working_directory=None):
-    """Write a minimal loadable `config.yaml` under `tmp` — one script connector
-    (constructible with no network or subprocess), one claude agent, one rule —
-    and load it. The one place tests hand-build a `GatewayConfig`."""
+    """Write and load a minimal `config.yaml` under `tmp` — the one hand-built config.
+
+    One script connector (constructible with no network or subprocess), one
+    claude agent, one rule."""
     import textwrap
 
     from gateway.config import GatewayConfig
@@ -280,8 +291,10 @@ def write_gateway_config(tmp, connector_name="script", *, working_directory=None
 
 def make_record_from_rule(rule, room, *, session_id="sess-1", connector=None,
                           now="2026-09-01T00:00:00-07:00", **overrides):
-    """A `WatcherState` written the way creation writes it: `materialize` the
-    rule for the room, then `creation_provenance` for the frozen fields.
+    """A `WatcherState` written the way creation writes it.
+
+    `materialize` the rule for the room, then `creation_provenance` for the
+    frozen fields.
 
     Unlike `make_rule_derived_record`, whose `rule` snapshot is a two-key stub,
     this record carries the real snapshot — what reconciliation compares
@@ -520,10 +533,4 @@ def evict_record(lifecycle, name):
     return lifecycle._uninstall(name)
 
 
-def _eng_room():
-    from gateway.core.watcher_manager import RoomRef
-    from gateway.core.watcher_rule import RoomKind
-    return RoomRef(id="eng-backend", kind=RoomKind.CHANNEL, name="eng-backend")
-
-
-ENG_ROOM = _eng_room()
+ENG_ROOM = RoomRef(id="eng-backend", kind=RoomKind.CHANNEL, name="eng-backend")

@@ -29,7 +29,7 @@ import hashlib
 import json
 import logging
 from dataclasses import dataclass, fields, is_dataclass, replace
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from .adapter_utils import ts_gt as _ts_gt
 from .config import HistoryHandoffConfig, WatcherConfig
@@ -341,10 +341,11 @@ def rule_bound_fields(
     *,
     connector_name: str,
     agent_name: str,
-) -> dict:
-    """The frozen fields that derive from the rule (§2.4) — the part of a
-    record a reconciliation rewrites when a different rule, or a changed one,
-    wins the room. One writer for creation and re-materialization: two
+) -> dict[str, Any]:
+    """The frozen fields a record derives from its rule (§2.4).
+
+    The part a reconciliation rewrites when a different rule, or a changed
+    one, wins the room. One writer for creation and re-materialization: two
     hand-built dicts drift the day a field is added.
     """
     return {

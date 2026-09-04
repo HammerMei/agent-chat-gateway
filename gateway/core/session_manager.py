@@ -503,8 +503,7 @@ class SessionManager:
     async def settle_records(
         self, unavailable_agents: set[str] | None = None
     ) -> list[str]:
-        """Hydrate the persisted records and reconcile them against the current
-        rules (§2.4, #143) — the boot-time "reload" of this connector's fleet.
+        """Hydrate and reconcile this connector's records — boot's "reload" (§2.4).
 
         Runs before the connector connects and before the identity barrier, so
         everything that consumes records afterwards — the DM-claim check, the
@@ -524,13 +523,13 @@ class SessionManager:
     async def _reconcile_records_at_boot(self) -> None:
         """Run the current rules over every hydrated record (§2.4, #143).
 
-        Right after hydration and before anything can create or wake a
-        watcher — the eager loop has not run and the inbound stream is not
-        open — so the plan is computed and applied against a still fleet.
-        Re-materialized records keep their object, session and clocks; expired
+        Applies the plan `reconcile_records` returns against a still fleet:
+        re-materialized records keep their object, session and clocks; expired
         ones go through the removal path's shared tail, jobs included, with the
-        session id in the AUDIT line. The plan is logged either way, so a
-        restart's effect on the fleet can be read back.
+        session id on the AUDIT line. A record the engine could not re-match
+        honestly is kept and said so. The plan is logged either way, as what
+        was actually applied, so a restart's effect on the fleet can be read
+        back.
         """
         plan = reconcile_records(
             self._lifecycle.states().values(),
@@ -549,57 +548,68 @@ class SessionManager:
                         self._connector_name, plan.summary())
             return
         rules_by_name = {r.name: r for r in self._watcher_rules}
-        rewritten = 0
+        rewritten = expired = 0
         for action in plan.changes:
             record = self._lifecycle.record_for_room(action.room_id)
             if record is None:
                 continue
             if action.action == "rematerialize":
-                self._lifecycle.rematerialize(
-                    record, rematerialized_fields(record, rules_by_name[action.to_rule]))
+                self._apply_rematerialize(record, action, rules_by_name[action.to_rule])
                 rewritten += 1
-                logger.info(
-                    "Reconciliation (%s): watcher '%s' (room %s) re-materialized "
-                    "from rule '%s' to rule '%s'",
-                    self._connector_name, action.watcher_name, action.room_id,
-                    action.from_rule, action.to_rule,
-                )
                 continue
-            logger.warning(
-                "Reconciliation (%s): watcher '%s' (room %s) is expired — %s",
-                self._connector_name, action.watcher_name, action.room_id,
-                action.reason,
-            )
             try:
                 self._lifecycle._enter_verb("reclaim", action.room_id)
             except RuntimeError:
                 break  # shutting down — leave the rest as it is, save what was done
             try:
-                await self._reclaim_removed_room(
-                    action.room_id,
-                    reason=f"reconciliation: {action.reason}",
-                    expected=record,
-                    job_reason="its watcher was expired by reconciliation — no "
-                               "rule in config.yaml covers the room any more",
-                )
+                expired += await self._apply_expire(record, action)
             finally:
                 self._lifecycle._exit_verb()
-            if self._lifecycle.record_for_room(action.room_id) is record:
-                # The shared tail swallows a failed reclamation (a transient
-                # save error re-installs the record dormant) because its
-                # other callers are re-discovered by the membership
-                # reconciliation. Nothing re-discovers this one before the
-                # next boot, so say what is still running and why.
-                logger.error(
-                    "Reconciliation (%s): watcher '%s' (room %s) could NOT be "
-                    "expired — its record is still installed and may be "
-                    "recreated from a rule config.yaml no longer has, until the "
-                    "next start reconciles it again",
-                    self._connector_name, action.watcher_name, action.room_id,
-                )
         if rewritten:
             self._lifecycle.save_state()
-        logger.info("Reconciliation (%s): %s", self._connector_name, plan.summary())
+        logger.info(
+            "Reconciliation (%s): %d kept, %d re-materialized, %d expired",
+            self._connector_name, len(plan.of("keep")), rewritten, expired,
+        )
+
+    def _apply_rematerialize(self, record: WatcherState, action, rule) -> None:
+        self._lifecycle.rematerialize(record, rematerialized_fields(record, rule))
+        logger.info(
+            "Reconciliation (%s): watcher '%s' (room %s) re-materialized "
+            "from rule '%s' to rule '%s'",
+            self._connector_name, action.watcher_name, action.room_id,
+            action.from_rule, action.to_rule,
+        )
+
+    async def _apply_expire(self, record: WatcherState, action) -> int:
+        """Expire one record through the removal path's shared tail; 1 if it
+        went, 0 if the record is still installed afterwards."""
+        logger.warning(
+            "Reconciliation (%s): watcher '%s' (room %s) is expired — %s",
+            self._connector_name, action.watcher_name, action.room_id, action.reason,
+        )
+        await self._reclaim_removed_room(
+            action.room_id,
+            reason=f"reconciliation: {action.reason}",
+            expected=record,
+            job_reason="its watcher was expired by reconciliation — no "
+                       "rule in config.yaml covers the room any more",
+        )
+        if self._lifecycle.record_for_room(action.room_id) is record:
+            # The shared tail swallows a failed reclamation (a transient save
+            # error re-installs the record dormant) because its other callers
+            # are re-discovered by the membership reconciliation. Nothing
+            # re-discovers this one before the next boot, so say what is
+            # still running and why.
+            logger.error(
+                "Reconciliation (%s): watcher '%s' (room %s) could NOT be "
+                "expired — its record is still installed and may be "
+                "recreated from a rule config.yaml no longer has, until the "
+                "next start reconciles it again",
+                self._connector_name, action.watcher_name, action.room_id,
+            )
+            return 0
+        return 1
 
     async def _room_still_served(self, record: WatcherState) -> bool:
         """Whether this connector still serves the record's room — asked before
@@ -913,10 +923,7 @@ class SessionManager:
                 # had left. Found by the sweep. A room-id job is cancellable by
                 # its room alone; only a pre-schema-2 job needs the handle, and
                 # with no record there is none to give.
-                if job_reason is None:
-                    self._cancel_jobs(room_id, name or "")
-                else:
-                    self._cancel_jobs(room_id, name or "", reason=job_reason)
+                self._cancel_jobs(room_id, name or "", reason=job_reason)
             except Exception:
                 logger.exception(
                     "Could not cancel scheduled jobs for reclaimed watcher "

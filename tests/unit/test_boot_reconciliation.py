@@ -303,9 +303,9 @@ class TestAnExpiryThatDidNotApplyIsLoud(IsolatedTestCase):
 
 
 class TestAuditFollowsTheDurableStep(IsolatedTestCase):
-    """A release is announced only once it has actually happened (Codex on
-    #148, twice): after the prune is saved, after the new record is committed,
-    with the job cancellation told the real reason."""
+    """A release is announced only once it has actually happened: after the
+    prune is saved, after the new record is committed, with the job
+    cancellation told the real reason."""
 
     async def test_a_static_prune_whose_save_fails_announces_nothing(self):
         from unittest.mock import MagicMock

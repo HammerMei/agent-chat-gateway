@@ -116,7 +116,7 @@ class TestARemovalReclaimsTheRecord(unittest.IsolatedAsyncioTestCase):
         PR #140). A room-id job is cancellable by its room alone."""
         cancelled = []
         mgr = _bare_manager_with_membership(
-            _cancel_jobs=lambda room_id, name: cancelled.append((room_id, name)))
+            _cancel_jobs=lambda room_id, name, reason=None: cancelled.append((room_id, name)))
         mgr._lifecycle.reclaim_room = AsyncMock(return_value=None)   # nothing reclaimed…
         mgr._lifecycle.record_for_room = MagicMock(return_value=None)  # …because no record exists
 
@@ -132,7 +132,7 @@ class TestARemovalReclaimsTheRecord(unittest.IsolatedAsyncioTestCase):
         answers, and why `None` alone was never enough to cancel on."""
         cancelled = []
         mgr = _bare_manager_with_membership(
-            _cancel_jobs=lambda room_id, name: cancelled.append((room_id, name)))
+            _cancel_jobs=lambda room_id, name, reason=None: cancelled.append((room_id, name)))
         mgr._lifecycle.reclaim_room = AsyncMock(return_value=None)
         mgr._lifecycle.record_for_room = MagicMock(return_value=object())  # a record remains
 
@@ -535,7 +535,7 @@ class TestTheMembershipHandlers(unittest.IsolatedAsyncioTestCase):
 
     async def test_a_remove_reclaims_and_cancels_the_jobs(self):
         cancelled = []
-        mgr = _bare_manager_with_membership(_cancel_jobs=lambda room_id, name: cancelled.append(name))
+        mgr = _bare_manager_with_membership(_cancel_jobs=lambda room_id, name, reason=None: cancelled.append(name))
 
         await mgr._on_membership_removed("room-w1")
 
@@ -549,7 +549,7 @@ class TestTheMembershipHandlers(unittest.IsolatedAsyncioTestCase):
         static record, or no record at all — and the jobs of a watcher that
         still exists must not be cancelled."""
         cancelled = []
-        mgr = _bare_manager_with_membership(_cancel_jobs=lambda room_id, name: cancelled.append(name))
+        mgr = _bare_manager_with_membership(_cancel_jobs=lambda room_id, name, reason=None: cancelled.append(name))
         mgr._lifecycle.reclaim_room = AsyncMock(return_value=None)
 
         await mgr._on_membership_removed("room-w1")
@@ -622,7 +622,7 @@ class TestTheMembershipReconciliation(unittest.IsolatedAsyncioTestCase):
 
     def _mgr(self, records, *, snapshot, cancelled=None):
         mgr = _bare_manager_with_membership(
-            _cancel_jobs=lambda room_id, name: cancelled.append(name) if cancelled is not None else None)
+            _cancel_jobs=lambda room_id, name, reason=None: cancelled.append(name) if cancelled is not None else None)
         mgr._lifecycle.states = MagicMock(
             return_value={r.watcher_name: r for r in records})
         # The pre-reclaim re-read (stale-snapshot guard) resolves by room —

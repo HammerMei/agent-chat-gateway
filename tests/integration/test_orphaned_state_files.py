@@ -1,14 +1,32 @@
 """A state file for a connector that is no longer configured is reclaimed at
 boot: each record's session id is logged, then the file is removed (#143).
 
-Seam: a real `GatewayService` built from a config file.
+Seam: a real `GatewayService` built from a config file; the sweep runs in its
+constructor, between the two state preflights.
 """
 
+import dataclasses
 import json
 import unittest
+from unittest.mock import patch
 
 from gateway.core.state import STATE_FORMAT_VERSION
-from tests.helpers import isolate_runtime_dir, write_gateway_config
+from gateway.core.watcher_manager import RoomRef
+from gateway.core.watcher_rule import RoomKind
+from tests.helpers import (
+    isolate_runtime_dir,
+    make_record_from_rule,
+    make_rule,
+    write_gateway_config,
+    write_state_file,
+)
+
+
+def _ghost_record(session_id, room_id="r-old"):
+    """A rule-derived record as the removed connector 'ghost' would have written it."""
+    rule = make_rule(room="old-room", name="eng", connector="ghost", agent="default")
+    room = RoomRef(id=room_id, kind=RoomKind.CHANNEL, name="old-room")
+    return make_record_from_rule(rule, room, session_id=session_id)
 
 
 class TestOrphanedStateFiles(unittest.IsolatedAsyncioTestCase):
@@ -16,24 +34,19 @@ class TestOrphanedStateFiles(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         self.tmp, self.runtime = isolate_runtime_dir(self)
 
-    def _write_state(self, connector, records):
-        (self.runtime / f"state.{connector}.json").write_text(json.dumps(
-            {"version": STATE_FORMAT_VERSION, "watchers": records}))
+    def _write_raw(self, connector, payload):
+        """Bypasses the real writer on purpose: these tests need shapes the
+        writer cannot produce (a malformed record, a non-list `watchers`)."""
+        (self.runtime / f"state.{connector}.json").write_text(json.dumps(payload))
 
     async def test_records_of_an_unconfigured_connector_are_logged_and_the_file_removed(self):
         from gateway.service import GatewayService
 
-        self._write_state("ghost", [{
-            "watcher_name": "ghost:old-room", "session_id": "sess-ghost-7777",
-            "room_id": "r-old", "connector": "ghost", "agent": "default",
-            "rule_name": "eng", "rule": {"name": "eng"},
-            "config": {"name": "ghost:old-room", "connector": "ghost",
-                       "room": "old-room", "agent": "default"},
-        }])
-        self._write_state("script", [])
+        write_state_file("ghost", [_ghost_record("sess-ghost-7777")])
+        write_state_file("script", [])
 
         with self.assertLogs("agent-chat-gateway", level="INFO") as logs:
-            GatewayService(write_gateway_config(self.tmp))  # the sweep runs in __init__
+            GatewayService(write_gateway_config(self.tmp))
 
         self.assertFalse((self.runtime / "state.ghost.json").exists(),
                          "nothing will ever open it again")
@@ -45,17 +58,10 @@ class TestOrphanedStateFiles(unittest.IsolatedAsyncioTestCase):
         self.assertIn("connector-removed", audit[0])
 
     async def test_a_file_that_cannot_be_removed_is_not_reported_released(self):
-        from unittest.mock import patch
-
         from gateway.service import GatewayService
 
-        self._write_state("ghost", [{
-            "watcher_name": "ghost:old-room", "session_id": "sess-ghost-8888",
-            "room_id": "r-old", "connector": "ghost", "agent": "default",
-            "rule_name": "eng", "rule": {"name": "eng"},
-            "config": {"name": "ghost:old-room", "connector": "ghost",
-                       "room": "old-room", "agent": "default"},
-        }])
+        write_state_file("ghost", [_ghost_record("sess-ghost-8888")])
+
         with patch("pathlib.Path.unlink", side_effect=OSError("read-only")), \
                 self.assertLogs("agent-chat-gateway", level="WARNING") as logs:
             GatewayService(write_gateway_config(self.tmp))
@@ -68,13 +74,10 @@ class TestOrphanedStateFiles(unittest.IsolatedAsyncioTestCase):
     async def test_a_file_with_a_record_that_does_not_parse_is_kept(self):
         from gateway.service import GatewayService
 
-        good = {"watcher_name": "ghost:ok", "session_id": "sess-ghost-ok",
-                "room_id": "r-ok", "connector": "ghost", "agent": "default",
-                "rule_name": "eng", "rule": {"name": "eng"},
-                "config": {"name": "ghost:ok", "connector": "ghost", "room": "ok", "agent": "default"}}
-        malformed = dict(good, watcher_name="ghost:bad", session_id="sess-ghost-bad",
-                         room_id="r-bad", paused="yes please")  # not a bool: load_state skips it
-        self._write_state("ghost", [good, malformed])
+        good = dataclasses.asdict(_ghost_record("sess-ghost-ok", room_id="r-ok"))
+        bad = dict(dataclasses.asdict(_ghost_record("sess-ghost-bad", room_id="r-bad")),
+                   paused="yes please")  # not a bool: load_state skips it
+        self._write_raw("ghost", {"version": STATE_FORMAT_VERSION, "watchers": [good, bad]})
 
         with self.assertLogs("agent-chat-gateway", level="WARNING") as logs:
             GatewayService(write_gateway_config(self.tmp))
@@ -90,11 +93,10 @@ class TestOrphanedStateFiles(unittest.IsolatedAsyncioTestCase):
         the sweep, or the boot is refused for records about to be released."""
         from gateway.service import GatewayService
 
-        record = {"watcher_name": "x:room", "session_id": "sess-shared-1", "room_id": "r1",
-                  "connector": "x", "agent": "default", "rule_name": "w1", "rule": {"name": "w1"},
-                  "config": {"name": "x:room", "connector": "x", "room": "room", "agent": "default"}}
-        self._write_state("old-name", [record])
-        self._write_state("script", [dict(record, watcher_name="script:room", connector="script")])
+        shared = _ghost_record("sess-shared-1", room_id="r1")
+        write_state_file("old-name", [shared])
+        write_state_file("script", [dataclasses.replace(
+            shared, connector="script", watcher_name="script:room")])
 
         GatewayService(write_gateway_config(self.tmp))  # no DuplicateSessionError
 
@@ -107,8 +109,7 @@ class TestOrphanedStateFiles(unittest.IsolatedAsyncioTestCase):
         keep every configured connector from starting."""
         from gateway.service import GatewayService
 
-        (self.runtime / "state.ghost.json").write_text(json.dumps(
-            {"version": STATE_FORMAT_VERSION, "watchers": None}))
+        self._write_raw("ghost", {"version": STATE_FORMAT_VERSION, "watchers": None})
 
         with self.assertLogs("agent-chat-gateway", level="WARNING") as logs:
             GatewayService(write_gateway_config(self.tmp))  # no TypeError

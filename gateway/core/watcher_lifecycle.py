@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from datetime import datetime
+from typing import Any
 
 from ..agents import AgentBackend
 from .adapter_utils import ts_gt as _ts_gt
@@ -1409,7 +1410,7 @@ class WatcherLifecycle:
             reason=reason,
         )
 
-    def rematerialize(self, record: WatcherState, fields: dict) -> None:
+    def rematerialize(self, record: WatcherState, fields: dict[str, Any]) -> None:
         """Rewrite a record's rule-derived frozen fields in place (§2.4).
 
         The record object stays — its session, pause, watermark and clocks are

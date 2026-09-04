@@ -815,9 +815,10 @@ This is what reconciliation reads. Two facts shaped it:
 connects and before the identity barrier**, so everything that consumes
 records afterwards, the DM-claim check included, sees the fleet as the current
 config describes it): for every rule-derived record, re-run first-match for
-its room against the connector's current ordered rules. Nothing in it needs the
-network: the plan is pure, re-materialization is an in-memory rewrite plus a
-save, and an expiry's connector step is a no-op for a room nothing has
+its room against the connector's current ordered rules. It does not need the
+connector to be connected: the plan is pure, re-materialization is an in-memory
+rewrite plus a save, and an expiry talks only to the agent backend (started
+earlier) — its connector step, unsubscribing, is a no-op for a room nothing has
 subscribed yet.
 
 - The same rule wins and its snapshot digest is unchanged → **keep**.
@@ -829,10 +830,18 @@ subscribed yet.
   the room and the birth, not the rule; session-scoped fields (`session_id`,
   `paused`, the watermark) and the lifecycle clocks are untouched. Same room,
   same session, same idle clock — a paused record is re-materialized paused.
-- No rule wins, or the winner names an agent that no longer exists →
-  **expire**, through the removal path's shared tail (jobs cancelled), with
-  the session id on the AUDIT line every released session gets
-  (`session_release.py`).
+- No rule wins → **expire**, through the removal path's shared tail (jobs
+  cancelled, with a reason that says so), with the session id on the AUDIT
+  line every released session gets (`session_release.py`). A rule cannot name
+  an agent that does not exist — config loading refuses it — so a deleted
+  agent reaches a record only through a rule edit, i.e. re-materialization.
+- A record that cannot be re-matched honestly is **kept**, with the reason on
+  a warning: no room kind recorded, a room kind this build does not know, a
+  named room with no name (`unmatchable_reason`). The runtime degrades each
+  of these to something workable; a decision that can expire must not.
+- The keep decision also requires the record's `config_schema_version` to be
+  current, so a build that changes what a config field means rewrites every
+  record once, rule change or not — that is what the per-record marker is for.
 - A state file whose connector is no longer in `config.yaml` is reconciled
   too: one AUDIT line per record, then the file is removed. Nothing would
   ever open it again.
@@ -843,7 +852,7 @@ record carries, which the inbound stream refreshes on every frame
 matched under its old name at this boot; the first frame teaches the new name,
 and the next reconciliation (the next boot, or a `config reload`) applies the
 rules to it. That is the same "sticky between reconciliations" rule as for
-rule edits, and it keeps this pass free of network calls.
+rule edits, and it keeps this pass free of connector calls.
 
 Boot has no operator to ask, so it applies the plan and logs it — one summary
 line, plus one line per record that changed. The preview is `config reload
@@ -852,7 +861,10 @@ This is affordable because a lost session is recoverable in practice: the
 platform keeps every message in the room, and history handoff re-feeds recent
 context on the next session. Whether the *backend* still has the session is
 backend-dependent (reclamation asks `delete_session`; OpenCode honours it,
-Claude does not support it), which is why the id is always logged.
+Claude does not support it), which is why the id is always logged — together
+with the backend identity it was provisioned against (`identity=`), which is
+what says where to look for it; the record's current agent name may already
+have moved on.
 
 One part of that is **not** deferrable, because it is about resuming a session
 rather than detecting drift. A record stores the agent *name* and a

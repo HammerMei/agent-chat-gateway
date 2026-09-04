@@ -25,7 +25,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Iterable, Literal
+from typing import Any, Iterable, Literal
 
 from .state import (
     CONFIG_SCHEMA_VERSION,
@@ -102,7 +102,7 @@ def room_ref_of(record: WatcherState) -> RoomRef:
     )
 
 
-def rematerialized_fields(record: WatcherState, rule: WatcherRule) -> dict:
+def rematerialized_fields(record: WatcherState, rule: WatcherRule) -> dict[str, Any]:
     """The frozen fields a re-materialization rewrites, from the winning rule.
 
     `materialize` and `rule_bound_fields` are the creation path's own, so the
@@ -131,9 +131,9 @@ _KNOWN_KINDS = frozenset(k.value for k in RoomKind)
 def unmatchable_reason(record: WatcherState) -> str | None:
     """Why this record cannot be re-matched honestly — or None if it can.
 
-    The one place that decides it (three conditions found one review round at
-    a time; the fourth belongs here, not in a fourth `if`). A record that
-    fails is **kept** with the reason: the runtime degrades these cases to
+    The one place that decides it — a new condition belongs here, not in
+    another `if` at a call site. A record that fails is **kept** with the
+    reason: the runtime degrades these cases to
     something workable (an unknown or missing kind reads as CHANNEL, a wake
     resolves a nameless room through the connector), which is fine for a
     path that cannot destroy anything and wrong for one that expires.

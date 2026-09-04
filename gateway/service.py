@@ -267,7 +267,10 @@ class GatewayService:
     """
 
     def __init__(self, config: GatewayConfig) -> None:
-        # Preflight the persisted state BEFORE building anything. A state file this
+        # Preflight — and settle — the persisted state BEFORE building anything.
+        # Two read-only checks (they raise) around one write (the orphan sweep
+        # removes files no configured connector owns; see below for why it must
+        # come between them). A state file this
         # build cannot read holds real sessions, and every path that would notice it
         # later is per-connector — so a file belonging to a connector no longer in
         # config.yaml would never be opened, and the daemon would start successfully
