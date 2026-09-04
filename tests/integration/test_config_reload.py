@@ -343,6 +343,37 @@ class TestConnectorChanges(_ReloadCase):
         self.assertEqual(after["session_id"], before["session_id"])
         self.assertEqual(after["state"], "active")
 
+    async def test_a_rename_with_copied_state_is_accepted_the_way_boot_accepts_it(self):
+        """The layout boot's sweep-then-check order accepts: the old file goes, the
+        copy under the new name is hydrated. Reload validates through the same
+        prediction, so it is not refused as a duplicate session (#144)."""
+        import shutil
+        await self._boot()
+        session = (await self._rows())["script:script"]["session_id"]
+        # `shutdown` saves the file on the way out; copy what is on disk now.
+        self.service._session_managers["script"]._lifecycle.save_state()
+        shutil.copy(self.runtime / "state.script.json", self.runtime / "state.renamed.json")
+        self._rewrite(self._text(connectors=("renamed",), rules=[{
+            "name": "w1", "agent": "default", "connector": "renamed",
+            "rooms": {"include": ["script"]}}]))
+
+        dry = await self._reload(dry_run=True)
+        self.assertTrue(dry["ok"], dry)
+        self.assertEqual(dry["changes"]["connectors"]["removed"], ["script"])
+        self.assertEqual(dry["changes"]["connectors"]["added"], ["renamed"])
+
+        result = await self._reload()
+
+        self.assertEqual(result["exit_code"], 0, result)
+        self.assertFalse((self.runtime / "state.script.json").exists())
+        # The copy keeps its OLD handle — repairing a copied handle is not a
+        # supported flow (#148) — so the row is found by room, not by name.
+        rows = [r for r in (await self._rows()).values()
+                if r["connector"] == "renamed" and r["room_id"] == "script"]
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["session_id"], session, "the copy carried it")
+        self.assertEqual(rows[0]["state"], "active")
+
     async def test_a_connector_that_fails_to_connect_is_degraded_not_fatal(self):
         await self._boot()
         self._rewrite(self._two())

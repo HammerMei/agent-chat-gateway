@@ -83,6 +83,17 @@ The env-to-config migration and the config-permission hardening are boot-only.
 `ValidationResult` now carries the parsed config when it is clean, so the
 daemon validates and diffs from one read.
 
+One check in the validator had to learn boot's order to be usable here. Boot
+sweeps orphaned state files *before* its session-uniqueness check (#143), so
+a renamed connector whose state was copied to the new name boots — the old
+file's duplicate ids are released, not refused. The validator's uniqueness
+check used to scan every file and refuse that layout. It now leaves out the
+files boot's sweep will remove, deciding which with the sweep's own function
+(`core.reconcile.orphan_decisions`, executed by boot and by the reload apply,
+predicted by validate) — and keeps refusing a layout boot refuses, an orphan
+the sweep keeps because a record in it did not parse. Validate writes
+nothing; it predicts.
+
 The service **retains the resolved configuration it started with** and
 replaces it after a successful apply, together with a SHA-256 digest of its
 canonical serialization and the time it was loaded. Diffing

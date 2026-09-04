@@ -17,7 +17,6 @@ daemon.py and cli.py interface is unchanged:
 """
 
 import asyncio
-import json
 import logging
 import os
 from dataclasses import dataclass
@@ -49,7 +48,7 @@ from .core.permission import (
     PermissionBroker,
     PermissionRegistry,
 )
-from .core.reconcile import orphaned_state_files
+from .core.reconcile import orphan_decisions
 from .core.scheduler import JobScheduler
 from .core.session_manager import SessionManager
 from .core.session_maps import SessionMaps
@@ -651,28 +650,16 @@ class GatewayService:
         file is removed. Enumerates files on disk, as the validator does, so a
         renamed connector is found by its old file and not by config.
         """
-        for path, name in orphaned_state_files(configured):
-            records = load_state(name)  # format already preflighted in __init__
-            try:
-                raw = json.loads(path.read_text()).get("watchers")
-            except (OSError, ValueError, AttributeError):
-                raw = None
-            if not isinstance(raw, list):
+        # The decision is `orphan_decisions`' (format already preflighted in
+        # __init__); this method only carries it out, so `config validate` can
+        # predict the same outcome without a second copy of the rule.
+        for decision in orphan_decisions(configured):
+            path, name, records = decision.path, decision.connector, decision.records
+            if decision.keep_reason:
                 logger.warning(
-                    "Orphaned state file %s kept: its records could not be read at "
-                    "all — fix or delete the file by hand (connector '%s' is no "
-                    "longer configured)", path.name, name,
-                )
-                continue
-            if len(raw) != len(records):
-                # `load_state` skips a malformed record with a warning. Deleting
-                # the file would delete that record's only session reference
-                # without a line saying so; keep the file and say why.
-                logger.warning(
-                    "Orphaned state file %s kept: %d of its %d record(s) could not "
-                    "be parsed and would be lost without a trace — fix or delete "
-                    "the file by hand (connector '%s' is no longer configured)",
-                    path.name, len(raw) - len(records), len(raw), name,
+                    "Orphaned state file %s kept: %s — fix or delete the file by "
+                    "hand (connector '%s' is no longer configured)",
+                    path.name, decision.keep_reason, name,
                 )
                 continue
             try:
