@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from datetime import datetime
+from typing import Any
 
 from ..agents import AgentBackend
 from .adapter_utils import ts_gt as _ts_gt
@@ -23,7 +24,9 @@ from .message_processor import MessageProcessor
 from .paths import room_path_key, watcher_prompt_key
 from .permission import PermissionRegistry
 from .session_maps import SessionMaps
+from .session_release import log_session_released
 from .state import (
+    FROZEN_AT_CREATION_FIELDS,
     StateFilter,
     WatcherState,
     backend_identity,
@@ -67,6 +70,20 @@ def _should_restore_watermark(stored: str, live: str | None) -> bool:
     if live == "":
         return False
     return _ts_gt(stored, live)
+
+
+def _why_not_reused(prior: WatcherState, identity: str, room_id: str) -> str:
+    """Why a stored session id is not reused for this start (§2.4).
+
+    One wording for the provisioning warning and the release AUDIT line.
+    """
+    if prior.backend_identity == identity:
+        return (f"it belongs to room '{prior.room_id}' and this watcher now "
+                f"watches '{room_id}'")
+    if prior.backend_identity:
+        return (f"it was created against backend identity "
+                f"'{prior.backend_identity}', which is now '{identity}'")
+    return f"it has no recorded backend identity to check against '{identity}'"
 
 
 class WatcherLifecycle:
@@ -219,6 +236,11 @@ class WatcherLifecycle:
                 self._hydrate(ws)
 
         self._state_store.save(self._by_name(), prune=prune)
+        # Released only once the prune is durable: a save that raises leaves
+        # the records on disk, and announcing them released would repeat the
+        # same ids at every failing boot.
+        for name in sorted(prune):
+            self.release_session(persisted[name], "static-era record pruned at boot")
         return errors
 
     # ── Two identities, one index ─────────────────────────────────────────────
@@ -537,6 +559,7 @@ class WatcherLifecycle:
                 return False
 
             await self._reclaim_record_locked(name, state)
+            self.release_session(state, "idle past session_expire_days")
             logger.info(
                 "Watcher '%s' expired after %s day(s) idle — session and "
                 "record reclaimed; the room's next message creates a fresh "
@@ -838,6 +861,7 @@ class WatcherLifecycle:
                         name, room_id, reason,
                     )
                 await self._reclaim_record_locked(name, record)
+                self.release_session(record, reason)
                 logger.info(
                     "Watcher '%s' reclaimed — %s; re-adding the bot to room "
                     "%s starts fresh, with no continuity",
@@ -1103,6 +1127,7 @@ class WatcherLifecycle:
             old_session_id = state.session_id
             if old_session_id:
                 self._injector.reset_session(old_session_id)
+                self.release_session(state, "reset by operator")
             state.session_id = ""
             state.context_injected = False
 
@@ -1367,6 +1392,54 @@ class WatcherLifecycle:
     def processor_named(self, name: str) -> MessageProcessor | None:
         """The live processor for a watcher name, or None when not resident."""
         return self._processor_named(name)
+
+    def _release_if_abandoned(
+        self, prior: "WatcherState | None", session_id: str, identity: str, room_id: str
+    ) -> None:
+        """The AUDIT line for a stored id `_provision_session` did not reuse.
+
+        Called at the two points where the prior record has actually been
+        replaced — a start that committed, and a subscription failure that
+        keeps the new record (#143): before either, a failure rolls the prior
+        record back with its id intact and nothing was released. The reason
+        is the same one `_provision_session` logged.
+        """
+        if prior is not None and prior.session_id and prior.session_id != session_id:
+            self.release_session(
+                prior,
+                f"abandoned at provisioning — {_why_not_reused(prior, identity, room_id)}")
+
+    def release_session(self, state: WatcherState, reason: str) -> None:
+        """The one AUDIT line for a session this lifecycle lets go of (#143).
+
+        Every path that discards or replaces a record's session calls this —
+        expiry, reclamation, reset, the static-era prune — so the full id is
+        always findable under one grep, whichever path took it.
+        """
+        log_session_released(
+            logger,
+            connector=state.connector or self._state_store.state_name,
+            room_id=state.room_id,
+            watcher=state.watcher_name,
+            agent=state.agent,
+            identity=state.backend_identity,
+            session_id=state.session_id,
+            reason=reason,
+        )
+
+    def rematerialize(self, record: WatcherState, fields: dict[str, Any]) -> None:
+        """Rewrite a record's rule-derived frozen fields in place (§2.4).
+
+        The record object stays — its session, pause, watermark and clocks are
+        untouched and every index still points at it. Nothing is saved here;
+        the caller saves once for the whole reconciliation.
+        """
+        stray = set(fields) - FROZEN_AT_CREATION_FIELDS
+        if stray:
+            raise ValueError(
+                f"re-materialization may only rewrite frozen fields, not {sorted(stray)}")
+        for name, value in fields.items():
+            setattr(record, name, value)
 
     def states(self) -> dict[str, WatcherState]:
         """The in-memory records, BY WATCHER NAME — a view built on each call.
@@ -1729,6 +1802,10 @@ class WatcherLifecycle:
                 ws.context_injected = False
             self._install(ws)
             self._maps.remove_session(session_id)
+            # The prior record is gone from the index either way — `ws` is
+            # what the next start reads — so an id provisioning abandoned is
+            # abandoned here too (#143), even though this start failed.
+            self._release_if_abandoned(state, session_id, identity, room.id)
             raise
 
         # 9. Activate processor — starts the consumer loop and emits the
@@ -1760,6 +1837,7 @@ class WatcherLifecycle:
             agent_name,
             session_id[:8],
         )
+        self._release_if_abandoned(state, session_id, identity, room.id)
 
     async def _provision_session(
         self,
@@ -1814,27 +1892,19 @@ class WatcherLifecycle:
         if state and state.session_id:
             if state.backend_identity == identity and state.room_id == room_id:
                 return state.session_id, False
-            # The full id, deviating from the [:8] used for routine session logging.
-            # This record is about to be overwritten with the new session, so this line
-            # is the only place the abandoned id survives — and the one use it has left
-            # is being pasted into the backend's own resume command.
+            why = _why_not_reused(state, identity, room_id)
+            # The gateway lets go of this id: it is not deleted anywhere — the
+            # conversation stays in the backend it was created against and can be
+            # resumed there by hand — but the record is about to be overwritten
+            # with the new session. The AUDIT line every released session gets
+            # (#143) is emitted by `start_watcher_in_room` once the new record is
+            # committed: a start that fails rolls the old record back, id intact.
             logger.warning(
-                "Watcher '%s': not reusing session %s — %s. Starting a fresh session; "
+                "Watcher '%s': not reusing session=%s — %s. Starting a fresh session; "
                 "the previous conversation stays in the backend it was created against "
                 "and can be resumed there by hand with this id. "
                 "Expected after changing an agent's type or working_directory.",
-                wc.name,
-                state.session_id,
-                (
-                    f"it belongs to room '{state.room_id}' and this watcher now "
-                    f"watches '{room_id}'"
-                    if state.backend_identity == identity
-                    else f"it was created against backend identity "
-                         f"'{state.backend_identity}', which is now '{identity}'"
-                    if state.backend_identity
-                    else f"it has no recorded backend identity to check against "
-                         f"'{identity}'"
-                ),
+                wc.name, state.session_id, why,
             )
         session_title = (
             f"{agent_cfg.session_prefix}:{wc.room}"

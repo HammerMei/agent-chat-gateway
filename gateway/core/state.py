@@ -261,8 +261,9 @@ def past_idle_ttl(record: "WatcherState", now) -> bool:
     drift on exactly the restart-only path nothing exercises.
 
     Reads the **frozen** rule, never current config (§2.5): the sweep reads what
-    the record carries, and rule updates belong to a future config-reload that
-    diffs current against frozen. Answers False — never destructive — when the
+    the record carries, and rule updates reach the record only through
+    reconciliation (§2.4 — at boot, and at `config reload`), which re-matches
+    the current rules against every record. Answers False — never destructive — when the
     record carries no rule snapshot (a static-model record, whose lifecycle is
     `config.yaml`'s), no TTL, no activity clock, or a clock it cannot parse.
 

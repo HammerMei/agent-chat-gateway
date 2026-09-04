@@ -37,40 +37,17 @@ from gateway.core.state import (
     save_state,
 )
 from gateway.service import GatewayService
+from tests.helpers import isolate_runtime_dir, write_gateway_config
 
 pytestmark = pytest.mark.integration
 
 
 class TestServiceStatePreflight(unittest.TestCase):
     def setUp(self) -> None:
-        self._tmp = tempfile.TemporaryDirectory()
-        self.addCleanup(self._tmp.cleanup)
-        self.tmp = Path(self._tmp.name)
-        self.runtime = self.tmp / "runtime"
-        self.runtime.mkdir()
-        patcher = patch.object(state_mod, "RUNTIME_DIR", self.runtime)
-        patcher.start()
-        self.addCleanup(patcher.stop)
+        self.tmp, self.runtime = isolate_runtime_dir(self)
 
     def _config(self, connector_name: str = "script") -> GatewayConfig:
-        """A script connector: constructible with no network or subprocess."""
-        path = self.tmp / "config.yaml"
-        path.write_text(textwrap.dedent(f"""\
-            connectors:
-              - name: {connector_name}
-                type: script
-            agents:
-              default:
-                type: claude
-                working_directory: {self.tmp}
-            watcher_rules:
-              - name: w1
-                agent: default
-                connector: {connector_name}
-                rooms:
-                  include: [script]
-        """))
-        return GatewayConfig.from_file(str(path))
+        return write_gateway_config(self.tmp, connector_name)
 
     def _write_unversioned(self, connector_name: str) -> Path:
         path = self.runtime / f"state.{connector_name}.json"

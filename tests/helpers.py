@@ -24,6 +24,8 @@ from gateway.config import AgentConfig, WatcherConfig
 from gateway.core.config import CoreConfig
 from gateway.core.connector import Room
 from gateway.core.session_manager import SessionManager
+from gateway.core.watcher_manager import RoomRef
+from gateway.core.watcher_rule import RoomKind
 
 # Patch load_state/save_state globally so tests never touch live state files.
 _patch_load_state = patch("gateway.core.state_store.load_state", return_value=[])
@@ -221,6 +223,103 @@ def make_rule_derived_record(
     return WatcherState(**defaults)
 
 
+def patch_persisted(records):
+    """Patch the state store to hand back `records` at the next load.
+
+    A context manager; the module-level `IsolatedTestCase` patch returns `[]`,
+    this one returns something — what a booted manager hydrates."""
+    return patch("gateway.core.state_store.load_state", return_value=list(records))
+
+
+def isolate_runtime_dir(testcase):
+    """Give a test its own `RUNTIME_DIR` under a temp dir; returns `(tmp, runtime)`.
+
+    Cleaned up with the test. For tests that build a real `GatewayService` or
+    touch `state.*.json` files on disk."""
+    import tempfile
+    from pathlib import Path
+
+    import gateway.core.state as state_mod
+
+    holder = tempfile.TemporaryDirectory()
+    testcase.addCleanup(holder.cleanup)
+    tmp = Path(holder.name)
+    runtime = tmp / "runtime"
+    runtime.mkdir()
+    patcher = patch.object(state_mod, "RUNTIME_DIR", runtime)
+    patcher.start()
+    testcase.addCleanup(patcher.stop)
+    return tmp, runtime
+
+
+def write_gateway_config(tmp, connector_name="script", *, working_directory=None):
+    """Write and load a minimal `config.yaml` under `tmp` — the one hand-built config.
+
+    One script connector (constructible with no network or subprocess), one
+    claude agent, one rule."""
+    import textwrap
+
+    from gateway.config import GatewayConfig
+
+    path = tmp / "config.yaml"
+    path.write_text(textwrap.dedent(f"""\
+        connectors:
+          - name: {connector_name}
+            type: script
+        agents:
+          default:
+            type: claude
+            working_directory: {working_directory or tmp}
+        watcher_rules:
+          - name: w1
+            agent: default
+            connector: {connector_name}
+            rooms:
+              include: [script]
+    """))
+    return GatewayConfig.from_file(str(path))
+
+
+def make_record_from_rule(rule, room, *, session_id="sess-1", connector=None,
+                          now="2026-09-01T00:00:00-07:00", **overrides):
+    """A `WatcherState` written the way creation writes it.
+
+    `materialize` the rule for the room, then `creation_provenance` for the
+    frozen fields.
+
+    Unlike `make_rule_derived_record`, whose `rule` snapshot is a two-key stub,
+    this record carries the real snapshot — what reconciliation compares
+    against the current rules — so a test can change one rule field and see
+    exactly that field's consequence. `overrides` land last (e.g.
+    `dropped_at=...` for a dormant record, `paused=True`).
+    """
+    from gateway.core.state import WatcherState, backend_identity
+    from gateway.core.watcher_manager import creation_provenance, materialize
+
+    wc = materialize(rule, room)
+    # A started watcher records the backend it provisioned its session against;
+    # a record without it never reuses its session (`_provision_session`).
+    # `make_core_config`'s agents are default `AgentConfig()`s, so that is the
+    # identity a real start would have written here.
+    default_identity = backend_identity(AgentConfig().type, AgentConfig().working_directory)
+    provenance = creation_provenance(
+        wc, rule, room,
+        connector_name=connector or rule.connector,
+        agent_name=rule.agent,
+        now=now,
+    )
+    fields = dict(
+        watcher_name=wc.name,
+        session_id=session_id,
+        room_id=room.id,
+        room_name=room.name,
+        backend_identity=default_identity,
+        **provenance,
+    )
+    fields.update(overrides)
+    return WatcherState(**fields)
+
+
 def make_core_config(timeout: int = 10, agents=None, **kw):
     """A `CoreConfig` with one agent, which is what most tests need."""
     return CoreConfig(
@@ -321,6 +420,7 @@ def make_bare_session_manager(**attrs):
     mgr._sweep = None
     mgr._cancel_jobs = None
     mgr._watcher_rules = []
+    mgr._records_settled = False
     for name, value in attrs.items():
         setattr(mgr, name, value)
     return mgr
@@ -422,3 +522,6 @@ def evict_record(lifecycle, name):
     """Drop the record and any processor under `name`, as a reclaim would."""
     lifecycle._pop_processor(name)
     return lifecycle._uninstall(name)
+
+
+ENG_ROOM = RoomRef(id="eng-backend", kind=RoomKind.CHANNEL, name="eng-backend")

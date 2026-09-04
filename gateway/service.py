@@ -17,6 +17,7 @@ daemon.py and cli.py interface is unchanged:
 """
 
 import asyncio
+import json
 import logging
 import os
 from dataclasses import dataclass
@@ -44,10 +45,16 @@ from .core.permission import (
     PermissionBroker,
     PermissionRegistry,
 )
+from .core.reconcile import orphaned_state_files
 from .core.scheduler import JobScheduler
 from .core.session_manager import SessionManager
 from .core.session_maps import SessionMaps
-from .core.state import check_session_uniqueness, check_state_formats, load_state
+from .core.session_release import log_session_released
+from .core.state import (
+    check_session_uniqueness,
+    check_state_formats,
+    load_state,
+)
 
 logger = logging.getLogger("agent-chat-gateway.service")
 
@@ -260,7 +267,10 @@ class GatewayService:
     """
 
     def __init__(self, config: GatewayConfig) -> None:
-        # Preflight the persisted state BEFORE building anything. A state file this
+        # Preflight — and settle — the persisted state BEFORE building anything.
+        # Two read-only checks (they raise) around one write (the orphan sweep
+        # removes files no configured connector owns; see below for why it must
+        # come between them). A state file this
         # build cannot read holds real sessions, and every path that would notice it
         # later is per-connector — so a file belonging to a connector no longer in
         # config.yaml would never be opened, and the daemon would start successfully
@@ -268,6 +278,12 @@ class GatewayService:
         # version marker: an unreadable file must stop the boot, not be discovered as
         # an absence. See gateway/core/state.py.
         check_state_formats()
+        # Then let go of the files no configured connector owns (#143) — BEFORE the
+        # uniqueness preflight below scans every file: an orphan left by renaming a
+        # connector (state copied, old file kept) shares its session ids with the new
+        # file, and a preflight that still read the orphan would refuse the boot for
+        # records this sweep is about to release.
+        self._reclaim_orphaned_state_files({c.name for c in config.connectors})
         # Before anything is built: a state file binding one session to two rooms is a
         # cross-room leak waiting for both watchers to start (§4.1). The runtime check
         # in `bind_session` catches it too, but only once one of them is already
@@ -325,8 +341,10 @@ class GatewayService:
                 # the exemption itself: a job records the room it targets and can
                 # resurrect it, so there is no record to protect on its behalf.
                 cancel_jobs=(
-                    lambda room_id, legacy_handle, _cn=cc.name: self._cancel_jobs_for(
-                        _cn, room_id, legacy_handle=legacy_handle)
+                    lambda room_id, legacy_handle, *, reason, advice, _cn=cc.name:
+                        self._cancel_jobs_for(
+                            _cn, room_id, legacy_handle=legacy_handle,
+                            reason=reason, advice=advice)
                 ),
             )
             self._entries.append(
@@ -348,7 +366,8 @@ class GatewayService:
         )
 
     def _cancel_jobs_for(
-        self, connector_name: str, room_id: str, *, legacy_handle: str
+        self, connector_name: str, room_id: str, *, legacy_handle: str,
+        reason: str, advice: str,
     ) -> None:
         """Cancel every scheduled job targeting a reclaimed room (§2.7).
 
@@ -413,13 +432,12 @@ class GatewayService:
             doomed = [j for j in self._job_store.list_jobs()
                       if _claims_this_room(j)]
             for job in doomed:
-                reason = "the bot was removed from the room, so the job could never deliver"
                 self._job_store.cancel(job.id, reason=reason)
                 logger.warning(
                     "AUDIT: cancelled scheduled job %s (watcher '%s', room %s, "
-                    "connector '%s') — %s. The record is kept; "
-                    "'agent-chat-gateway schedule resume %s' restores it.",
-                    job.id, job.watcher, room_id, job.connector, reason, job.id,
+                    "connector '%s') — %s. The record is kept; %s",
+                    job.id, job.watcher, room_id, job.connector, reason,
+                    advice.format(job_id=job.id),
                 )
         except Exception as e:
             logger.warning(
@@ -514,6 +532,70 @@ class GatewayService:
         if conflicts:
             raise DuplicateBotIdentityError("\n".join(conflicts))
 
+    def _reclaim_orphaned_state_files(self, configured: set[str]) -> None:
+        """Remove state files of connectors that are no longer configured (#143).
+
+        Nothing opens `state.<name>.json` for a connector `config.yaml` no longer
+        names — `config validate` only warns about it — so its records, and the
+        sessions they point at, were abandoned silently. Boot now reconciles
+        them the way it reconciles every other record: one AUDIT line per
+        record with the full session id (the backend session cannot be deleted;
+        there is no connector or agent context left to do it with), then the
+        file is removed. Enumerates files on disk, as the validator does, so a
+        renamed connector is found by its old file and not by config.
+        """
+        for path, name in orphaned_state_files(configured):
+            records = load_state(name)  # format already preflighted in __init__
+            try:
+                raw = json.loads(path.read_text()).get("watchers")
+            except (OSError, ValueError, AttributeError):
+                raw = None
+            if not isinstance(raw, list):
+                logger.warning(
+                    "Orphaned state file %s kept: its records could not be read at "
+                    "all — fix or delete the file by hand (connector '%s' is no "
+                    "longer configured)", path.name, name,
+                )
+                continue
+            if len(raw) != len(records):
+                # `load_state` skips a malformed record with a warning. Deleting
+                # the file would delete that record's only session reference
+                # without a line saying so; keep the file and say why.
+                logger.warning(
+                    "Orphaned state file %s kept: %d of its %d record(s) could not "
+                    "be parsed and would be lost without a trace — fix or delete "
+                    "the file by hand (connector '%s' is no longer configured)",
+                    path.name, len(raw) - len(records), len(raw), name,
+                )
+                continue
+            try:
+                path.unlink()
+            except OSError as exc:
+                # Not released: the file, and the records in it, are still
+                # there and the next start finds them again. No AUDIT line —
+                # that would announce a release that did not happen, twice.
+                logger.warning(
+                    "Could not remove orphaned state file %s (%d record(s) of "
+                    "connector '%s' remain until the next start): %s",
+                    path, len(records), name, exc,
+                )
+                continue
+            for record in records:
+                log_session_released(
+                    logger,
+                    connector=name,
+                    room_id=record.room_id,
+                    watcher=record.watcher_name,
+                    agent=record.agent,
+                    identity=record.backend_identity,
+                    session_id=record.session_id,
+                    reason="connector-removed",
+                )
+            logger.warning(
+                "Removed state file %s — connector '%s' is no longer configured; "
+                "its %d record(s) are logged above", path.name, name, len(records),
+            )
+
     async def run(self, startup_fd: int = -1) -> None:
         """Connect all connectors, start unified control socket, block until cancelled.
 
@@ -584,6 +666,22 @@ class GatewayService:
             # only this loop can see the collision. Fanning `run_once()` out would let
             # connector A finish subscribing while B was still logging in, and the
             # check would then run after the duplicate had started answering.
+            # Settle the persisted records first (#143): hydrate and reconcile
+            # each connector's fleet against the current rules BEFORE anything
+            # consumes it. The identity barrier below folds persisted DM
+            # records into each connector's claim; a record a deleted rule
+            # left behind must be gone by then, or a legitimate two-team setup
+            # is refused for a conversation nothing will ever answer again.
+            await self._settle(
+                [
+                    e.session_manager.settle_records(
+                        unavailable_agents=self._runtime_manager.unavailable_agents,
+                    )
+                    for e in self._entries
+                ],
+                phase="settle",
+                startup_errors=startup_errors,
+            )
             await self._settle(
                 [e.session_manager.connect_only() for e in self._entries],
                 phase="connect",

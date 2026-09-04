@@ -15,6 +15,7 @@ from gateway.core.bot_identity import (
     DuplicateBotIdentityError,
     canonical_origin,
 )
+from gateway.core.session_manager import JOBS_CANCELLED_BOT_REMOVED as REMOVED
 from gateway.service import GatewayService
 
 
@@ -49,6 +50,7 @@ class TestGatewayServiceRun(unittest.IsolatedAsyncioTestCase):
         service._runtime_manager.unavailable_agents = set()
         sm = MagicMock()
         sm.connect_only = AsyncMock()
+        sm.settle_records = AsyncMock(return_value=[])
         sm.sync_only = AsyncMock(return_value=[])
         sm.shutdown = AsyncMock()
         service._entries = [
@@ -126,11 +128,13 @@ class TestGatewayServiceRun(unittest.IsolatedAsyncioTestCase):
 
         good_sm = MagicMock()
         good_sm.connect_only = AsyncMock(side_effect=slow_good_connect)
+        good_sm.settle_records = AsyncMock(return_value=[])
         good_sm.sync_only = AsyncMock(return_value=[])
         good_sm.shutdown = AsyncMock(side_effect=good_shutdown)
 
         bad_sm = MagicMock()
         bad_sm.connect_only = AsyncMock(side_effect=ConnectionError("bad url: test"))
+        bad_sm.settle_records = AsyncMock(return_value=[])
         bad_sm.sync_only = AsyncMock(return_value=[])
         bad_sm.shutdown = AsyncMock()
 
@@ -222,7 +226,8 @@ class TestTheCancellationClaimRule(unittest.TestCase):
     def test_a_job_on_this_connector_is_cancelled(self):
         service = self._service_with_jobs([("acg-1", "rc:general", "rc")])
 
-        service._cancel_jobs_for("rc", "room-1", legacy_handle="rc:general")
+        service._cancel_jobs_for("rc", "room-1", legacy_handle="rc:general",
+                                 reason=REMOVED[0], advice=REMOVED[1])
 
         service._job_store.cancel.assert_called_once()
 
@@ -235,7 +240,8 @@ class TestTheCancellationClaimRule(unittest.TestCase):
         must be able to cancel it here."""
         service = self._service_with_jobs([("acg-1", "rc:general", "")])
 
-        service._cancel_jobs_for("rc", "room-1", legacy_handle="rc:general")
+        service._cancel_jobs_for("rc", "room-1", legacy_handle="rc:general",
+                                 reason=REMOVED[0], advice=REMOVED[1])
 
         service._job_store.cancel.assert_called_once()
 
@@ -244,7 +250,8 @@ class TestTheCancellationClaimRule(unittest.TestCase):
     def test_a_job_naming_a_connector_that_no_longer_exists_is_cancelled(self):
         service = self._service_with_jobs([("acg-1", "rc:general", "retired")])
 
-        service._cancel_jobs_for("rc", "room-1", legacy_handle="rc:general")
+        service._cancel_jobs_for("rc", "room-1", legacy_handle="rc:general",
+                                 reason=REMOVED[0], advice=REMOVED[1])
 
         service._job_store.cancel.assert_called_once()
 
@@ -258,14 +265,16 @@ class TestTheCancellationClaimRule(unittest.TestCase):
         other.name = "mm"
         service._entries.append(other)
 
-        service._cancel_jobs_for("rc", "room-1", legacy_handle="rc:general")
+        service._cancel_jobs_for("rc", "room-1", legacy_handle="rc:general",
+                                 reason=REMOVED[0], advice=REMOVED[1])
 
         service._job_store.cancel.assert_not_called()
 
     def test_another_watchers_job_is_left_alone(self):
         service = self._service_with_jobs([("acg-1", "rc:dev", "rc")])
 
-        service._cancel_jobs_for("rc", "room-1", legacy_handle="rc:general")
+        service._cancel_jobs_for("rc", "room-1", legacy_handle="rc:general",
+                                 reason=REMOVED[0], advice=REMOVED[1])
 
         service._job_store.cancel.assert_not_called()
 class TestIdentityBarrier(unittest.IsolatedAsyncioTestCase):
@@ -291,6 +300,7 @@ class TestIdentityBarrier(unittest.IsolatedAsyncioTestCase):
         for i, identity in enumerate(identities):
             sm = MagicMock()
             sm.connect_only = AsyncMock()
+            sm.settle_records = AsyncMock(return_value=[])
             sm.sync_only = AsyncMock(return_value=[])
             sm.shutdown = AsyncMock()
             connector = MagicMock()
@@ -843,7 +853,8 @@ class TestCancellationRequiresOwnershipNotJustTheRoom(unittest.TestCase):
             ("acg-theirs", "alice:general", "alice", "room-1"),
         ])
 
-        service._cancel_jobs_for("rc", "room-1", legacy_handle="rc:general")
+        service._cancel_jobs_for("rc", "room-1", legacy_handle="rc:general",
+                                 reason=REMOVED[0], advice=REMOVED[1])
 
         self.assertEqual(self._removed(service), ["acg-mine"])
 
@@ -854,7 +865,8 @@ class TestCancellationRequiresOwnershipNotJustTheRoom(unittest.TestCase):
             ("acg-theirs", "alice:general", "alice", "room-1"),
         ])
 
-        service._cancel_jobs_for("rc", "room-1", legacy_handle="rc:general")
+        service._cancel_jobs_for("rc", "room-1", legacy_handle="rc:general",
+                                 reason=REMOVED[0], advice=REMOVED[1])
 
         self.assertEqual(self._removed(service), [])
 
@@ -869,7 +881,8 @@ class TestCancellationRequiresOwnershipNotJustTheRoom(unittest.TestCase):
             ("acg-old", "rc:general", ""),
         ])
 
-        service._cancel_jobs_for("rc", "room-1", legacy_handle="rc:general")
+        service._cancel_jobs_for("rc", "room-1", legacy_handle="rc:general",
+                                 reason=REMOVED[0], advice=REMOVED[1])
 
         self.assertEqual(self._removed(service), ["acg-old"])
 
@@ -878,7 +891,8 @@ class TestCancellationRequiresOwnershipNotJustTheRoom(unittest.TestCase):
             ("acg-old", "alice:general", ""),
         ])
 
-        service._cancel_jobs_for("rc", "room-1", legacy_handle="rc:general")
+        service._cancel_jobs_for("rc", "room-1", legacy_handle="rc:general",
+                                 reason=REMOVED[0], advice=REMOVED[1])
 
         self.assertEqual(self._removed(service), [])
 
@@ -917,7 +931,7 @@ class TestCancellationMatchesByRoomNotByHandle(unittest.TestCase):
         """Room B holds the handle and is alive; the bot was removed from A."""
         service = self._service([("acg-b", "rc:general", "room-B")])
 
-        service._cancel_jobs_for("rc", "room-A", legacy_handle="rc:general")
+        service._cancel_jobs_for("rc", "room-A", legacy_handle="rc:general", reason=REMOVED[0], advice=REMOVED[1])
 
         service._job_store.cancel.assert_not_called()
 
@@ -926,7 +940,7 @@ class TestCancellationMatchesByRoomNotByHandle(unittest.TestCase):
         renamed, so its record's handle differs. The room id still matches."""
         service = self._service([("acg-a", "rc:general", "room-A")])
 
-        service._cancel_jobs_for("rc", "room-A", legacy_handle="rc:daily-standup")
+        service._cancel_jobs_for("rc", "room-A", legacy_handle="rc:daily-standup", reason=REMOVED[0], advice=REMOVED[1])
 
         service._job_store.cancel.assert_called_once()
 
@@ -936,12 +950,41 @@ class TestCancellationMatchesByRoomNotByHandle(unittest.TestCase):
         """It has no id, so the handle is the only key it has."""
         service = self._service([("acg-old", "rc:general", "")])
 
-        service._cancel_jobs_for("rc", "room-A", legacy_handle="rc:general")
+        service._cancel_jobs_for("rc", "room-A", legacy_handle="rc:general", reason=REMOVED[0], advice=REMOVED[1])
 
         service._job_store.cancel.assert_called_once()
 
         self.assertEqual(service._job_store.cancel.call_args.args[0], "acg-old")
 
+
+class TestRecordsSettleBeforeTheIdentityBarrier(unittest.IsolatedAsyncioTestCase):
+    """#143: the identity barrier folds persisted DM records into each connector's
+    claim, so the fleet must be reconciled before it runs — a record a deleted
+    rule left behind would otherwise refuse a legitimate two-team setup."""
+
+    async def test_settle_runs_before_connect_and_the_identity_check(self):
+        service = _make_service()
+        service._runtime_manager.start_all = AsyncMock(return_value=[])
+        service._runtime_manager.has_active_brokers = False
+        service._runtime_manager.unavailable_agents = set()
+        service._runtime_manager.stop_all = AsyncMock()
+        order = []
+        sm = MagicMock()
+        sm.settle_records = AsyncMock(side_effect=lambda **kw: order.append("settle") or [])
+        sm.connect_only = AsyncMock(side_effect=lambda: order.append("connect"))
+        sm.sync_only = AsyncMock(side_effect=lambda **kw: order.append("sync") or [])
+        sm.shutdown = AsyncMock()
+        service._entries = [
+            SimpleNamespace(name="script", session_manager=sm, connector=_accountless())
+        ]
+        service._check_bot_identities = MagicMock(side_effect=lambda: order.append("identity"))
+        service._control.start = AsyncMock(side_effect=RuntimeError("stop here"))
+        service._control.stop = AsyncMock()
+
+        with self.assertRaises(RuntimeError):
+            await service.run()
+
+        self.assertEqual(order, ["settle", "connect", "identity", "sync"])
 
 
 if __name__ == "__main__":
