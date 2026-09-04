@@ -101,7 +101,9 @@ class TestARemovalReclaimsTheRecord(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(name, "w1")
         self.assertIsNone(lifecycle.get_watcher_state("w1"))
-        audit = [line for line in captured.output if "AUDIT" in line]
+        # Two AUDIT lines are expected now: this override, and the session
+        # release every reclamation logs (#143). Count the override alone.
+        audit = [line for line in captured.output if "pause is being overridden" in line]
         self.assertEqual(len(audit), 1, "the pause override is audited, once")
         self.assertIn("room-w1", audit[0], "the audit names the room")
         self.assertIn("pause", audit[0].lower())

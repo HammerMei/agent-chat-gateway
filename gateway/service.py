@@ -44,10 +44,16 @@ from .core.permission import (
     PermissionBroker,
     PermissionRegistry,
 )
+from .core.reconcile import orphaned_state_files
 from .core.scheduler import JobScheduler
 from .core.session_manager import SessionManager
 from .core.session_maps import SessionMaps
-from .core.state import check_session_uniqueness, check_state_formats, load_state
+from .core.session_release import log_session_released
+from .core.state import (
+    check_session_uniqueness,
+    check_state_formats,
+    load_state,
+)
 
 logger = logging.getLogger("agent-chat-gateway.service")
 
@@ -514,6 +520,40 @@ class GatewayService:
         if conflicts:
             raise DuplicateBotIdentityError("\n".join(conflicts))
 
+    def _reclaim_orphaned_state_files(self) -> None:
+        """Remove state files of connectors that are no longer configured (#143).
+
+        Nothing opens `state.<name>.json` for a connector `config.yaml` no longer
+        names — `config validate` only warns about it — so its records, and the
+        sessions they point at, were abandoned silently. Boot now reconciles
+        them the way it reconciles every other record: one AUDIT line per
+        record with the full session id (the backend session cannot be deleted;
+        there is no connector or agent context left to do it with), then the
+        file is removed. Enumerates files on disk, as the validator does, so a
+        renamed connector is found by its old file and not by config.
+        """
+        for path, name in orphaned_state_files(e.name for e in self._entries):
+            records = load_state(name)  # format already preflighted in __init__
+            for record in records:
+                log_session_released(
+                    logger,
+                    connector=name,
+                    room_id=record.room_id,
+                    watcher=record.watcher_name,
+                    agent=record.agent,
+                    session_id=record.session_id,
+                    reason="connector-removed",
+                )
+            try:
+                path.unlink()
+            except OSError as exc:
+                logger.warning("Could not remove orphaned state file %s: %s", path, exc)
+                continue
+            logger.warning(
+                "Removed state file %s — connector '%s' is no longer configured; "
+                "its %d record(s) are logged above", path.name, name, len(records),
+            )
+
     async def run(self, startup_fd: int = -1) -> None:
         """Connect all connectors, start unified control socket, block until cancelled.
 
@@ -555,6 +595,7 @@ class GatewayService:
             # catch-up injections need processors), and it still does, below.
             if getattr(self, "_job_store", None) is not None:
                 self._job_store.load()
+                self._reclaim_orphaned_state_files()
 
             # 3. run_once() connects each SessionManager without blocking — the daemon
             #    loop below keeps the process alive.  We intentionally avoid sm.run()

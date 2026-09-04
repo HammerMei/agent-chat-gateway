@@ -697,9 +697,12 @@ which is why it is worth doing even though the trigger is not yet reachable.
 ### 2.4 Sticky binding and materialization
 
 Once a watcher exists for `(connector, room_id)` it stays bound to that key
-until it expires. **Editing or deleting the rule that created it does not
-rebind or destroy it.** Recreation after an idle drop uses the watcher's own
-persisted config, not the current rule.
+until it expires. **Between reconciliations, editing or deleting the rule that
+created it does not rebind or destroy it**: recreation after an idle drop uses
+the watcher's own persisted config, not the current rule. A **reconciliation**
+— every boot, and every `config reload` — re-runs first-match over the current
+ordered rule list for every record and brings the record up to date (see
+"Reconciliation" below); until the next one, the record is authoritative.
 
 **That persisted config is a materialized per-watcher config, not a copy of
 the rule.** At creation the rule is copied and two fields are overwritten
@@ -791,19 +794,52 @@ changed?" and is worth deriving for cheap equality checks, but the full
 content is what allows showing an operator *what* changed, or applying a
 change field-by-field.
 
-This is groundwork for automatic rebinding on config change, which is out of
-scope here (§3). Two things that design will need, recorded now because they
-shape what is worth storing:
+This is what reconciliation reads. Two facts shaped it:
 
 - **Content drift and ownership drift are different checks.** Under
   first-match precedence a rule inserted *above* mine begins winning for my
   room without any rule's content changing. Detecting that requires
   re-running the match against the current ordered rule list, not a diff.
-  A rule-content diff alone would miss it.
+  A rule-content diff alone would miss it — so reconciliation re-matches
+  every record and uses the snapshot digest only to decide whether a
+  same-named winner is a change at all.
 - **The agent's own definition is outside the rule.** A rule names
   `agent: X`, but X's `working_directory`, backend and permission settings
-  can all change without the rule changing. Complete drift detection has to
-  consider the resolved agent config too.
+  can all change without the rule changing. Reconciliation does not decide
+  that: it rewrites the record's `agent`, and the backend-identity check at
+  the next session provisioning decides whether the stored session is reused
+  or abandoned with its id logged — one place deciding session reuse.
+
+**Reconciliation** (`gateway/core/reconcile.py`, run by the session manager
+right after hydration at boot — before the eager loop and before the inbound
+stream opens, so the fleet is still): for every rule-derived record, re-run
+first-match for its room against the connector's current ordered rules.
+
+- The same rule wins and its snapshot digest is unchanged → **keep**.
+- A rule wins whose name or content differs from what the record froze →
+  **re-materialize**: the rule-derived frozen fields (`config`, `rule`,
+  `rule_name`, `connector`, `agent`, `config_schema_version`) are rewritten
+  from the winning rule through the same `materialize` creation uses. The
+  record object stays: `room_kind`, `participants` and `created_at` describe
+  the room and the birth, not the rule; session-scoped fields (`session_id`,
+  `paused`, the watermark) and the lifecycle clocks are untouched. Same room,
+  same session, same idle clock — a paused record is re-materialized paused.
+- No rule wins, or the winner names an agent that no longer exists →
+  **expire**, through the removal path's shared tail (jobs cancelled), with
+  the session id on the AUDIT line every released session gets
+  (`session_release.py`).
+- A state file whose connector is no longer in `config.yaml` is reconciled
+  too: one AUDIT line per record, then the file is removed. Nothing would
+  ever open it again.
+
+Boot has no operator to ask, so it applies the plan and logs it — one summary
+line, plus one line per record that changed. The preview is `config reload
+--dry-run` (next increment), which renders the same plan without acting.
+This is affordable because a lost session is recoverable in practice: the
+platform keeps every message in the room, and history handoff re-feeds recent
+context on the next session. Whether the *backend* still has the session is
+backend-dependent (reclamation asks `delete_session`; OpenCode honours it,
+Claude does not support it), which is why the id is always logged.
 
 One part of that is **not** deferrable, because it is about resuming a session
 rather than detecting drift. A record stores the agent *name* and a
@@ -915,10 +951,11 @@ difference — rather than a value that silently changes meaning on the next
 sweep. An operator can then see what a config change did, which the silent
 version cannot offer.
 
-So the config-reload capability owns rule updates, and this section owns only
-the reading: **the sweep reads what the record carries.** Until reload exists,
-a rule edit reaches existing watchers by the blunt route — expire the watcher,
-let the next message recreate it against the current rule.
+So reconciliation (§2.4) owns rule updates — at boot, and at `config
+reload` — and this section owns only the reading: **the sweep reads what the
+record carries.** Between reconciliations a rule edit reaches an existing
+watcher only by the blunt route — expire the watcher, let the next message
+recreate it against the current rule.
 
 **One ordering constraint is not optional, whatever the arithmetic does:** the
 first expiry sweep must not run until the startup replay (§2.2) has finished.
@@ -1832,14 +1869,14 @@ on-disk records persist, and boot then eagerly starts every room ever seen.
 
 **Accepted:**
 
-- **Rule edits do not affect existing watchers — for now.** A watcher keeps
-  its materialized config until it expires. This is the price of sticky
-  binding, and it is what prevents a rule edit from stealing a room or
-  overriding a pause. **Automatic rebinding on config change is planned and
-  deliberately out of scope here**; storing the originating rule at creation
-  (§2.4) is groundwork for it, so the follow-up is unblocked rather than
-  merely postponed. Until then, operators force a rebind per room with
-  `expire`, at the cost of that room's conversational continuity.
+- **Rule edits reach existing watchers only at a reconciliation.** Between
+  a boot and the next, a watcher keeps its materialized config; a rule edit
+  cannot steal a running room or override a pause mid-flight. At boot (and at
+  `config reload`) every record is reconciled against the current rules
+  (§2.4): re-materialized where its rule changed or a different rule now wins
+  its room, expired where no rule covers it. An operator who wants a rebind
+  *now*, without a restart, still has `expire`, at the cost of that room's
+  conversational continuity — until `config reload` lands.
 - **`list` output becomes dynamic.** There is no longer a static set of
   watchers derivable from `config.yaml`; the answer to "what is being
   watched" is runtime state, so tooling must query the daemon. `agent-chat-gateway list`

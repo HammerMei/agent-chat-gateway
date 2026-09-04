@@ -5,8 +5,10 @@ derived from a room, and conflating any two of them has already been the source 
 defects, so they are named here once:
 
 * **the key** — `(connector, room_id)`. Sticky: once a watcher exists for a key it stays
-  bound to it until it expires, and editing or deleting the rule that created it neither
-  rebinds nor destroys it (§2.4).
+  bound to it until it expires, and between reconciliations editing or deleting the rule
+  that created it neither rebinds nor destroys it (§2.4). A reconciliation — every boot,
+  every `config reload`; see `reconcile.py` — re-matches the record against the current
+  rules and re-materializes or expires it.
 * **the label** — `<connector>-<room label>`, cosmetic, for display and CLI. Free to
   change, free to be ugly. It is deliberately *not* a path component and *not* a lookup
   key; filesystem paths key on a digest (`gateway/core/paths.py`) precisely so the label
@@ -333,6 +335,28 @@ def _digest(room_id: str) -> str:
     return hashlib.sha256(room_id.encode()).hexdigest()[:_GROUP_DM_LABEL_DIGITS]
 
 
+def rule_bound_fields(
+    wc: WatcherConfig,
+    rule: WatcherRule,
+    *,
+    connector_name: str,
+    agent_name: str,
+) -> dict:
+    """The frozen fields that derive from the rule (§2.4) — the part of a
+    record a reconciliation rewrites when a different rule, or a changed one,
+    wins the room. One writer for creation and re-materialization: two
+    hand-built dicts drift the day a field is added.
+    """
+    return {
+        "connector": connector_name,
+        "agent": agent_name,
+        "config": _jsonable(wc),
+        "rule_name": rule.name,
+        "rule": rule_snapshot(rule),
+        "config_schema_version": CONFIG_SCHEMA_VERSION,
+    }
+
+
 def creation_provenance(
     wc: WatcherConfig,
     rule: WatcherRule,
@@ -356,15 +380,10 @@ def creation_provenance(
     return {
         "room_kind": room.kind.value,
         "participants": list(room.participants),
-        "connector": connector_name,
-        "agent": agent_name,
         "created_at": now,
         "last_activity_at": now,
         "dropped_at": dropped_at,
-        "config": _jsonable(wc),
-        "rule_name": rule.name,
-        "rule": rule_snapshot(rule),
-        "config_schema_version": CONFIG_SCHEMA_VERSION,
+        **rule_bound_fields(wc, rule, connector_name=connector_name, agent_name=agent_name),
     }
 
 

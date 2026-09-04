@@ -481,11 +481,10 @@ def _check_state_orphans(config: GatewayConfig, result: ValidationResult) -> Non
             msg = (
                 f"State file '{path.name}' belongs to connector "
                 f"'{file_connector}', which is not in config.yaml. Its "
-                f"{len(states)} saved watcher(s) are being ignored — nothing "
-                "reads that file, and nothing deletes it either, so their "
-                f"sessions are left unused. Add '{file_connector}' back to "
-                "config.yaml to use them again, or delete the file yourself "
-                "if you do not want them."
+                f"{len(states)} saved watcher(s) will be released at the next "
+                "start: each session id is written to the log and the file is "
+                f"removed. Add '{file_connector}' back to config.yaml first if "
+                "you want to keep them."
             )
             result.warnings.append(msg)
             result.findings.append(

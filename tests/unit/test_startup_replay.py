@@ -535,10 +535,11 @@ class TestBootValidatesRoomScope(unittest.IsolatedAsyncioTestCase):
         mgr._cancel_jobs.assert_called_once()
         self.assertEqual(mgr._cancel_jobs.call_args.args[0], "r-old",
                          "the removal path's tail: a room nobody serves keeps no jobs")
-        self.assertTrue(
-            any("sess-old-team-1234" in line for line in logs.output),
-            "the full session id is what an operator searches for afterwards",
-        )
+        # The full session id is on the AUDIT line the (here mocked) lifecycle
+        # emits when it reclaims — asserted with a real lifecycle in
+        # test_boot_reconciliation; this seam only sees that the reclaim was asked.
+        self.assertTrue(any("not available to this connector" in line for line in logs.output),
+                        logs.output)
 
     async def test_the_replay_reclaims_a_dormant_room_before_probing_it(self):
         """The replay's own recreation site. The room is resolved BEFORE the

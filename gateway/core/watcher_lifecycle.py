@@ -23,7 +23,9 @@ from .message_processor import MessageProcessor
 from .paths import room_path_key, watcher_prompt_key
 from .permission import PermissionRegistry
 from .session_maps import SessionMaps
+from .session_release import log_session_released
 from .state import (
+    FROZEN_AT_CREATION_FIELDS,
     StateFilter,
     WatcherState,
     backend_identity,
@@ -214,6 +216,7 @@ class WatcherLifecycle:
                 "its room to serve the room again (a fresh session starts on "
                 "its first message)", name,
             )
+            self.release_session(persisted[name], "static-era record pruned at boot")
         for name, ws in persisted.items():
             if (ws.rule_name or ws.config) and name not in self._room_of:
                 self._hydrate(ws)
@@ -537,6 +540,7 @@ class WatcherLifecycle:
                 return False
 
             await self._reclaim_record_locked(name, state)
+            self.release_session(state, "idle past session_expire_days")
             logger.info(
                 "Watcher '%s' expired after %s day(s) idle — session and "
                 "record reclaimed; the room's next message creates a fresh "
@@ -838,6 +842,7 @@ class WatcherLifecycle:
                         name, room_id, reason,
                     )
                 await self._reclaim_record_locked(name, record)
+                self.release_session(record, reason)
                 logger.info(
                     "Watcher '%s' reclaimed — %s; re-adding the bot to room "
                     "%s starts fresh, with no continuity",
@@ -1103,6 +1108,7 @@ class WatcherLifecycle:
             old_session_id = state.session_id
             if old_session_id:
                 self._injector.reset_session(old_session_id)
+                self.release_session(state, "reset by operator")
             state.session_id = ""
             state.context_injected = False
 
@@ -1367,6 +1373,37 @@ class WatcherLifecycle:
     def processor_named(self, name: str) -> MessageProcessor | None:
         """The live processor for a watcher name, or None when not resident."""
         return self._processor_named(name)
+
+    def release_session(self, state: WatcherState, reason: str) -> None:
+        """The one AUDIT line for a session this lifecycle lets go of (#143).
+
+        Every path that discards or replaces a record's session calls this —
+        expiry, reclamation, reset, the static-era prune — so the full id is
+        always findable under one grep, whichever path took it.
+        """
+        log_session_released(
+            logger,
+            connector=state.connector or self._state_store.state_name,
+            room_id=state.room_id,
+            watcher=state.watcher_name,
+            agent=state.agent,
+            session_id=state.session_id,
+            reason=reason,
+        )
+
+    def rematerialize(self, record: WatcherState, fields: dict) -> None:
+        """Rewrite a record's rule-derived frozen fields in place (§2.4).
+
+        The record object stays — its session, pause, watermark and clocks are
+        untouched and every index still points at it. Nothing is saved here;
+        the caller saves once for the whole reconciliation.
+        """
+        stray = set(fields) - FROZEN_AT_CREATION_FIELDS
+        if stray:
+            raise ValueError(
+                f"re-materialization may only rewrite frozen fields, not {sorted(stray)}")
+        for name, value in fields.items():
+            setattr(record, name, value)
 
     def states(self) -> dict[str, WatcherState]:
         """The in-memory records, BY WATCHER NAME — a view built on each call.
@@ -1819,7 +1856,7 @@ class WatcherLifecycle:
             # is the only place the abandoned id survives — and the one use it has left
             # is being pasted into the backend's own resume command.
             logger.warning(
-                "Watcher '%s': not reusing session %s — %s. Starting a fresh session; "
+                "Watcher '%s': not reusing session=%s — %s. Starting a fresh session; "
                 "the previous conversation stays in the backend it was created against "
                 "and can be resumed there by hand with this id. "
                 "Expected after changing an agent's type or working_directory.",
