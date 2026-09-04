@@ -555,6 +555,8 @@ class SessionManager:
                     action.room_id,
                     reason=f"reconciliation: {action.reason}",
                     expected=record,
+                    job_reason="its watcher was expired by reconciliation — no "
+                               "rule in config.yaml covers the room any more",
                 )
             finally:
                 self._lifecycle._exit_verb()
@@ -847,7 +849,7 @@ class SessionManager:
 
     async def _reclaim_removed_room(
         self, room_id: str, *, reason: str, expected=None,
-        require_dormant: bool = False,
+        require_dormant: bool = False, job_reason: str | None = None,
     ) -> None:
         """The removal path's shared tail: reclaim the record, cancel its jobs.
 
@@ -887,7 +889,10 @@ class SessionManager:
                 # had left. Found by the sweep. A room-id job is cancellable by
                 # its room alone; only a pre-schema-2 job needs the handle, and
                 # with no record there is none to give.
-                self._cancel_jobs(room_id, name or "")
+                if job_reason is None:
+                    self._cancel_jobs(room_id, name or "")
+                else:
+                    self._cancel_jobs(room_id, name or "", reason=job_reason)
             except Exception:
                 logger.exception(
                     "Could not cancel scheduled jobs for reclaimed watcher "

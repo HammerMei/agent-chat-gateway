@@ -17,6 +17,7 @@ daemon.py and cli.py interface is unchanged:
 """
 
 import asyncio
+import json
 import logging
 import os
 from dataclasses import dataclass
@@ -331,8 +332,9 @@ class GatewayService:
                 # the exemption itself: a job records the room it targets and can
                 # resurrect it, so there is no record to protect on its behalf.
                 cancel_jobs=(
-                    lambda room_id, legacy_handle, _cn=cc.name: self._cancel_jobs_for(
-                        _cn, room_id, legacy_handle=legacy_handle)
+                    lambda room_id, legacy_handle, _cn=cc.name, reason=None:
+                        self._cancel_jobs_for(
+                            _cn, room_id, legacy_handle=legacy_handle, reason=reason)
                 ),
             )
             self._entries.append(
@@ -354,7 +356,8 @@ class GatewayService:
         )
 
     def _cancel_jobs_for(
-        self, connector_name: str, room_id: str, *, legacy_handle: str
+        self, connector_name: str, room_id: str, *, legacy_handle: str,
+        reason: str | None = None,
     ) -> None:
         """Cancel every scheduled job targeting a reclaimed room (§2.7).
 
@@ -418,14 +421,18 @@ class GatewayService:
 
             doomed = [j for j in self._job_store.list_jobs()
                       if _claims_this_room(j)]
+            removed = reason is None
+            reason = reason or "the bot was removed from the room, so the job could never deliver"
             for job in doomed:
-                reason = "the bot was removed from the room, so the job could never deliver"
                 self._job_store.cancel(job.id, reason=reason)
                 logger.warning(
                     "AUDIT: cancelled scheduled job %s (watcher '%s', room %s, "
-                    "connector '%s') — %s. The record is kept; "
-                    "'agent-chat-gateway schedule resume %s' restores it.",
-                    job.id, job.watcher, room_id, job.connector, reason, job.id,
+                    "connector '%s') — %s. The record is kept; %s",
+                    job.id, job.watcher, room_id, job.connector, reason,
+                    (f"'agent-chat-gateway schedule resume {job.id}' restores it."
+                     if removed else
+                     "no rule recreates this room's watcher, so recreate the "
+                     "job once a rule covers the room again."),
                 )
         except Exception as e:
             logger.warning(
@@ -534,6 +541,21 @@ class GatewayService:
         """
         for path, name in orphaned_state_files(e.name for e in self._entries):
             records = load_state(name)  # format already preflighted in __init__
+            try:
+                raw_count = len(json.loads(path.read_text()).get("watchers", []))
+            except (OSError, ValueError, AttributeError):
+                raw_count = -1
+            if raw_count != len(records):
+                # `load_state` skips a malformed record with a warning. Deleting
+                # the file would delete that record's only session reference
+                # without a line saying so; keep the file and say why.
+                logger.warning(
+                    "Orphaned state file %s kept: %d of its record(s) could not be "
+                    "parsed and would be lost without a trace — fix or delete the "
+                    "file by hand (connector '%s' is no longer configured)",
+                    path.name, (raw_count - len(records)) if raw_count >= 0 else -1, name,
+                )
+                continue
             try:
                 path.unlink()
             except OSError as exc:

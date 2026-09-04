@@ -67,3 +67,23 @@ class TestOrphanedStateFiles(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(any("AUDIT: session released" in line for line in logs.output),
                          "a release that did not happen is not announced")
         self.assertTrue(any("remain until the next start" in line for line in logs.output))
+
+    async def test_a_file_with_a_record_that_does_not_parse_is_kept(self):
+        from gateway.service import GatewayService
+
+        good = {"watcher_name": "ghost:ok", "session_id": "sess-ghost-ok",
+                "room_id": "r-ok", "connector": "ghost", "agent": "default",
+                "rule_name": "eng", "rule": {"name": "eng"},
+                "config": {"name": "ghost:ok", "connector": "ghost", "room": "ok", "agent": "default"}}
+        malformed = dict(good, watcher_name="ghost:bad", session_id="sess-ghost-bad",
+                         room_id="r-bad", paused="yes please")  # not a bool: load_state skips it
+        self._write_state("ghost", [good, malformed])
+        service = GatewayService(write_gateway_config(self.tmp))
+
+        with self.assertLogs("agent-chat-gateway", level="WARNING") as logs:
+            service._reclaim_orphaned_state_files()
+
+        self.assertTrue((self.runtime / "state.ghost.json").exists(),
+                        "deleting it would lose sess-ghost-bad without a trace")
+        self.assertFalse(any("AUDIT: session released" in line for line in logs.output))
+        self.assertTrue(any("could not be parsed" in line for line in logs.output), logs.output)

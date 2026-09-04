@@ -300,3 +300,62 @@ class TestAnExpiryThatDidNotApplyIsLoud(IsolatedTestCase):
         row = await _listed(mgr, "eng-backend")
         self.assertEqual(row["session_id"], "sess-stuck", "still installed, honestly")
         self.assertTrue(any("could NOT be expired" in line for line in logs.output), logs.output)
+
+
+class TestAuditFollowsTheDurableStep(IsolatedTestCase):
+    """A release is announced only once it has actually happened (Codex on
+    #148, twice): after the prune is saved, after the new record is committed,
+    with the job cancellation told the real reason."""
+
+    async def test_a_static_prune_whose_save_fails_announces_nothing(self):
+        from unittest.mock import MagicMock
+
+        static = make_rule_derived_record(name="old-static", room_id="r-static",
+                                          connector="default", session_id="sess-static-fail",
+                                          rule_name="", rule={}, config={})
+        mgr, loaded = _booted([static], [])
+        mgr._lifecycle._state_store.save = MagicMock(side_effect=OSError("disk full"))
+
+        with loaded, self.assertLogs("agent-chat-gateway.core", level="INFO") as logs:
+            with self.assertRaises(OSError):
+                await mgr.sync_only()
+
+        self.assertEqual(_audit_lines(logs, "sess-static-fail"), [],
+                         "the record is still on disk; the next boot prunes it again")
+
+    async def test_a_failed_start_after_an_identity_change_keeps_the_old_id_unannounced(self):
+        from unittest.mock import AsyncMock
+
+        from gateway.config import AgentConfig
+
+        eng = make_rule(room="eng-backend", name="eng", agent="a")
+        record = make_record_from_rule(eng, ROOM, session_id="sess-kept-on-failure")
+        moved = make_rule(room="eng-backend", name="eng", agent="b")
+        config = make_core_config(agents={
+            "a": AgentConfig(), "b": AgentConfig(working_directory="/elsewhere")})
+        mgr, loaded = _booted([record], [moved], config=config)
+        mgr._lifecycle._agents["b"].create_session = AsyncMock(side_effect=RuntimeError("backend down"))
+
+        with loaded, self.assertLogs("agent-chat-gateway.core", level="INFO") as logs:
+            await mgr.sync_only()  # the eager start fails; boot survives it
+
+        self.assertEqual(_audit_lines(logs, "sess-kept-on-failure"), [],
+                         "the prior record was rolled back with its id — nothing was released")
+        row = await _listed(mgr, "eng-backend")
+        self.assertEqual(row["session_id"], "sess-kept-on-failure")
+
+    async def test_jobs_of_a_reconciled_away_room_are_cancelled_for_the_right_reason(self):
+        from unittest.mock import MagicMock
+
+        eng = make_rule(room="eng-backend", name="eng", agent="a")
+        record = make_record_from_rule(eng, ROOM, session_id="sess-jobs",
+                                       dropped_at="2026-09-01T01:00:00-07:00")
+        mgr, loaded = _booted([record], [])
+        mgr._cancel_jobs = MagicMock()
+
+        with loaded:
+            await mgr.sync_only()
+
+        mgr._cancel_jobs.assert_called_once()
+        self.assertEqual(mgr._cancel_jobs.call_args.args[0], "eng-backend")
+        self.assertIn("reconciliation", mgr._cancel_jobs.call_args.kwargs["reason"])

@@ -216,12 +216,16 @@ class WatcherLifecycle:
                 "its room to serve the room again (a fresh session starts on "
                 "its first message)", name,
             )
-            self.release_session(persisted[name], "static-era record pruned at boot")
         for name, ws in persisted.items():
             if (ws.rule_name or ws.config) and name not in self._room_of:
                 self._hydrate(ws)
 
         self._state_store.save(self._by_name(), prune=prune)
+        # Released only once the prune is durable: a save that raises leaves
+        # the records on disk, and announcing them released would repeat the
+        # same ids at every failing boot.
+        for name in sorted(prune):
+            self.release_session(persisted[name], "static-era record pruned at boot")
         return errors
 
     # ── Two identities, one index ─────────────────────────────────────────────
@@ -1797,6 +1801,12 @@ class WatcherLifecycle:
             agent_name,
             session_id[:8],
         )
+        if state is not None and state.session_id and state.session_id != session_id:
+            # Only now is the old id gone from the record (#143): everything
+            # above could still have rolled the prior record back, id intact.
+            # `_provision_session` logged why it was not reused.
+            self.release_session(
+                state, "abandoned at provisioning — backend identity or room changed")
 
     async def _provision_session(
         self,
@@ -1864,8 +1874,9 @@ class WatcherLifecycle:
             # The gateway lets go of this id: it is not deleted anywhere — the
             # conversation stays in the backend it was created against and can be
             # resumed there by hand — but the record is about to be overwritten
-            # with the new session, so it gets the same AUDIT line every released
-            # session gets (#143, owner's call on PR #148).
+            # with the new session. The AUDIT line every released session gets
+            # (#143) is emitted by `start_watcher_in_room` once the new record is
+            # committed: a start that fails rolls the old record back, id intact.
             logger.warning(
                 "Watcher '%s': not reusing session=%s — %s. Starting a fresh session; "
                 "the previous conversation stays in the backend it was created against "
@@ -1873,7 +1884,6 @@ class WatcherLifecycle:
                 "Expected after changing an agent's type or working_directory.",
                 wc.name, state.session_id, why,
             )
-            self.release_session(state, f"abandoned at provisioning — {why}")
         session_title = (
             f"{agent_cfg.session_prefix}:{wc.room}"
             if agent_cfg.session_prefix
