@@ -27,7 +27,13 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterable, Literal
 
-from .state import WatcherState, connector_name_of, room_kind_or_channel, state_files
+from .state import (
+    CONFIG_SCHEMA_VERSION,
+    WatcherState,
+    connector_name_of,
+    room_kind_or_channel,
+    state_files,
+)
 from .watcher_manager import (
     RoomRef,
     first_matching_rule,
@@ -119,9 +125,34 @@ def rematerialized_fields(record: WatcherState, rule: WatcherRule) -> dict:
     )
 
 
-NAMELESS = "no room name recorded — cannot re-match, left as it is"
-UNKNOWN_KIND = "room kind {kind!r} is not one this build knows — cannot re-match, left as it is"
 _KNOWN_KINDS = frozenset(k.value for k in RoomKind)
+
+
+def unmatchable_reason(record: WatcherState) -> str | None:
+    """Why this record cannot be re-matched honestly — or None if it can.
+
+    The one place that decides it (three conditions found one review round at
+    a time; the fourth belongs here, not in a fourth `if`). A record that
+    fails is **kept** with the reason: the runtime degrades these cases to
+    something workable (an unknown or missing kind reads as CHANNEL, a wake
+    resolves a nameless room through the connector), which is fine for a
+    path that cannot destroy anything and wrong for one that expires.
+
+    * no `room_kind` recorded — the runtime's CHANNEL fallback would judge a
+      DM as a channel;
+    * a `room_kind` this build does not know — same;
+    * a named room with no name — the matcher deliberately does not fall
+      back to the opaque id.
+    """
+    if not record.room_kind:
+        return "no room kind recorded — cannot re-match, left as it is"
+    if record.room_kind not in _KNOWN_KINDS:
+        return (f"room kind {record.room_kind!r} is not one this build knows — "
+                f"cannot re-match, left as it is")
+    if (RoomKind(record.room_kind) not in (RoomKind.DM, RoomKind.GROUP_DM)
+            and not record.room_name):
+        return "no room name recorded — cannot re-match, left as it is"
+    return None
 
 
 def orphaned_state_files(configured: Iterable[str]) -> list[tuple[Path, str]]:
@@ -148,10 +179,8 @@ def reconcile_records(
     — config loading refuses one that does not — so no agent check is needed
     here). Static-era records (neither `rule_name` nor `config`) are not this
     module's — boot prunes them before reconciling — and are skipped. A record
-    that cannot be re-matched honestly — a named room with no name recorded
-    (the matcher deliberately does not fall back to the opaque id), or a room
-    kind this build does not know — is kept as it is, with the reason:
-    "nothing matches" is destructive here.
+    that cannot be re-matched honestly (`unmatchable_reason`) is kept as it
+    is, with the reason: "nothing matches" is destructive here.
     """
     plan = ReconcilePlan(connector=connector)
     for record in records:
@@ -164,21 +193,12 @@ def reconcile_records(
             session_id=record.session_id,
             from_rule=record.rule_name,
         )
-        # A kind this build does not know is degraded to CHANNEL everywhere
-        # else, which is fine for a runtime fallback and wrong for a match
-        # that can expire the record: a DM whose kind was garbled must not be
-        # judged as a channel. Kept, with the reason, like a nameless room.
-        if record.room_kind and record.room_kind not in _KNOWN_KINDS:
+        unmatchable = unmatchable_reason(record)
+        if unmatchable:
             plan.actions.append(RecordAction(
-                action="keep", reason=UNKNOWN_KIND.format(kind=record.room_kind),
-                to_rule=record.rule_name, **common))
+                action="keep", reason=unmatchable, to_rule=record.rule_name, **common))
             continue
-        room = room_ref_of(record)
-        if room.kind not in (RoomKind.DM, RoomKind.GROUP_DM) and not room.name:
-            plan.actions.append(RecordAction(
-                action="keep", reason=NAMELESS, to_rule=record.rule_name, **common))
-            continue
-        winner = first_matching_rule(rules, connector, room)
+        winner = first_matching_rule(rules, connector, room_ref_of(record))
         if winner is None:
             plan.actions.append(RecordAction(
                 action="expire", reason="no-rule-matches", **common))
@@ -190,6 +210,10 @@ def reconcile_records(
             record.rule_name == winner.name
             and frozen is not None
             and snapshot_digest(frozen) == snapshot_digest(rule_snapshot(winner))
+            # The per-record schema marker exists for exactly this: a build
+            # that changed what a config field means rewrites every record
+            # once, not only the ones whose rule happened to change too.
+            and record.config_schema_version == CONFIG_SCHEMA_VERSION
         )
         plan.actions.append(RecordAction(
             action="keep" if unchanged else "rematerialize",

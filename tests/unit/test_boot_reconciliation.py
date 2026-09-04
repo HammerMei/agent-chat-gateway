@@ -414,3 +414,59 @@ class TestRecordsThatCannotBeReMatchedHonestly(IsolatedTestCase):
         row = await _listed(mgr, "eng-backend")
         self.assertEqual(row["connector"], "default")
         self.assertEqual(mgr._lifecycle.record_for_room("eng-backend").connector, "default")
+
+    async def test_a_record_with_no_room_kind_is_kept_too(self):
+        eng = make_rule(room="eng-backend", name="eng", agent="a")
+        record = make_record_from_rule(eng, ROOM, session_id="sess-no-kind",
+                                       dropped_at="2026-09-01T01:00:00-07:00")
+        record.room_kind = ""
+        mgr, loaded = _booted([record], [])
+
+        with loaded, self.assertLogs("agent-chat-gateway.core.session_manager", level="WARNING") as logs:
+            await mgr.sync_only()
+
+        self.assertEqual((await _listed(mgr, "eng-backend"))["session_id"], "sess-no-kind")
+        self.assertTrue(any("no room kind recorded" in line for line in logs.output), logs.output)
+
+    async def test_a_record_from_an_older_config_schema_is_rewritten(self):
+        eng = make_rule(room="eng-backend", name="eng", agent="a")
+        record = make_record_from_rule(eng, ROOM, session_id="sess-old-schema",
+                                       dropped_at="2026-09-01T01:00:00-07:00")
+        record.config_schema_version = 0  # written by a build with an older materialization
+        mgr, loaded = _booted([record], [eng])  # the rule itself is unchanged
+
+        with loaded, self.assertLogs("agent-chat-gateway.core.session_manager", level="INFO") as logs:
+            await mgr.sync_only()
+
+        from gateway.core.state import CONFIG_SCHEMA_VERSION
+        self.assertEqual(mgr._lifecycle.record_for_room("eng-backend").config_schema_version,
+                         CONFIG_SCHEMA_VERSION)
+        self.assertTrue(any("re-materialized from rule 'eng' to rule 'eng'" in line
+                            for line in logs.output), logs.output)
+
+
+class TestAbandonedIdsAreAuditedOnEveryPathThatReplacesTheRecord(IsolatedTestCase):
+
+    async def test_a_subscription_failure_that_keeps_the_new_record_still_audits_the_old_id(self):
+        """This failure path deliberately installs the NEW record (session and
+        context flag preserved for the next start), so the old id is gone from
+        the index even though the start failed."""
+        from unittest.mock import AsyncMock
+
+        from gateway.config import AgentConfig
+
+        eng = make_rule(room="eng-backend", name="eng", agent="a")
+        record = make_record_from_rule(eng, ROOM, session_id="sess-old-on-subfail")
+        moved = make_rule(room="eng-backend", name="eng", agent="b")
+        config = make_core_config(agents={
+            "a": AgentConfig(), "b": AgentConfig(working_directory="/elsewhere")})
+        mgr, loaded = _booted([record], [moved], config=config)
+        mgr._connector.subscribe_room = AsyncMock(side_effect=RuntimeError("subscribe down"))
+
+        with loaded, self.assertLogs("agent-chat-gateway.core", level="INFO") as logs:
+            await mgr.sync_only()  # the eager start fails at subscription; boot survives
+
+        lines = _audit_lines(logs, "sess-old-on-subfail")
+        self.assertEqual(len(lines), 1, logs.output)
+        self.assertNotEqual(mgr._lifecycle.record_for_room("eng-backend").session_id,
+                            "sess-old-on-subfail", "the new record is what remains")

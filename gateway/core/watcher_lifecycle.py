@@ -1378,6 +1378,19 @@ class WatcherLifecycle:
         """The live processor for a watcher name, or None when not resident."""
         return self._processor_named(name)
 
+    def _release_if_abandoned(self, prior: "WatcherState | None", session_id: str) -> None:
+        """The AUDIT line for a stored id `_provision_session` did not reuse.
+
+        Called at the two points where the prior record has actually been
+        replaced — a start that committed, and a subscription failure that
+        keeps the new record (#143): before either, a failure rolls the prior
+        record back with its id intact and nothing was released.
+        `_provision_session` logged why the id was not reused.
+        """
+        if prior is not None and prior.session_id and prior.session_id != session_id:
+            self.release_session(
+                prior, "abandoned at provisioning — backend identity or room changed")
+
     def release_session(self, state: WatcherState, reason: str) -> None:
         """The one AUDIT line for a session this lifecycle lets go of (#143).
 
@@ -1771,6 +1784,10 @@ class WatcherLifecycle:
                 ws.context_injected = False
             self._install(ws)
             self._maps.remove_session(session_id)
+            # The prior record is gone from the index either way — `ws` is
+            # what the next start reads — so an id provisioning abandoned is
+            # abandoned here too (#143), even though this start failed.
+            self._release_if_abandoned(state, session_id)
             raise
 
         # 9. Activate processor — starts the consumer loop and emits the
@@ -1802,12 +1819,7 @@ class WatcherLifecycle:
             agent_name,
             session_id[:8],
         )
-        if state is not None and state.session_id and state.session_id != session_id:
-            # Only now is the old id gone from the record (#143): everything
-            # above could still have rolled the prior record back, id intact.
-            # `_provision_session` logged why it was not reused.
-            self.release_session(
-                state, "abandoned at provisioning — backend identity or room changed")
+        self._release_if_abandoned(state, session_id)
 
     async def _provision_session(
         self,
