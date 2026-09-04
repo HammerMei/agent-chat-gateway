@@ -221,6 +221,10 @@ class VoiceConnector(Connector):
     async def resolve_room(self, room_name: str) -> Room:
         return Room(id=room_name, name=room_name, type="channel")
 
+    def supports_room_lookup(self) -> bool:
+        """See `Connector.supports_room_lookup` — the identity lookup below is an answer, not a shrug."""
+        return True
+
     async def room_ref_by_id(self, room_id: str) -> "RoomRef | None":
         """See `Connector.room_ref_by_id`.
 

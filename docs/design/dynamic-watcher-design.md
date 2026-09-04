@@ -380,6 +380,36 @@ Two consequences that are not obvious and were each got wrong once:
   the ts filter suppresses nothing and only the bounded id window separates the
   two passes.
 
+* **Boot resolves a room through the connector before recreating a watcher
+  from its record.** A record's stored room fields say what the room was when
+  the record was written, not whether this connector still serves it: a
+  Mattermost connector whose `server.team` changed under an unchanged name, or
+  an account removed from a room, leaves those fields intact. `room_ref_by_id`
+  is the connector's own scope check and the wake path already goes through
+  it; both boot recreation sites — the lifecycle evaluation and the startup
+  replay — do the same, after asking `supports_room_lookup()`: the base
+  `room_ref_by_id` answers `None` for a connector with no id lookup, which must
+  not read as "gone" on a path that destroys the record, so such a connector
+  keeps the pre-lookup behaviour. `None` (gone, another team, no longer a member)
+  reclaims the record through the removal path's shared tail (jobs cancelled,
+  same end state as the bot being removed) with the full session id in the
+  log — reclamation calls the backend's `delete_session`, which some
+  implementations honour (OpenCode deletes the session) and others do not
+  support (Claude keeps it), so the logged id is a recovery path only where
+  the backend keeps the session; a raise (could not ask) leaves the record
+  alone for this boot, and its
+  next live message resolves the room again. In the replay the lookup runs
+  *before* the history probe: a room the bot was removed from makes the probe
+  itself raise, and a probe failure is skipped as best-effort, so a check after
+  it would never reach exactly the rooms it exists for. Cost: the connector's
+  room lookup per record the boot would recreate — one subscription read on
+  Rocket.Chat; on Mattermost the channel read plus the account-wide membership
+  list, so roughly two serialized requests per record on top of the existing
+  history probe. Dormant records — paused, or idle with no gap — are not
+  resolved here; nothing recreates them at boot. A later wake resolves the room
+  itself (`_resolve_room_for_wake`); `resume` does not yet — it still rebuilds
+  the room from the record's stored fields, tracked as a separate gap (#145).
+
 The claim the drain makes is the one piece that is deliberately *not* a replay:
 the frames are handed to the room's worker immediately, and the claim only
 covers the case where the scalar watermark has already moved past them (above).

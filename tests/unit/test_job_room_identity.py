@@ -358,6 +358,24 @@ class TestEveryConnectorTypeCanBeResurrectedOrSaysItCannot(unittest.TestCase):
                     f"qualifier into docs/scheduling.md.",
                 )
 
+    def test_every_supported_type_declares_room_lookup_or_is_declared(self):
+        """The capability flag boot's destructive scope check asks first (#141):
+        a shipped connector that overrides `room_ref_by_id` but leaves the base
+        `supports_room_lookup` (False) would silently keep the pre-lookup
+        behaviour — its records would never be reclaimed for a room it no longer
+        serves. The two must move together."""
+        from gateway.core.connector import SUPPORTED_CONNECTOR_TYPES
+
+        for connector_type in SUPPORTED_CONNECTOR_TYPES:
+            with self.subTest(connector=connector_type):
+                cls = self._class_for(connector_type)
+                declares = cls.supports_room_lookup(cls.__new__(cls))
+                self.assertEqual(
+                    declares, connector_type not in self.CANNOT_RESURRECT,
+                    f"{connector_type}.supports_room_lookup() must agree with "
+                    f"whether it overrides room_ref_by_id",
+                )
+
     def test_a_declared_exception_is_not_secretly_overriding(self):
         """The other direction: a type listed as unable that DOES override is a
         stale declaration, and the docs would understate the connector."""
