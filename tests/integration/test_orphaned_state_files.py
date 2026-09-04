@@ -31,10 +31,9 @@ class TestOrphanedStateFiles(unittest.IsolatedAsyncioTestCase):
                        "room": "old-room", "agent": "default"},
         }])
         self._write_state("script", [])
-        service = GatewayService(write_gateway_config(self.tmp))
 
         with self.assertLogs("agent-chat-gateway", level="INFO") as logs:
-            service._reclaim_orphaned_state_files()
+            GatewayService(write_gateway_config(self.tmp))  # the sweep runs in __init__
 
         self.assertFalse((self.runtime / "state.ghost.json").exists(),
                          "nothing will ever open it again")
@@ -57,11 +56,9 @@ class TestOrphanedStateFiles(unittest.IsolatedAsyncioTestCase):
             "config": {"name": "ghost:old-room", "connector": "ghost",
                        "room": "old-room", "agent": "default"},
         }])
-        service = GatewayService(write_gateway_config(self.tmp))
-
         with patch("pathlib.Path.unlink", side_effect=OSError("read-only")), \
                 self.assertLogs("agent-chat-gateway", level="WARNING") as logs:
-            service._reclaim_orphaned_state_files()
+            GatewayService(write_gateway_config(self.tmp))
 
         self.assertTrue((self.runtime / "state.ghost.json").exists())
         self.assertFalse(any("AUDIT: session released" in line for line in logs.output),
@@ -78,12 +75,28 @@ class TestOrphanedStateFiles(unittest.IsolatedAsyncioTestCase):
         malformed = dict(good, watcher_name="ghost:bad", session_id="sess-ghost-bad",
                          room_id="r-bad", paused="yes please")  # not a bool: load_state skips it
         self._write_state("ghost", [good, malformed])
-        service = GatewayService(write_gateway_config(self.tmp))
 
         with self.assertLogs("agent-chat-gateway", level="WARNING") as logs:
-            service._reclaim_orphaned_state_files()
+            GatewayService(write_gateway_config(self.tmp))
 
         self.assertTrue((self.runtime / "state.ghost.json").exists(),
                         "deleting it would lose sess-ghost-bad without a trace")
         self.assertFalse(any("AUDIT: session released" in line for line in logs.output))
         self.assertTrue(any("could not be parsed" in line for line in logs.output), logs.output)
+
+    async def test_an_orphan_sharing_session_ids_with_a_live_file_does_not_block_the_boot(self):
+        """Renaming a connector by copying its state file leaves the old file behind
+        with the SAME session ids. The uniqueness preflight must see the fleet after
+        the sweep, or the boot is refused for records about to be released."""
+        from gateway.service import GatewayService
+
+        record = {"watcher_name": "x:room", "session_id": "sess-shared-1", "room_id": "r1",
+                  "connector": "x", "agent": "default", "rule_name": "w1", "rule": {"name": "w1"},
+                  "config": {"name": "x:room", "connector": "x", "room": "room", "agent": "default"}}
+        self._write_state("old-name", [record])
+        self._write_state("script", [dict(record, watcher_name="script:room", connector="script")])
+
+        GatewayService(write_gateway_config(self.tmp))  # no DuplicateSessionError
+
+        self.assertFalse((self.runtime / "state.old-name.json").exists())
+        self.assertTrue((self.runtime / "state.script.json").exists())

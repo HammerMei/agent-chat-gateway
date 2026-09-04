@@ -1391,6 +1391,7 @@ class WatcherLifecycle:
             room_id=state.room_id,
             watcher=state.watcher_name,
             agent=state.agent,
+            identity=state.backend_identity,
             session_id=state.session_id,
             reason=reason,
         )

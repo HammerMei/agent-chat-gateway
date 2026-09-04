@@ -275,6 +275,12 @@ class GatewayService:
         # version marker: an unreadable file must stop the boot, not be discovered as
         # an absence. See gateway/core/state.py.
         check_state_formats()
+        # Then let go of the files no configured connector owns (#143) — BEFORE the
+        # uniqueness preflight below scans every file: an orphan left by renaming a
+        # connector (state copied, old file kept) shares its session ids with the new
+        # file, and a preflight that still read the orphan would refuse the boot for
+        # records this sweep is about to release.
+        self._reclaim_orphaned_state_files({c.name for c in config.connectors})
         # Before anything is built: a state file binding one session to two rooms is a
         # cross-room leak waiting for both watchers to start (§4.1). The runtime check
         # in `bind_session` catches it too, but only once one of them is already
@@ -527,7 +533,7 @@ class GatewayService:
         if conflicts:
             raise DuplicateBotIdentityError("\n".join(conflicts))
 
-    def _reclaim_orphaned_state_files(self) -> None:
+    def _reclaim_orphaned_state_files(self, configured: set[str]) -> None:
         """Remove state files of connectors that are no longer configured (#143).
 
         Nothing opens `state.<name>.json` for a connector `config.yaml` no longer
@@ -539,7 +545,7 @@ class GatewayService:
         file is removed. Enumerates files on disk, as the validator does, so a
         renamed connector is found by its old file and not by config.
         """
-        for path, name in orphaned_state_files(e.name for e in self._entries):
+        for path, name in orphaned_state_files(configured):
             records = load_state(name)  # format already preflighted in __init__
             try:
                 raw_count = len(json.loads(path.read_text()).get("watchers", []))
@@ -575,6 +581,7 @@ class GatewayService:
                     room_id=record.room_id,
                     watcher=record.watcher_name,
                     agent=record.agent,
+                    identity=record.backend_identity,
                     session_id=record.session_id,
                     reason="connector-removed",
                 )
@@ -624,7 +631,6 @@ class GatewayService:
             # catch-up injections need processors), and it still does, below.
             if getattr(self, "_job_store", None) is not None:
                 self._job_store.load()
-                self._reclaim_orphaned_state_files()
 
             # 3. run_once() connects each SessionManager without blocking — the daemon
             #    loop below keeps the process alive.  We intentionally avoid sm.run()

@@ -359,3 +359,22 @@ class TestAuditFollowsTheDurableStep(IsolatedTestCase):
         mgr._cancel_jobs.assert_called_once()
         self.assertEqual(mgr._cancel_jobs.call_args.args[0], "eng-backend")
         self.assertIn("reconciliation", mgr._cancel_jobs.call_args.kwargs["reason"])
+
+
+class TestSessionlessRecordsReleaseNothing(IsolatedTestCase):
+
+    async def test_an_idle_record_that_never_had_a_session_is_expired_without_an_audit(self):
+        """A membership-add registers a record with no session; if its rule goes
+        before the room ever speaks, there is nothing to release — and saying
+        there was would be a false event."""
+        eng = make_rule(room="eng-backend", name="eng", agent="a")
+        record = make_record_from_rule(eng, ROOM, session_id="",
+                                       dropped_at="2026-09-01T01:00:00-07:00")
+        mgr, loaded = _booted([record], [])
+
+        with loaded, self.assertLogs("agent-chat-gateway.core", level="INFO") as logs:
+            await mgr.sync_only()
+
+        reply = await mgr.dispatch_command({"cmd": "list"})
+        self.assertEqual(reply["data"], [], "expired all the same")
+        self.assertFalse(any("AUDIT: session released" in line for line in logs.output), logs.output)
