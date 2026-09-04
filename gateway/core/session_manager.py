@@ -532,20 +532,24 @@ class SessionManager:
         if self._records_settled:
             return []
         errors = await self._lifecycle.sync_watchers(unavailable_agents=unavailable_agents)
-        await self._reconcile_records_at_boot()
+        await self._reconcile_records()
         self._records_settled = True
         return errors
 
-    async def _reconcile_records_at_boot(self) -> None:
+    async def _reconcile_records(self) -> list[str]:
         """Run the current rules over every hydrated record (§2.4, #143).
 
-        Applies the plan `reconcile_records` returns against a still fleet:
-        re-materialized records keep their object, session and clocks; expired
-        ones go through the removal path's shared tail, jobs included, with the
-        session id on the AUDIT line. A record the engine could not re-match
-        honestly is kept and said so. The plan is logged either way, as what
-        was actually applied, so a restart's effect on the fleet can be read
-        back.
+        Applies the plan `reconcile_records` returns: re-materialized records
+        keep their object, session and clocks; expired ones go through the
+        removal path's shared tail, jobs included, with the session id on the
+        AUDIT line. A record the engine could not re-match honestly is kept
+        and said so. The plan is logged either way, as what was actually
+        applied, so a restart's effect on the fleet can be read back.
+
+        Boot-independent: boot runs it over a still fleet from `settle_records`;
+        `config reload` runs it on a live manager through `reconcile_live`,
+        which then restarts the resident processors of the records this
+        rewrote — returned here by room id for exactly that.
         """
         plan = reconcile_records(
             self._lifecycle.states().values(),
@@ -562,16 +566,17 @@ class SessionManager:
         if not plan.changes:
             logger.info("Reconciliation (%s): %s — nothing to change",
                         self._connector_name, plan.summary())
-            return
+            return []
         rules_by_name = {r.name: r for r in self._watcher_rules}
-        rewritten = expired = 0
+        rewritten: list[str] = []
+        expired = 0
         for action in plan.changes:
             record = self._lifecycle.record_for_room(action.room_id)
             if record is None:
                 continue
             if action.action == "rematerialize":
                 self._apply_rematerialize(record, action, rules_by_name[action.to_rule])
-                rewritten += 1
+                rewritten.append(record.room_id)
                 continue
             try:
                 self._lifecycle._enter_verb("reclaim", action.room_id)
@@ -584,7 +589,142 @@ class SessionManager:
         if rewritten:
             self._lifecycle.save_state()
         logger.info("Reconciliation (%s): %s", self._connector_name,
-                    plan.format_counts(len(plan.of("keep")), rewritten, expired))
+                    plan.format_counts(len(plan.of("keep")), len(rewritten), expired))
+        return rewritten
+
+    # ── Config reload (#144) ─────────────────────────────────────────────────
+
+    def records(self) -> list[WatcherState]:
+        """This connector's in-memory records — what a reload plans over."""
+        return list(self._lifecycle.states().values())
+
+    def resident_watcher_names(self) -> set[str]:
+        """The watchers with a running processor — the ones a restart reaches."""
+        return {ws.watcher_name for ws in self._lifecycle.states().values()
+                if self._lifecycle.processor_for_room(ws.room_id) is not None}
+
+    def set_unavailable_agents(self, names: set[str]) -> None:
+        """Push the agents a reload could not start (or brought back) to the
+        lifecycle's fail-closed gate — boot wrote it once; a reload rewrites it."""
+        self._lifecycle.set_blocked_agents(names)
+
+    def replace_rules(self, rules: list[WatcherRule]) -> None:
+        """Take the candidate config's rules for this connector.
+
+        On a quiesced manager: both the router's list and the eager loop's
+        are replaced, so the next offered room and the next reconciliation
+        both read the new list.
+        """
+        self._watcher_rules = list(rules)
+        self._watcher_manager.replace_rules(self._watcher_rules)
+
+    async def quiesce(self, reason: str) -> None:
+        """Still this manager for a reload's apply window.
+
+        Refuses new transitions everywhere with `reason` — operator verbs are
+        refused outright, a room offer parks (retryable, see
+        `WatcherManager._park_if_reloading`) — waits out the ones in flight,
+        and stops the sweep so no pass overlaps the apply. Processors keep
+        running: a room whose agent is not being rebuilt keeps answering, and
+        the processors of an agent that IS are drained by `stop_watchers_on_agents`
+        before that backend stops. `rearm` is the inverse.
+        """
+        await self._watcher_manager.drain(reason)
+        await self._lifecycle.drain_verbs()
+        if self._sweep is not None:
+            await self._sweep.stop()
+
+    def rearm(self) -> None:
+        """Open the manager again after a reload's apply window."""
+        self._lifecycle.rearm_transitions()
+        if self._sweep is not None:
+            self._sweep.start()
+
+    async def reconcile_live(self) -> list[str]:
+        """Reconcile a RUNNING fleet against the rules just installed (#144).
+
+        Boot's reconciliation plus what a live fleet adds: a re-materialized
+        record with a resident processor is restarted, because that processor
+        was built from the config the record no longer carries; and on an
+        eager connector the new rules' literal rooms are started, since no
+        message will ever offer them. Called re-armed: the expiries go
+        through the verb barrier like every other reclamation, and a wake
+        racing a restart is serialized by the watcher lock. Returns the names
+        of the watchers it restarted, so a caller restarting processors for
+        another reason (an agent change) does not restart them twice.
+        """
+        rewritten = await self._reconcile_records()
+        restarted: list[str] = []
+        for room_id in rewritten:
+            try:
+                if await self._lifecycle.restart_resident(room_id):
+                    restarted.append(room_id)
+            except Exception as e:
+                logger.error(
+                    "Reconciliation (%s): the record for room %s was re-materialized "
+                    "but its processor could not be restarted — it stays down until "
+                    "its next message or 'resume': %s", self._connector_name, room_id, e,
+                )
+        errors: list[str] = []
+        await self._eager_start_rule_rooms(errors)
+        for msg in errors:
+            logger.error("Reconciliation (%s): %s", self._connector_name, msg)
+        return restarted
+
+    async def stop_watchers_on_agents(self, agents: set[str]) -> int:
+        """Drain and stop every resident processor bound to one of `agents` (#144).
+
+        The first half of a reload's agent restart, run BEFORE the backend
+        stops: a processor's stop drains its queue by processing it, so the
+        backend must still be alive for the drain to be a drain and not a
+        string of failures posted to the room. Returns how many stopped.
+        """
+        stopped = 0
+        for record in self.records():
+            if record.agent not in agents:
+                continue
+            try:
+                stopped += await self._lifecycle.stop_resident(record.room_id)
+            except Exception as e:
+                logger.error(
+                    "Connector '%s': watcher '%s' could not be stopped before agent "
+                    "'%s' restarts: %s", self._connector_name, record.watcher_name,
+                    record.agent, e,
+                )
+        return stopped
+
+    async def start_watchers_on_agents(
+        self, agents: set[str], *, exclude: set[str] = frozenset()
+    ) -> list[str]:
+        """Start every WAS-ACTIVE record on one of `agents` once its backend is
+        back (#144) — the second half of the agent restart.
+
+        Was-active is boot's own criterion (`_evaluate_lifecycle_at_boot`):
+        rule-derived, not paused, no `dropped_at`. That covers the processors
+        `stop_watchers_on_agents` just stopped AND the rooms an earlier reload
+        left down because the agent did not come up then — a fixed agent
+        brings its rooms back without a restart. An idle room stays idle: its
+        next message wakes it. `exclude` names rooms the reconciliation
+        already restarted. Sessions are kept; a changed backend identity is
+        settled by the start's own provisioning check, which logs the
+        abandoned id. Returns error strings, one per room that could not
+        come back.
+        """
+        errors: list[str] = []
+        for record in self.records():
+            if (record.agent not in agents or record.room_id in exclude
+                    or not (record.rule_name or record.config)
+                    or record.paused or record.dropped_at or not record.room_id):
+                continue
+            try:
+                await self._lifecycle.start_from_record(record.room_id)
+            except Exception as e:
+                msg = (f"Connector '{self._connector_name}': watcher "
+                       f"'{record.watcher_name}' could not be started after agent "
+                       f"'{record.agent}' changed: {e}")
+                logger.error(msg)
+                errors.append(msg)
+        return errors
 
     def _apply_rematerialize(
         self, record: WatcherState, action: RecordAction, rule: WatcherRule

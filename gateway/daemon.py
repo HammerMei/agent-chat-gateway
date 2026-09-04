@@ -273,7 +273,7 @@ def start_daemon(config_path: str) -> None:
 
     # Run the service — startup_fd is passed through so service.run() signals
     # the parent once the full startup sequence completes.
-    service = GatewayService(config)
+    service = GatewayService(config, config_path=config_path)
 
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)

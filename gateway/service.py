@@ -21,15 +21,19 @@ import json
 import logging
 import os
 from dataclasses import dataclass
+from pathlib import Path
 
 from .agents import AgentBackend, GatewayBrokerConfig, check_backend_signatures
 from .agents.claude import ClaudeBackend
 from .agents.opencode import OpenCodeBackend
-from .config import AgentConfig, GatewayConfig
+from .config import AgentConfig, ConnectorConfig, GatewayConfig
+from .config_diff import ConfigDiff, config_digest, diff_configs, redacted_config
+from .config_validate import finding_to_dict, validate_config
 from .connectors import connector_factory
 from .control import ControlServer
 from .core.bot_identity import (
     ConnectorIdentity,
+    ConnectorIdentityError,
     DmClaim,
     DuplicateBotIdentityError,
     dm_claims,
@@ -54,9 +58,21 @@ from .core.state import (
     check_session_uniqueness,
     check_state_formats,
     load_state,
+    now_iso,
+)
+from .reload_plan import (
+    SCOPE_REVALIDATION_NOTE,
+    Degraded,
+    ReloadPlan,
+    connector_removed_changes,
+    orphan_removals,
+    plan_connector_records,
 )
 
 logger = logging.getLogger("agent-chat-gateway.service")
+
+# What a lifecycle verb or a room wake is told while a reload applies (#144).
+RELOAD_IN_PROGRESS = "a config reload is in progress — retry when it finishes"
 
 
 def _build_agent_backend(agent_cfg: AgentConfig) -> AgentBackend:
@@ -134,8 +150,22 @@ class AgentRuntimeManager:
         Returns:
             List of human-readable error strings for any agent that failed.
         """
+        return await self.start_some(set(self._agents), registry, notifier, maps)
+
+    async def start_some(
+        self,
+        names: set[str],
+        registry: PermissionRegistry,
+        notifier: "ConnectorPermissionNotifier",
+        maps: SessionMaps,
+    ) -> list[str]:
+        """`start_all` for a subset — what `config reload` starts after it has
+        stopped and rebuilt the agents whose definition changed (#144). The
+        unavailable set is updated for exactly these names: a failure adds,
+        a success removes."""
         errors: list[str] = []
         failed_backends: set[str] = set()
+        starting = {name: self._agents[name] for name in names if name in self._agents}
 
         # Phase 1: start backends
         async def _start_backend(
@@ -148,7 +178,7 @@ class AgentRuntimeManager:
                 return name, e
 
         backend_results = await asyncio.gather(
-            *[_start_backend(name, backend) for name, backend in self._agents.items()]
+            *[_start_backend(name, backend) for name, backend in starting.items()]
         )
         for name, err in backend_results:
             if err is not None:
@@ -183,7 +213,7 @@ class AgentRuntimeManager:
         broker_results = await asyncio.gather(
             *[
                 _start_broker(name, backend)
-                for name, backend in self._agents.items()
+                for name, backend in starting.items()
                 if name not in failed_backends
             ]
         )
@@ -212,27 +242,49 @@ class AgentRuntimeManager:
                     e,
                 )
 
-        self._unavailable = failed_backends | failed_broker_agents
+        self._unavailable = (
+            (self._unavailable - set(starting)) | failed_backends | failed_broker_agents
+        )
         return errors
 
     async def stop_all(self) -> None:
         """Stop all brokers and backends (reverse of start order)."""
-        for name, broker in self._brokers.items():
+        await self.stop_some(set(self._agents))
+
+    async def stop_some(self, names: set[str]) -> None:
+        """Stop the brokers and backends of `names` (reverse of start order).
+
+        Idempotent per the backend contract; an agent not in the dict is
+        skipped. `config reload` calls this for the agents it is about to
+        rebuild or drop, and `stop_all` for everything at shutdown.
+        """
+        for name in [n for n in names if n in self._brokers]:
             try:
-                await broker.stop()
+                await self._brokers.pop(name).stop()
             except Exception as e:
                 logger.error("Error stopping broker for agent '%s': %s", name, e)
-        self._brokers.clear()
 
+        stopping = [(name, self._agents[name]) for name in names if name in self._agents]
         backend_results = await asyncio.gather(
-            *[backend.stop() for backend in self._agents.values()],
+            *[backend.stop() for _name, backend in stopping],
             return_exceptions=True,
         )
-        for (name, _backend), result in zip(
-            self._agents.items(), backend_results, strict=False
-        ):
+        for (name, _backend), result in zip(stopping, backend_results, strict=False):
             if isinstance(result, Exception):
                 logger.error("Error stopping backend for agent '%s': %s", name, result)
+
+    def replace(self, name: str, backend: AgentBackend | None) -> None:
+        """Install a rebuilt backend under `name`, or drop the agent (`None`).
+
+        Writes the dict the session managers hold — every lifecycle sees the
+        new object on its next start. The caller stops the old one first
+        (`stop_some`) and starts the new one after (`start_some`).
+        """
+        if backend is None:
+            self._agents.pop(name, None)
+            self._unavailable.discard(name)
+        else:
+            self._agents[name] = backend
 
     @property
     def unavailable_agents(self) -> set[str]:
@@ -247,11 +299,20 @@ class AgentRuntimeManager:
 
 @dataclass
 class ConnectorEntry:
-    """A single connector instance paired with its dedicated SessionManager."""
+    """A single connector instance paired with its dedicated SessionManager.
+
+    `degraded` is set by `config reload` on an entry it could not bring back
+    (#144): the connector failed to connect or to start its watchers. The
+    entry stays in the list — `list` still answers for its records and
+    `status` shows the error — with no processors and no automatic retry;
+    the operator fixes the file and reloads again. Boot never sets it: a
+    connector that cannot connect at boot stops the boot.
+    """
 
     name: str
     connector: Connector
     session_manager: SessionManager
+    degraded: str = ""
 
 
 class GatewayService:
@@ -266,7 +327,22 @@ class GatewayService:
         await service.run()
     """
 
-    def __init__(self, config: GatewayConfig) -> None:
+    def __init__(self, config: GatewayConfig, config_path: str | None = None) -> None:
+        # The ACTIVE configuration (#144): what the daemon is running, kept so
+        # `config reload` diffs the file against it rather than reconstructing
+        # it from runtime state, and so `status`/`config show` can name it.
+        # `config_path` is where a reload re-reads from; None (tests, scripts)
+        # means reload has nothing to read and refuses.
+        self._config = config
+        self._config_path = str(Path(config_path).resolve()) if config_path else None
+        self._config_digest = config_digest(config)
+        self._config_loaded_at = now_iso()
+        self._reload_lock = asyncio.Lock()
+        self._reloading = False
+        self._notifier: ConnectorPermissionNotifier | None = None
+        # Why each unavailable agent is unavailable — the start error, kept so
+        # `status` can say more than "failed to start".
+        self._agent_errors: dict[str, str] = {}
         # Preflight — and settle — the persisted state BEFORE building anything.
         # Two read-only checks (they raise) around one write (the orphan sweep
         # removes files no configured connector owns; see below for why it must
@@ -291,6 +367,9 @@ class GatewayService:
         check_session_uniqueness()
 
         core_config = CoreConfig.from_gateway_config(config)
+        # Held by every session manager and processor, and updated IN PLACE by a
+        # reload: `max_queue_depth`, the agent and connector config maps.
+        self._core_config = core_config
 
         # Shared permission registry (one per gateway instance)
         self._registry = PermissionRegistry()
@@ -311,6 +390,10 @@ class GatewayService:
         # lifecycle, which rolls the startup back and says nothing about what to change.
         check_backend_signatures(agents)
 
+        # The ONE agents dict: the runtime manager, every session manager and
+        # every lifecycle hold this same object, so a reload's replacement of
+        # one backend is seen everywhere on the next start.
+        self._agents = agents
         self._runtime_manager = AgentRuntimeManager(agents)
 
         # What each connector claims of its account's direct messages — a rule opting
@@ -320,50 +403,74 @@ class GatewayService:
         # is the one thing the Mattermost different-teams exception cannot keep apart
         # (§4.5).
         self._dm_claims: dict[str, DmClaim] = dm_claims(config.watcher_rules)
-        self._entries: list[ConnectorEntry] = []
-        for cc in config.connectors:
-            connector = connector_factory(cc)
-            sm = SessionManager(
-                connector=connector,
-                agents=agents,
-                config=core_config,
-                state_name=cc.name,
-                permission_registry=self._registry,
-                session_maps=self._maps,
-                # Rules give the manager runtime effect (§2.8). Filtered like the
-                # watcher configs: a rule binds to one connector by name, and the
-                # manager keys its matches on that same name.
-                watcher_rules=[
-                    r for r in config.watcher_rules if r.connector == cc.name
-                ],
-                # The membership-remove handler's job cancellation (§2.7).
-                # The expiry-exemption oracle that used to sit here is gone with
-                # the exemption itself: a job records the room it targets and can
-                # resurrect it, so there is no record to protect on its behalf.
-                cancel_jobs=(
-                    lambda room_id, legacy_handle, *, reason, advice, _cn=cc.name:
-                        self._cancel_jobs_for(
-                            _cn, room_id, legacy_handle=legacy_handle,
-                            reason=reason, advice=advice)
-                ),
-            )
-            self._entries.append(
-                ConnectorEntry(name=cc.name, connector=connector, session_manager=sm)
-            )
+        self._entries: list[ConnectorEntry] = [
+            self._build_entry(cc, connector_factory(cc), config) for cc in config.connectors
+        ]
 
-        # Build JobStore + JobScheduler
+        # Build JobStore + JobScheduler. The scheduler's mapping is THIS dict,
+        # kept in step with `_entries` by `_install_entries` — a reload swaps
+        # a connector's manager in both places at once.
         self._job_store = JobStore()
-        session_managers = {e.name: e.session_manager for e in self._entries}
+        self._session_managers = {e.name: e.session_manager for e in self._entries}
         self._job_scheduler = JobScheduler(
             store=self._job_store,
-            session_managers=session_managers,
+            session_managers=self._session_managers,
             completed_job_ttl_days=config.scheduler.completed_job_ttl_days,
         )
 
         self._control = ControlServer(
             self._entries,
             job_store=self._job_store,
+            service=self,
         )
+
+    def _build_entry(
+        self, cc: ConnectorConfig, connector: Connector, config: GatewayConfig
+    ) -> ConnectorEntry:
+        """One connector and its session manager, from the config entry.
+
+        Boot builds every entry this way; a reload builds the added and the
+        restarted ones. The connector is passed in rather than built here so a
+        reload can construct every new connector BEFORE it stops anything —
+        a factory that raises must leave the running fleet untouched.
+        """
+        sm = SessionManager(
+            connector=connector,
+            agents=self._agents,
+            config=self._core_config,
+            state_name=cc.name,
+            permission_registry=self._registry,
+            session_maps=self._maps,
+            # Rules give the manager runtime effect (§2.8). Filtered like the
+            # watcher configs: a rule binds to one connector by name, and the
+            # manager keys its matches on that same name.
+            watcher_rules=[
+                r for r in config.watcher_rules if r.connector == cc.name
+            ],
+            # The membership-remove handler's job cancellation (§2.7).
+            # The expiry-exemption oracle that used to sit here is gone with
+            # the exemption itself: a job records the room it targets and can
+            # resurrect it, so there is no record to protect on its behalf.
+            cancel_jobs=(
+                lambda room_id, legacy_handle, *, reason, advice, _cn=cc.name:
+                    self._cancel_jobs_for(
+                        _cn, room_id, legacy_handle=legacy_handle,
+                        reason=reason, advice=advice)
+            ),
+        )
+        return ConnectorEntry(name=cc.name, connector=connector, session_manager=sm)
+
+    def _install_entries(self, entries: list[ConnectorEntry]) -> None:
+        """Make `entries` the fleet, in place — the control server and the
+        scheduler hold the list and the dict, not copies."""
+        self._entries[:] = entries
+        self._session_managers.clear()
+        self._session_managers.update({e.name: e.session_manager for e in entries})
+
+    @property
+    def reloading(self) -> bool:
+        """Whether a `config reload` is applying right now (#144)."""
+        return self._reloading
 
     def _cancel_jobs_for(
         self, connector_name: str, room_id: str, *, legacy_handle: str,
@@ -488,7 +595,7 @@ class GatewayService:
         if first_exception is not None:
             raise first_exception
 
-    def _check_bot_identities(self) -> None:
+    def _check_bot_identities(self, entries: "list[ConnectorEntry] | None" = None) -> None:
         """Refuse to go further if two connectors are one bot account (§4.5).
 
         Runs between authentication and subscription: earlier there is no identity to
@@ -502,7 +609,7 @@ class GatewayService:
         healthy while half its rooms go unanswered.
         """
         identities: list[ConnectorIdentity] = []
-        for e in self._entries:
+        for e in (self._entries if entries is None else entries):
             identity = e.connector.bot_identity()
             if identity is None:
                 continue  # declares no shared account to collide over
@@ -614,12 +721,14 @@ class GatewayService:
             #      manager handles ordering (backends first, then brokers) and
             #      failure isolation internally.
             notifier = ConnectorPermissionNotifier(self._maps.connector_view)
+            self._notifier = notifier
             runtime_errors = await self._runtime_manager.start_all(
                 registry=self._registry,
                 notifier=notifier,
                 maps=self._maps,
             )
             startup_errors.extend(runtime_errors)
+            self._note_agent_errors(runtime_errors)
 
             # Start the permission expiry background task if any brokers are active.
             if self._runtime_manager.has_active_brokers:
@@ -703,11 +812,7 @@ class GatewayService:
             # watchers are up.  Starting it before run_once() would cause
             # catch-up messages to be dropped (processors not yet started).
             # The store itself loaded BEFORE run_once — see above.
-            if getattr(self, "_job_store", None) is not None:
-                self._scheduler_task = asyncio.create_task(
-                    self._job_scheduler.run(),
-                    name="job-scheduler",
-                )
+            self._start_scheduler()
 
             await self._control.start()
             names = ", ".join(e.name for e in self._entries)
@@ -773,16 +878,7 @@ class GatewayService:
         # Step 2: cancel the job scheduler before session managers stop.
         # This prevents a scheduler tick from trying to inject into a processor
         # that is in the middle of draining its queue.
-        if getattr(self, "_scheduler_task", None):
-            self._scheduler_task.cancel()
-            try:
-                await self._scheduler_task
-            except asyncio.CancelledError:
-                pass
-            except Exception as e:
-                logger.error("Error stopping job scheduler task: %s", e)
-            finally:
-                self._scheduler_task = None  # type: ignore[assignment]
+        await self._stop_scheduler()
         # Step 3: shut down session managers.
         sm_results = await asyncio.gather(
             *[e.session_manager.shutdown() for e in self._entries],
@@ -813,11 +909,405 @@ class GatewayService:
                 self._expiry_task = None
         logger.info("GatewayService shut down")
 
+    def _start_scheduler(self) -> None:
+        """Start the job scheduler — after connectors are connected and
+        watchers are up, so its catch-up injections find processors."""
+        if getattr(self, "_job_store", None) is not None and self._scheduler_task is None:
+            self._scheduler_task = asyncio.create_task(
+                self._job_scheduler.run(),
+                name="job-scheduler",
+            )
+
+    async def _stop_scheduler(self) -> None:
+        if getattr(self, "_scheduler_task", None):
+            self._scheduler_task.cancel()
+            try:
+                await self._scheduler_task
+            except asyncio.CancelledError:
+                pass
+            except Exception as e:
+                logger.error("Error stopping job scheduler task: %s", e)
+            finally:
+                self._scheduler_task = None  # type: ignore[assignment]
+
+    # ── Config reload (#144) ─────────────────────────────────────────────────
+
+    def describe_config(self, *, include_config: bool = False) -> dict:
+        """The active configuration as `status` and `config show` report it."""
+        out = {
+            "ok": True,
+            "config_path": self._config_path,
+            "digest": self._config_digest,
+            "loaded_at": self._config_loaded_at,
+            "reloading": self._reloading,
+            "degraded": [
+                Degraded("connector", e.name, e.degraded).to_dict()
+                for e in self._entries if e.degraded
+            ] + [
+                Degraded("agent", name, self._agent_errors.get(name, "failed to start")).to_dict()
+                for name in sorted(self._runtime_manager.unavailable_agents)
+            ],
+        }
+        if include_config:
+            out["config"] = redacted_config(self._config)
+        return out
+
+    def _note_agent_errors(self, errors: list[str]) -> None:
+        """Keep each unavailable agent's start error, by name, for `status`."""
+        for name in self._runtime_manager.unavailable_agents:
+            for err in errors:
+                if f"'{name}'" in err:
+                    self._agent_errors[name] = err
+        for name in list(self._agent_errors):
+            if name not in self._runtime_manager.unavailable_agents:
+                del self._agent_errors[name]
+
+    async def reload_config(self, *, dry_run: bool, config_path: str | None = None) -> dict:
+        """`config reload`: validate the file, plan, and unless `dry_run` apply.
+
+        One request, one response. The file is read once, here; the plan is
+        computed against the running fleet; a dry run returns it; an apply
+        prints it to the log, executes it and returns it with what happened.
+        Refusals — invalid file, a reload already applying, a path other than
+        the daemon's — return `ok: False` and change nothing.
+        """
+        if self._config_path is None:
+            return ReloadPlan.refused(
+                "this daemon was not started from a config file — nothing to reload",
+                dry_run=dry_run).to_dict()
+        if config_path and str(Path(config_path).resolve()) != self._config_path:
+            return ReloadPlan.refused(
+                f"the daemon runs {self._config_path}, not {config_path} — pass that "
+                f"path, or restart the daemon on the new one", dry_run=dry_run).to_dict()
+        if self._reload_lock.locked():
+            return ReloadPlan.refused(
+                "a config reload is already in progress — wait for it to finish",
+                dry_run=dry_run).to_dict()
+        async with self._reload_lock:
+            result = validate_config(self._config_path)
+            findings = [finding_to_dict(f) for f in result.findings if f.severity != "lint"]
+            if not result.ok or result.config is None:
+                return ReloadPlan.refused(
+                    f"{self._config_path}: {len(result.errors)} error(s) — nothing changed",
+                    dry_run=dry_run, findings=findings).to_dict()
+            candidate = result.config
+            diff = diff_configs(self._config, candidate)
+            retried = self._retry_degraded(diff, candidate)
+            try:
+                plan = self._plan_reload(diff, candidate, findings, dry_run=dry_run)
+                plan.notes.extend(retried)
+            except Exception as e:
+                logger.exception("config reload: could not plan")
+                return ReloadPlan.refused(
+                    f"could not plan the reload — nothing changed: {e}",
+                    dry_run=dry_run, findings=findings).to_dict()
+            if dry_run or not plan.has_changes:
+                return plan.to_dict()
+            logger.info("config reload: applying\n%s", plan.render())
+            try:
+                await self._apply_reload(diff, candidate, plan)
+            except _ReloadRefused as e:
+                return ReloadPlan.refused(str(e), dry_run=dry_run, findings=findings).to_dict()
+            plan.applied = True
+            logger.info("config reload: %s", plan.render().splitlines()[-1])
+            return plan.to_dict()
+
+    def _retry_degraded(self, diff: ConfigDiff, candidate: GatewayConfig) -> list[str]:
+        """Fold the degraded sections into the diff as changed, so a reload
+        retries them even when their own entry did not change.
+
+        "Fix the file and reload again" must also cover a fix that is not in
+        the file — a server that is reachable again, a sidecar binary put
+        back. Without this an unchanged degraded connector would stay down
+        until a full restart. Returns the plan notes that say so.
+        """
+        notes = []
+        names = {c.name for c in candidate.connectors}
+        for e in self._entries:
+            if e.degraded and e.name in names and e.name not in diff.connectors.changed:
+                diff.connectors.changed.append(e.name)
+                notes.append(f"connector '{e.name}' is degraded ({e.degraded}) — retried")
+        for name in sorted(self._runtime_manager.unavailable_agents):
+            if name in candidate.agents and name not in diff.agents.changed:
+                diff.agents.changed.append(name)
+                notes.append(f"agent '{name}' is unavailable — retried")
+        return notes
+
+    def _plan_reload(
+        self, diff: ConfigDiff, candidate: GatewayConfig, findings: list[dict], *, dry_run: bool
+    ) -> ReloadPlan:
+        """What this reload will do, record by record, from the running fleet."""
+        plan = ReloadPlan(dry_run=dry_run, findings=findings, digest=config_digest(candidate))
+        plan.take_diff(diff)
+        removed = set(diff.connectors.removed)
+        restarted = set(diff.connectors.changed)
+        restarted_agents = set(diff.agents.changed)
+        candidate_names = {c.name for c in candidate.connectors}
+        for e in self._entries:
+            records = e.session_manager.records()
+            if e.name in removed:
+                plan.watchers.extend(connector_removed_changes(e.name, records))
+                continue
+            rules = [r for r in candidate.watcher_rules if r.connector == e.name]
+            plan.watchers.extend(plan_connector_records(
+                e.name, records, rules,
+                resident=e.session_manager.resident_watcher_names(),
+                restart_all=e.name in restarted,
+                restarted_agents=restarted_agents,
+            ))
+            if e.name in restarted and records:
+                plan.notes.append(SCOPE_REVALIDATION_NOTE.format(
+                    connector=e.name, count=len(records)))
+        # An added connector hydrates whatever state file already carries its
+        # name (a connector renamed back, say); those records reconcile too.
+        for name in diff.connectors.added:
+            rules = [r for r in candidate.watcher_rules if r.connector == name]
+            plan.watchers.extend(plan_connector_records(name, load_state(name), rules))
+        # Files on disk no candidate connector owns — the same sweep boot runs.
+        # A removed entry's own file is planned above from its live records.
+        names, changes = orphan_removals(candidate_names, skip={e.name for e in self._entries})
+        plan.connectors.removed.extend(n for n in names if n not in plan.connectors.removed)
+        plan.watchers.extend(changes)
+        return plan
+
+    async def _apply_reload(
+        self, diff: ConfigDiff, candidate: GatewayConfig, plan: ReloadPlan
+    ) -> None:
+        """Execute a reload plan: one stop pass, one start pass, then reconcile.
+
+        Order, and why:
+
+        0. Everything new is CONSTRUCTED first — backends, connectors. A factory
+           that raises refuses the whole reload with nothing touched.
+        1. The scheduler is paused (as shutdown does) so no fire lands in the
+           window; a job due meanwhile fires on the restart's catch-up.
+        2. Every kept manager is quiesced — no new wake, join or verb — so no
+           watcher can start against a backend about to be stopped.
+        3. Stop pass, in shutdown order: removed and restarted connectors'
+           managers shut down (drain processors, save, disconnect); their
+           orphaned files are swept; changed and removed agents stop.
+        4. Rebuild: the shared agents dict and the core config are updated in
+           place; new entries replace old ones in candidate order; kept
+           managers take the candidate's rules.
+        5. Start pass, in boot order: agents, then each new connector settles
+           its records, connects, passes the identity barrier and syncs. A
+           failure leaves a DEGRADED entry, never a half-started one.
+        6. Kept managers re-arm, reconcile against the new rules (restarting
+           re-materialized resident processors) and restart the processors of
+           changed agents. Then the scheduler, the active config, the digest.
+        """
+        removed = set(diff.connectors.removed)
+        restarted = set(diff.connectors.changed)
+        added = set(diff.connectors.added)
+        changed_agents = set(diff.agents.changed)
+        added_agents = set(diff.agents.added)
+        removed_agents = set(diff.agents.removed)
+
+        # 0. Construct before destroying.
+        try:
+            new_backends = {
+                name: _build_agent_backend(candidate.agents[name])
+                for name in sorted(changed_agents | added_agents)
+            }
+            check_backend_signatures(new_backends)
+            new_connectors = {
+                cc.name: connector_factory(cc)
+                for cc in candidate.connectors if cc.name in (restarted | added)
+            }
+        except Exception as e:
+            raise _ReloadRefused(f"could not build the new configuration — nothing changed: {e}")
+
+        self._reloading = True
+        kept: list[ConnectorEntry] = []
+        started: set[str] = set()
+        try:
+            # 1–2. Pause the scheduler, still the kept managers.
+            await self._stop_scheduler()
+            kept = [e for e in self._entries if e.name not in (removed | restarted)]
+            for e in kept:
+                await e.session_manager.quiesce(RELOAD_IN_PROGRESS)
+
+            # 3. Stop pass. The processors of a changing agent stop FIRST, while
+            #    their backend is still alive: a processor's stop drains its queue
+            #    by processing it, and against a stopped sidecar every drained
+            #    message would fail into the room instead.
+            going = [e for e in self._entries if e.name in (removed | restarted)]
+            results = await asyncio.gather(
+                *[e.session_manager.shutdown() for e in going], return_exceptions=True)
+            for e, result in zip(going, results, strict=True):
+                if isinstance(result, BaseException):
+                    logger.error("config reload: connector '%s' did not shut down cleanly: %s",
+                                 e.name, result)
+            if changed_agents:
+                for e in kept:
+                    await e.session_manager.stop_watchers_on_agents(changed_agents)
+            self._install_entries(kept)
+            self._reclaim_orphaned_state_files({c.name for c in candidate.connectors})
+            await self._runtime_manager.stop_some(changed_agents | removed_agents)
+
+            # 4. Rebuild.
+            for name in removed_agents:
+                self._runtime_manager.replace(name, None)
+            for name, backend in new_backends.items():
+                self._runtime_manager.replace(name, backend)
+            self._core_config.agents = candidate.agents
+            self._core_config.connector_configs = {c.name: c for c in candidate.connectors}
+            self._core_config.max_queue_depth = candidate.max_queue_depth
+            self._dm_claims = dm_claims(candidate.watcher_rules)
+            by_name = {e.name: e for e in kept}
+            fleet: list[ConnectorEntry] = []
+            for cc in candidate.connectors:
+                if cc.name in new_connectors:
+                    fleet.append(self._build_entry(cc, new_connectors[cc.name], candidate))
+                else:
+                    fleet.append(by_name[cc.name])
+            self._install_entries(fleet)
+            for e in kept:
+                e.session_manager.replace_rules(
+                    [r for r in candidate.watcher_rules if r.connector == e.name])
+
+            # 5. Start pass.
+            if new_backends:
+                notifier = self._notifier or ConnectorPermissionNotifier(self._maps.connector_view)
+                errors = await self._runtime_manager.start_some(
+                    set(new_backends), self._registry, notifier, self._maps)
+                self._note_agent_errors(errors)
+                for name in sorted(set(new_backends) & self._runtime_manager.unavailable_agents):
+                    plan.degraded.append(Degraded(
+                        "agent", name, self._agent_errors.get(name, "failed to start")))
+                if self._runtime_manager.has_active_brokers and self._expiry_task is None:
+                    self._expiry_task = asyncio.create_task(
+                        run_expiry_task(self._registry, notifier), name="permission-expiry")
+            # The kept lifecycles judge starts by a set boot wrote; a reload that
+            # changed which agents are up must rewrite it before anything starts.
+            for e in kept:
+                e.session_manager.set_unavailable_agents(self._runtime_manager.unavailable_agents)
+            starting = [e for e in fleet if e.name in new_connectors]
+            started |= await self._start_entries(starting, plan)
+
+            # 6. Re-arm, reconcile, restart.
+            for e in kept:
+                e.session_manager.rearm()
+            for e in kept:
+                restarted_rooms: set[str] = set()
+                if diff.rules_changed:
+                    try:
+                        restarted_rooms = set(await e.session_manager.reconcile_live())
+                    except Exception as exc:
+                        logger.exception("config reload: reconciliation on connector '%s' failed",
+                                         e.name)
+                        plan.degraded.append(Degraded("connector", e.name,
+                                                      f"reconciliation failed: {exc}"))
+                if changed_agents:
+                    for msg in await e.session_manager.start_watchers_on_agents(
+                            changed_agents, exclude=restarted_rooms):
+                        logger.error("config reload: %s", msg)
+            self._job_scheduler.completed_job_ttl_days = candidate.scheduler.completed_job_ttl_days
+            self._start_scheduler()
+            self._config = candidate
+            self._config_digest = plan.digest
+            self._config_loaded_at = now_iso()
+        except BaseException as exc:
+            # A defect in the apply must not leave the daemon wedged or lying.
+            # What is running keeps running (kept managers re-armed, scheduler
+            # back); the fleet is made CANDIDATE-shaped — every connector the
+            # candidate names has an entry, the ones this apply lost marked
+            # degraded with the error — and the candidate becomes the active
+            # config, so the next reload diffs against what the daemon now
+            # holds and retries the degraded entries instead of tripping over
+            # a name it cannot find. The error itself goes back to the operator.
+            logger.exception("config reload: apply failed part-way — re-arming what is running")
+            self._settle_after_failed_apply(candidate, kept, started, new_connectors, plan, exc)
+            raise
+        finally:
+            self._reloading = False
+
+    def _settle_after_failed_apply(
+        self, candidate: GatewayConfig, kept: "list[ConnectorEntry]", started: set[str],
+        new_connectors: dict[str, Connector], plan: ReloadPlan, exc: BaseException,
+    ) -> None:
+        """Leave a candidate-shaped fleet behind a failed apply (see the caller).
+
+        An entry that is neither kept nor known to have started — one this
+        apply built but never brought up, or never even built — is degraded
+        with the error, so `status` shows it and the next reload retries it.
+        """
+        by_name = {e.name: e for e in self._entries}
+        untouched = {e.name for e in kept} | started
+        fleet: list[ConnectorEntry] = []
+        for cc in candidate.connectors:
+            entry = by_name.get(cc.name)
+            if entry is None:
+                connector = new_connectors.get(cc.name) or connector_factory(cc)
+                entry = self._build_entry(cc, connector, candidate)
+            if cc.name not in untouched and not entry.degraded:
+                entry.degraded = f"reload failed before this connector started: {exc}"
+                plan.degraded.append(Degraded("connector", cc.name, entry.degraded))
+            fleet.append(entry)
+        self._install_entries(fleet)
+        for e in kept:
+            try:
+                e.session_manager.rearm()
+            except Exception:
+                logger.exception("config reload: could not re-arm connector '%s'", e.name)
+        self._start_scheduler()
+        self._config = candidate
+        self._config_digest = plan.digest
+        self._config_loaded_at = now_iso()
+
+    async def _start_entries(self, entries: "list[ConnectorEntry]", plan: ReloadPlan) -> set[str]:
+        """Boot order for a reload's new connectors, one degraded entry per
+        failure. Returns the names that came up."""
+        unavailable = self._runtime_manager.unavailable_agents
+        connected: list[ConnectorEntry] = []
+        started: set[str] = set()
+        for e in entries:
+            try:
+                await e.session_manager.settle_records(unavailable_agents=unavailable)
+                await e.session_manager.connect_only()
+            except Exception as exc:
+                await self._degrade(e, f"failed to connect: {exc}", plan)
+                continue
+            connected.append(e)
+        if connected:
+            try:
+                self._check_bot_identities([e for e in self._entries if not e.degraded])
+            except (DuplicateBotIdentityError, ConnectorIdentityError) as exc:
+                # Boot fails fast here; a reload cannot take the running
+                # connectors down for it, so the NEW ones are the ones refused
+                # — for a conflict, and for an identity nothing could read.
+                for e in connected:
+                    await self._degrade(e, f"bot identity check failed: {exc}", plan)
+                connected = []
+        for e in connected:
+            try:
+                errors = await e.session_manager.sync_only(unavailable_agents=unavailable)
+                for msg in errors:
+                    logger.error("config reload: %s", msg)
+                started.add(e.name)
+            except Exception as exc:
+                await self._degrade(e, f"failed to start: {exc}", plan)
+        return started
+
+    async def _degrade(self, entry: ConnectorEntry, error: str, plan: ReloadPlan) -> None:
+        logger.error("config reload: connector '%s' is degraded — %s", entry.name, error)
+        entry.degraded = error
+        plan.degraded.append(Degraded("connector", entry.name, error))
+        try:
+            await entry.session_manager.shutdown()
+        except Exception as exc:
+            logger.error("config reload: degraded connector '%s' did not shut down cleanly: %s",
+                         entry.name, exc)
+
     # Control socket has been extracted to gateway.control.ControlServer.
     # Backend + broker lifecycle has been extracted to AgentRuntimeManager.
 
 
 # ── Module-level helpers ───────────────────────────────────────────────────────
+
+
+class _ReloadRefused(Exception):
+    """A reload that could not start — nothing was changed."""
 
 
 def sanitize_pipe_message(message: str) -> str:

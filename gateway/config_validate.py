@@ -114,6 +114,18 @@ class Finding:
     message: str
 
 
+def finding_to_dict(finding: Finding) -> dict:
+    """The one JSON shape for a finding — `config validate --json` and the
+    reload plan's validation block both use it (#144)."""
+    return {
+        "level": finding.severity,
+        "entity_kind": finding.entity_kind,
+        "entity_name": finding.entity_name,
+        "field": finding.field,
+        "message": finding.message,
+    }
+
+
 @dataclass
 class ValidationResult:
     config_path: str
@@ -123,10 +135,22 @@ class ValidationResult:
     warnings: list[str] = field(default_factory=list)
     lint_findings: list[str] = field(default_factory=list)
     findings: list[Finding] = field(default_factory=list)
+    # The parsed config when there were no load errors — so a caller that
+    # validates and then acts on the file (`config reload`) reads it once.
+    config: GatewayConfig | None = None
 
     @property
     def ok(self) -> bool:
         return not self.errors
+
+    def to_dict(self) -> dict:
+        return {
+            "ok": self.ok,
+            "config_path": self.config_path,
+            "watcher_count": self.watcher_count,
+            "entry_count": self.entry_count,
+            "findings": [finding_to_dict(f) for f in self.findings],
+        }
 
 
 def validate_config(config_path: str, lint: bool = False) -> ValidationResult:
@@ -193,6 +217,10 @@ def validate_config(config_path: str, lint: bool = False) -> ValidationResult:
     if lint:
         _lint_config(raw, result)
 
+    if result.ok:
+        # Only once every check has run: an error a later check adds must not
+        # leave a config attached to a result that says the file is invalid.
+        result.config = config
     return result
 
 

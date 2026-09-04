@@ -28,6 +28,7 @@ def _make_service() -> GatewayService:
     service._control = MagicMock()
     service._entries = []
     service._dm_owner_connectors = set()
+    service._agent_errors = {}
     return service
 
 
@@ -683,6 +684,7 @@ class TestServiceRunFatalHandshake(unittest.IsolatedAsyncioTestCase):
         svc._control = MagicMock()
         svc._control.stop = AsyncMock()
         svc._entries = []
+        svc._agent_errors = {}
         return svc
 
     async def test_exception_during_startup_no_ok_in_pipe(self):

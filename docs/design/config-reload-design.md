@@ -1,0 +1,267 @@
+# Config Reload
+
+`agent-chat-gateway config reload` applies changes in `config.yaml` to the
+running daemon: it validates the whole file, diffs it against the active
+configuration, restarts the affected connectors and agents, and runs the same
+record reconciliation boot runs — re-materializing records against the current
+rules (keeping their sessions) and expiring records no rule covers (session id
+logged). This document records the design; the dynamic-watcher design's §2.4
+owns the reconciliation engine it reuses.
+
+## 1. Motivation
+
+Before this, every change to `config.yaml` — a new rule, a changed agent
+working directory, a rotated connector token — required `restart`, which
+stops every connector, backend and watcher, including the ones the edit did
+not touch. A daemon serving several rooms went dark for the full restart
+window because one rule changed.
+
+Two smaller gaps came with it. Nothing said what the daemon was actually
+running: `status` showed a pid and uptime, `config validate` checked the file
+on disk, and an edit that was never applied looked identical to one that was.
+And none of the config commands produced machine-readable output, which blocks
+letting an onboarding agent operate the gateway.
+
+## 2. Design
+
+### 2.1 Command surface
+
+```
+config reload [--dry-run] [--json]
+config show   [--json]
+config validate [--json]        # --json is new
+status                          # gains the active digest, load time, degraded sections
+```
+
+No `--yes`, no interactive confirmation. The dry run is the preview; execution
+is explicit. **There is deliberately no binding between a dry run and a later
+execution** — execution reads the file as it is at that moment, and the plan
+printed before the apply is the operator's last look. Nothing watches the
+file, no signal handler exists, and saving in the config TUI does not trigger
+a reload.
+
+The reasoning for dropping the confirmation step: the only sessions that can
+be lost between a dry run and an execution are ones created in that window,
+the platform keeps every message in the room, and history handoff re-feeds
+recent context on the next session.
+
+### 2.2 Control protocol
+
+The control socket stays strictly **one request → one response → close**. Two
+commands are added:
+
+- `config-reload {dry_run, config_path}` — the daemon reads its own file
+  once, validates, plans, and (unless `dry_run`) applies within the same
+  request; the response is the plan document (§2.7). `config_path` must be
+  the path the daemon was started from — a different one is refused rather
+  than silently reloading another file.
+- `config-show {include_config}` — the active digest, load time, degraded
+  sections and (with `include_config`) the redacted resolved config. `status`
+  is this command with `include_config: false`.
+
+### 2.3 Offline dry run
+
+When the daemon is not running, the CLI computes the record-level plan itself
+from the state files and the file (`reload_plan.boot_plan`), labelled as the
+plan the next start will execute, with the connector/agent restart section
+marked not applicable. This is the same engine boot uses over the same files
+boot reads — including files of connectors the config no longer names, which
+boot sweeps — so the offline plan and the boot are one computation.
+
+Without `--dry-run` and with no daemon, the plan is still printed (it is what
+`start` will do) and the command exits 1: nothing is running to apply it to.
+
+When the daemon **appears** to be running but its socket cannot be reached,
+the command errors out. It never falls back to the offline plan: a daemon in
+that state is the thing to fix first.
+
+### 2.4 Validation first, active config, diff
+
+The whole-file validator (`validate_config`) runs on the candidate. Any error
+returns the findings and changes nothing; warnings are carried into the plan.
+The env-to-config migration and the config-permission hardening are boot-only.
+`ValidationResult` now carries the parsed config when it is clean, so the
+daemon validates and diffs from one read.
+
+The service **retains the resolved configuration it started with** and
+replaces it after a successful apply, together with a SHA-256 digest of its
+canonical serialization and the time it was loaded. Diffing
+(`gateway/config_diff.py`) compares parsed dataclasses, never YAML text:
+comments, key order and `description:` (which every entity parser drops)
+register as nothing; a template edit registers as a change to every entry
+inheriting it, because inheritance is flattened at parse time.
+
+Entity identity is `name` for connectors, agents and rules. **A rename is a
+removal plus an addition.** For rules that is harmless — ownership is
+recomputed by re-matching, and the record re-materializes to the new name.
+For a connector it expires every record under the old name and deletes its
+state file; the dry run shows this.
+
+Every field of every config entity is classified once, in `RELOAD_ACTIONS`,
+and `tests/unit/test_config_diff.py` enumerates the dataclasses against it:
+a new field cannot arrive without saying what a reload does about it.
+
+### 2.5 Diff → action table
+
+| Change | Action |
+|---|---|
+| Any connector field | Restart that connector as a unit: shut its manager down (drain processors, save, disconnect), build a new connector and manager from the candidate, settle, connect, sync. Its records are re-validated against the connector's scope on reconnect (#141), so a scope change expires out-of-scope rooms then — the plan says so; it cannot list them in advance. |
+| Connector removed | Shut down; every record expires through the shared release method (`connector-removed`); state file deleted by the same orphan sweep boot runs. |
+| Connector added | Build, connect, sync. A state file already carrying its name is hydrated and reconciled. |
+| Any agent field | Stop the backend (an OpenCode sidecar restarts) and its broker, rebuild both, restart every resident processor on that agent. A changed backend identity (type or working directory) is settled by the existing provisioning check: a fresh session, the old id on the AUDIT line. |
+| Agent removed | Stop and drop it. Config loading refuses a rule naming an unknown agent, so its records have already re-materialized or expired. |
+| Any change in the rules block, including a reorder | Reconcile every record of every kept connector (§2.4 of the dynamic-watcher design). A re-materialized record with a resident processor is restarted; on an eager connector the new rules' literal rooms are started. |
+| `max_queue_depth`, `scheduler.*` | Replace the value in place. |
+| `description` on any entity | Nothing — it is not a field. |
+
+### 2.6 Apply order
+
+The apply reuses the boot and shutdown orders — one stop pass, one start pass,
+never one pass per change:
+
+0. **Construct before destroying.** Every new backend and connector is built
+   first; a factory that raises refuses the whole reload with nothing
+   touched.
+1. **Pause the scheduler** (as shutdown does). A job due in the window fires
+   on the restart's catch-up pass; nothing is cancelled, and the scheduler
+   never observes a half-swapped mapping. This is how "a degraded
+   connector keeps its scheduled jobs" is met, with no new scheduler state.
+2. **Quiesce every kept manager**: no new wake, join or operator verb — each
+   refused with "a config reload is in progress" — and in-flight ones are
+   waited out; the sweep is stopped. Processors keep running: an in-flight
+   agent turn finishes on its own, and a processor the reload restarts is
+   drained by its own stop.
+3. **Stop pass**, in shutdown order: removed and restarted connectors'
+   managers shut down; their orphaned state files are swept (AUDIT line per
+   record); changed and removed agents stop.
+4. **Rebuild**: the one shared agents dict and the core config are updated in
+   place (every lifecycle holds them by reference); new entries replace old
+   ones in candidate order, in the same list and dict the control server and
+   scheduler hold; kept managers take the candidate's rules.
+5. **Start pass**, in boot order: agents; then each new connector settles its
+   records, connects, passes the identity barrier and syncs. A failure
+   leaves a **degraded** entry, never a half-started one.
+6. Kept managers **re-arm** (the lifecycle's disarm was a one-way shutdown
+   flag until this; `rearm_transitions` is the inverse), reconcile against
+   the new rules, and start every *was-active* record of a changed agent —
+   the processors step 3 stopped, and rooms an earlier reload left down
+   because the agent did not come up then (not twice for a record the
+   reconciliation already restarted; an idle room stays idle). Then the
+   scheduler, the active config, the digest.
+
+The processors of a changing agent are stopped in step 3 **before** their
+backend, while it is still alive: a processor's stop drains its queue by
+processing it, and against a stopped sidecar every drained message would
+fail into the room. The kept lifecycles are also told which agents came up
+(`set_blocked_agents`) — boot writes that set once; a reload rewrites it.
+
+If the apply itself raises part-way (a defect, not a degraded section), the
+daemon is left consistent rather than half-swapped: the kept managers are
+re-armed, the scheduler restarted, every connector the candidate names has
+an entry (the ones the apply lost, marked degraded with the error), and the
+candidate becomes the active config — so the next reload diffs against what
+the daemon actually holds and retries the degraded entries.
+
+A room offer that arrives on a kept connector during the window **parks**
+rather than declines (`WatcherManager._park_if_reloading` raises a retryable
+error): a declined offer remembers the buffered ids, which is right for
+shutdown and wrong for a kept connector whose dedup set survives the reload —
+the next wake's replay would die on them. The connector retries for a few
+seconds and, if the reload is still applying, leaves the ids unknown so the
+replay recovers the frames.
+
+The control server refuses `pause`/`resume`/`reset`/`expire` for the whole
+apply window — not only against the restarting connector: it serves clients
+concurrently, the window is short, and "which connector is mid-restart" is a
+moving target the operator cannot see. `list`, `send`, `status` and
+`schedule-*` are not refused. A second `config reload` during an apply is
+refused by the apply lock.
+
+### 2.7 Failure semantics and output
+
+Apply is per section. A connector that fails to connect or sync, an agent
+whose backend fails to start, or a new connector caught by the identity
+barrier (boot fails fast there; a reload cannot take the running connectors
+down for it, so the *new* ones are refused) is left as a **degraded** entry:
+present in the mapping, no processors, visible in `status`, no automatic
+retry. The operator fixes what was wrong and reloads again — and **every
+reload retries the degraded sections**, whether or not their own entry
+changed, because the fix is often not in the file (a server reachable again,
+a sidecar binary put back); the plan notes the retry. Degraded is a
+reload-only state; boot remains fail-fast for connectors.
+
+Human output has four blocks: validation warnings; entity-level
+added/changed/removed per connector, agent and rule (plus "reordered" and
+value swaps); one line per affected watcher — `restart (why)`,
+`rematerialize <from> → <to>`, `expire <reason>  session=<full id>`; degraded
+sections. The final line says what the plan is: a dry run, the next start's
+plan, applied, applied with N degraded sections, or refused.
+
+Exit codes: **0** applied cleanly or nothing to do, **1** validation failure
+or refusal, **2** any section degraded.
+
+`--json` returns the same information as a document: `ok`, `dry_run`,
+`offline`, `applied`, `exit_code`, `error`, `digest`, `validation.findings`
+(the `config validate --json` finding shape: `level`, `entity_kind`,
+`entity_name`, `field`, `message`), `changes` (per entity kind: `added`,
+`changed`, `removed`; rules add `reordered`; `values` as `path`/`old`/`new`),
+`watchers` (`connector`, `room_id`, `handle`, `agent`, `action`,
+`from_rule`, `to_rule`, `session_id`, `reason`), `notes`, `degraded`
+(`kind`, `name`, `error`). The CLI renders the daemon's document; nothing is
+computed twice.
+
+### 2.8 Digest and `config show`
+
+The digest is SHA-256 over a canonical serialization (sorted keys) of the
+**resolved** config — templates and inheritance expanded — so semantically
+identical files hash identically and comments never matter. It is over the
+unredacted values: a rotated secret changes it, which is the point of a
+fingerprint. `config show` prints it with a flattened dump (connectors keyed
+by name so two machines' dumps line up) in which values under a key naming a
+`password`, `token` or `secret` (case-insensitive substring, at any depth) are
+`***`. With the daemon running it also fetches the active digest and warns
+when the file differs — "I edited but forgot to reload" made visible.
+
+## 3. What it does and does not guarantee
+
+- Message loss during the apply window is accepted: on a restarted connector
+  it is equivalent to that connector restarting; on a kept connector a room
+  whose watcher is being created or woken during the window parks and is
+  recovered by the next wake's replay, while its resident rooms keep
+  answering. The requirements promise graceful handling of transient
+  connector failures and no delivery guarantee.
+- A reload cannot be interrupted once the request is sent; the plan printed
+  before the apply is the last look.
+- `restart` and `reload` converge on the same runtime state, because both run
+  the same reconciliation over the same records and the same orphan sweep.
+- The exact rooms a scope-changed connector will drop are not listed in the
+  dry run — that needs a new connector contract method (follow-up).
+
+## 4. Out of scope
+
+`reset-watcher-config <handle>` (a per-watcher reload); triggering reload from
+the config TUI, a file watcher or SIGHUP; automatic retry or rollback of a
+degraded section; rename detection heuristics; pattern-matching batch
+`reset`/`pause`/`resume`/`expire`.
+
+## 5. Testing
+
+Primary seam: `ControlServer.dispatch_command` on a real `GatewayService`
+booted from a config file with Script connectors and mock agents
+(`tests/integration/test_config_reload.py`, harness
+`tests/helpers.boot_gateway_service`). Scenarios cover the action table
+through dry runs and applies: re-materialization with the session kept, expiry
+with the id logged, an agent rebuilt with its processors restarted, a changed
+working directory starting a fresh session with the old id on the AUDIT line,
+a connector added / removed / restarted, a degraded connector with exit code 2
+and `status`, a scheduled job surviving its connector's restart, concurrent
+reload refused, verbs refused during the apply, no-change reload, path
+mismatch, invalid file.
+
+Per-field enumeration (`tests/unit/test_config_diff.py`): every field of
+`ConnectorConfig`, `AgentConfig`, `WatcherRule`, `GatewayConfig` and
+`SchedulerConfig` has a row in `RELOAD_ACTIONS` and a change to it is seen by
+the diff. Secondary seam, the CLI entry point (`tests/integration/test_cli.py`):
+offline dry run from state files, execute refused without a daemon, error
+when the daemon has no reachable socket, `config validate --json`,
+`config show` digest and redaction, the `status` digest line.
