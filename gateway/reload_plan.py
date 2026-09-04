@@ -308,6 +308,18 @@ def plan_connector_records(
     return out
 
 
+def static_era_changes(connector: str, records: Iterable[WatcherState]) -> list[WatcherChange]:
+    """The records hydration prunes — neither `rule_name` nor `config` — as the
+    expiries they are. Boot and an added connector's `settle_records` both
+    release them, so both plans list them."""
+    return [
+        WatcherChange(connector=connector, room_id=r.room_id, handle=r.watcher_name,
+                      agent=r.agent, action="expire", session_id=r.session_id,
+                      reason="static-era record pruned at boot")
+        for r in records if not (r.rule_name or r.config)
+    ]
+
+
 def connector_removed_changes(connector: str, records: Iterable[WatcherState]) -> list[WatcherChange]:
     """Every record of a connector the candidate no longer names expires."""
     return [
@@ -356,11 +368,7 @@ def boot_plan(config: GatewayConfig) -> ReloadPlan:
     for name in configured:
         rules = [r for r in config.watcher_rules if r.connector == name]
         records = load_state(name)
-        plan.watchers.extend(
-            WatcherChange(connector=name, room_id=r.room_id, handle=r.watcher_name,
-                          agent=r.agent, action="expire", session_id=r.session_id,
-                          reason="static-era record pruned at boot")
-            for r in records if not (r.rule_name or r.config))
+        plan.watchers.extend(static_era_changes(name, records))
         plan.watchers.extend(plan_connector_records(name, records, rules))
     names, changes = orphan_removals(configured)
     plan.connectors.removed.extend(names)

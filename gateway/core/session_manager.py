@@ -14,6 +14,7 @@ import asyncio
 import logging
 import secrets
 from datetime import UTC, datetime
+from typing import Collection
 
 from ..agents import AgentBackend
 from .config import CoreConfig
@@ -671,48 +672,58 @@ class SessionManager:
             logger.error("Reconciliation (%s): %s", self._connector_name, msg)
         return restarted
 
-    async def stop_watchers_on_agents(self, agents: set[str]) -> int:
+    async def stop_watchers_on_agents(self, agents: set[str]) -> list[str]:
         """Drain and stop every resident processor bound to one of `agents` (#144).
 
         The first half of a reload's agent restart, run BEFORE the backend
         stops: a processor's stop drains its queue by processing it, so the
         backend must still be alive for the drain to be a drain and not a
-        string of failures posted to the room. Returns how many stopped.
+        string of failures posted to the room. The drains run concurrently,
+        as `stop_all`'s do — each may take the full queue timeout, and one
+        busy agent can have many rooms. Returns the room ids stopped, so the
+        reload can start them again wherever their records point afterwards.
         """
-        stopped = 0
-        for record in self.records():
-            if record.agent not in agents:
-                continue
-            try:
-                stopped += await self._lifecycle.stop_resident(record.room_id)
-            except Exception as e:
+        targets = [r for r in self.records() if r.agent in agents]
+        results = await asyncio.gather(
+            *[self._lifecycle.stop_resident(r.room_id) for r in targets],
+            return_exceptions=True)
+        stopped: list[str] = []
+        for record, result in zip(targets, results, strict=True):
+            if isinstance(result, BaseException):
                 logger.error(
                     "Connector '%s': watcher '%s' could not be stopped before agent "
                     "'%s' restarts: %s", self._connector_name, record.watcher_name,
-                    record.agent, e,
+                    record.agent, result,
                 )
+            elif result:
+                stopped.append(record.room_id)
         return stopped
 
     async def start_watchers_on_agents(
-        self, agents: set[str], *, exclude: set[str] = frozenset()
+        self, agents: set[str], *, rooms: Collection[str] = (),
+        exclude: set[str] = frozenset(),
     ) -> list[str]:
         """Start every WAS-ACTIVE record on one of `agents` once its backend is
         back (#144) — the second half of the agent restart.
 
         Was-active is boot's own criterion (`_evaluate_lifecycle_at_boot`):
-        rule-derived, not paused, no `dropped_at`. That covers the processors
-        `stop_watchers_on_agents` just stopped AND the rooms an earlier reload
-        left down because the agent did not come up then — a fixed agent
-        brings its rooms back without a restart. An idle room stays idle: its
-        next message wakes it. `exclude` names rooms the reconciliation
+        rule-derived, not paused, no `dropped_at`. That covers the rooms an
+        earlier reload left down because the agent did not come up then — a
+        fixed agent brings its rooms back without a restart. `rooms` are the
+        ones `stop_watchers_on_agents` stopped this reload, started whatever
+        agent their record names NOW: a reconciliation in between may have
+        moved one to an agent that did not change. An idle room stays idle:
+        its next message wakes it. `exclude` names rooms the reconciliation
         already restarted. Sessions are kept; a changed backend identity is
         settled by the start's own provisioning check, which logs the
         abandoned id. Returns error strings, one per room that could not
         come back.
         """
         errors: list[str] = []
+        rooms = set(rooms)
         for record in self.records():
-            if (record.agent not in agents or record.room_id in exclude
+            if ((record.agent not in agents and record.room_id not in rooms)
+                    or record.room_id in exclude
                     or not (record.rule_name or record.config)
                     or record.paused or record.dropped_at or not record.room_id):
                 continue

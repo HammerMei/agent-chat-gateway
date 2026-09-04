@@ -251,6 +251,56 @@ class TestAgentRestartOrdering(_ReloadCase):
         new_backend = self.service._agents["default"]
         self.assertIsNot(new_backend, old_backend)
 
+    async def test_a_removed_agents_processors_drain_before_its_backend_stops(self):
+        """Its records expire or move under the new rules, and each of those stops
+        the processor — which drains by processing. The backend must still be up."""
+        await self._boot(self._text(
+            agents={"default": {"type": "claude", "working_directory": str(self.tmp)},
+                    "other": {"type": "claude", "working_directory": str(self.tmp)}}))
+        old_backend = self.service._agents["default"]
+        sm = self.service._session_managers["script"]
+        order: list[str] = []
+        real_stop_backend, real_stop_processor = old_backend.stop, sm._lifecycle._stop_processor
+
+        async def _stop_backend():
+            order.append("backend.stop")
+            await real_stop_backend()
+
+        async def _stop_processor(name):
+            order.append("processor.stop")
+            await real_stop_processor(name)
+
+        old_backend.stop = _stop_backend
+        self._rewrite(self._text(
+            agents={"other": {"type": "claude", "working_directory": str(self.tmp)}},
+            rules=[{"name": "w1", "agent": "other", "connector": "script",
+                    "rooms": {"include": ["script"]}}]))
+        with patch.object(sm._lifecycle, "_stop_processor", side_effect=_stop_processor):
+            result = await self._reload()
+
+        self.assertEqual(result["exit_code"], 0, result)
+        self.assertEqual(result["changes"]["agents"]["removed"], ["default"])
+        self.assertEqual(order[:2], ["processor.stop", "backend.stop"])
+        self.assertNotIn("default", self.service._agents)
+        after = (await self._rows())["script:script"]
+        self.assertEqual(after["agent_name"], "other")
+        self.assertEqual(after["state"], "active", "moved to the other agent and started there")
+
+    async def test_a_room_moved_off_a_changed_agent_is_started_on_its_new_one(self):
+        await self._boot(self._text(
+            agents={"default": {"type": "claude", "working_directory": str(self.tmp)},
+                    "other": {"type": "claude", "working_directory": str(self.tmp)}}))
+        self._rewrite(self._text(
+            agents={"default": {"type": "claude", "working_directory": str(self.tmp),
+                                "timeout": 99},
+                    "other": {"type": "claude", "working_directory": str(self.tmp)}},
+            rules=[{"name": "w1", "agent": "other", "connector": "script",
+                    "rooms": {"include": ["script"]}}]))
+        result = await self._reload()
+        self.assertEqual(result["exit_code"], 0, result)
+        after = (await self._rows())["script:script"]
+        self.assertEqual((after["agent_name"], after["state"]), ("other", "active"))
+
     async def test_a_kept_lifecycle_learns_which_agents_are_unavailable(self):
         await self._boot()
         sm = self.service._session_managers["script"]
@@ -457,9 +507,10 @@ class TestConnectorChanges(_ReloadCase):
         listed = await self._dispatch(cmd="list", connector="second", states=ALL)
         self.assertTrue(listed["ok"], "list still answers for the records")
 
-    async def test_an_apply_that_raises_leaves_a_candidate_shaped_fleet(self):
+    async def test_an_apply_that_raises_leaves_a_consistent_fleet_and_the_old_config(self):
         """A defect mid-apply must not wedge the daemon or make it lie."""
         await self._boot()
+        before = self.service.describe_config()["digest"]
         self._rewrite(self._two())
         sm = self.service._session_managers["script"]
         with patch.object(sm, "replace_rules", side_effect=RuntimeError("kaboom")):
@@ -474,10 +525,71 @@ class TestConnectorChanges(_ReloadCase):
         self.assertIsNotNone(self.service._scheduler_task)
         status = await self._dispatch(cmd="config-show", include_config=False)
         self.assertEqual([d["name"] for d in status["degraded"]], ["second"])
-        # The candidate is active: the next reload diffs against it and retries.
+        self.assertEqual(status["digest"], before,
+                         "the previous config stays active — the file is NOT applied")
+        # The next reload re-diffs against the previous config and lands everything.
         second = await self._reload()
         self.assertEqual(second["exit_code"], 0, second)
+        self.assertEqual(second["changes"]["connectors"]["added"], ["second"])
         self.assertEqual((await self._rows())["second:script"]["state"], "active")
+        self.assertEqual(self.service.describe_config()["digest"], second["digest"])
+        self.assertEqual(len(self.service._entries), 2, "the placeholder was replaced, not doubled")
+
+    async def test_a_connector_whose_teardown_fails_is_not_replaced(self):
+        await self._boot()
+        sm = self.service._session_managers["script"]
+        entry = self.service._entries[0]
+        self._rewrite(self._text().replace("- name: script\n  type: script",
+                                           "- name: script\n  type: script\n  timezone: UTC"))
+        real_shutdown = sm.shutdown
+
+        async def _fail_once():
+            sm.shutdown = real_shutdown
+            raise OSError("disk full while saving state")
+
+        sm.shutdown = _fail_once
+        result = await self._reload()
+
+        self.assertFalse(result["ok"])
+        self.assertIn("did not shut down cleanly", result["error"])
+        self.assertIs(self.service._entries[0], entry, "the old entry stays tracked")
+        self.assertTrue(entry.degraded)
+        self.assertEqual(len(self.service._entries), 1, "no replacement started beside it")
+
+        second = await self._reload()
+        self.assertEqual(second["exit_code"], 0, second)
+        self.assertIsNot(self.service._entries[0], entry)
+        self.assertEqual((await self._rows())["script:script"]["state"], "active")
+
+    async def test_a_reconciliation_failure_degrades_the_entry_and_is_retried(self):
+        await self._boot()
+        sm = self.service._session_managers["script"]
+        self._rewrite(self._text(rules=[{
+            "name": "w1", "agent": "default", "connector": "script",
+            "rooms": {"include": ["script"]}, "session_idle_days": 3}]))
+        with patch.object(sm, "reconcile_live", side_effect=RuntimeError("engine broke")):
+            result = await self._reload()
+
+        self.assertEqual(result["exit_code"], 2, result)
+        self.assertIn("engine broke", self.service._entries[0].degraded)
+        status = await self._dispatch(cmd="config-show", include_config=False)
+        self.assertEqual([d["name"] for d in status["degraded"]], ["script"])
+
+        second = await self._reload()  # file unchanged; the degraded entry is retried whole
+        self.assertEqual(second["exit_code"], 0, second)
+        self.assertEqual(second["changes"]["connectors"]["changed"], ["script"])
+        self.assertEqual(self.service._entries[0].degraded, "")
+        self.assertEqual(load_state("script")[0].rule["session_idle_days"], 3)
+
+    async def test_an_added_connectors_static_era_records_are_planned_as_expired(self):
+        from gateway.core.state import WatcherState, save_state
+        await self._boot()
+        save_state("second", [WatcherState(watcher_name="legacy", session_id="s-legacy",
+                                           room_id="r-legacy")])
+        self._rewrite(self._two())
+        dry = await self._reload(dry_run=True)
+        self.assertIn(("expire", "static-era record pruned at boot", "s-legacy"),
+                      [(w["action"], w["reason"], w["session_id"]) for w in dry["watchers"]])
 
     async def test_a_scheduled_job_survives_its_connectors_restart(self):
         await self._boot()
@@ -552,6 +664,19 @@ class TestValuesAndRefusals(_ReloadCase):
         self.assertEqual(result["config"]["connectors"][0]["name"], "script")
         self.assertEqual(result["config_path"], str(self.config_path.resolve()))
         self.assertTrue(result["loaded_at"])
+
+
+class TestShutdownAndReload(_ReloadCase):
+
+    async def test_shutdown_waits_for_a_reload_that_is_applying(self):
+        await self._boot()
+        await self.service._reload_lock.acquire()  # a reload mid-apply
+        shutting = asyncio.create_task(self.service.shutdown())
+        await asyncio.sleep(0.05)
+        self.assertFalse(shutting.done(), "teardown does not race the apply")
+        self.service._reload_lock.release()
+        await asyncio.wait_for(shutting, timeout=10)
+        self.assertTrue(self.service._reload_lock.locked(), "held for good once shutting down")
 
 
 class TestApplyIsQuiescent(_ReloadCase):

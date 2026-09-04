@@ -217,7 +217,13 @@ def config_digest(config: GatewayConfig) -> str:
     changes it (the digest is over the unredacted values; it is a fingerprint,
     not a dump).
     """
-    payload = json.dumps(canonical(config), sort_keys=True, separators=(",", ":"))
+    data = canonical(config)
+    # Connectors are an identity-keyed set, and the diff treats them as one;
+    # the digest must agree, or reordering two connectors would be "no
+    # changes" to reload and "differs" to `config show`, forever. Rule order
+    # stays significant — first match wins — and is not touched.
+    data["connectors"] = {c["name"]: c for c in data["connectors"]}
+    payload = json.dumps(data, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(payload.encode()).hexdigest()
 
 

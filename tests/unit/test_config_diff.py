@@ -192,6 +192,18 @@ class TestDigest(unittest.TestCase):
         self.assertEqual(config_digest(a), config_digest(b))
         self.assertFalse(diff_configs(a, b), "a description is not a change")
 
+    def test_connector_order_changes_neither_the_diff_nor_the_digest(self):
+        a = _config(connectors=[_connector(name="rc"), _connector(name="mm")])
+        b = _config(connectors=[_connector(name="mm"), _connector(name="rc")])
+        self.assertFalse(diff_configs(a, b))
+        self.assertEqual(config_digest(a), config_digest(b), "the two notions of equality agree")
+
+    def test_rule_order_still_changes_the_digest(self):
+        r1 = make_rule(room="eng", name="eng", connector="rc", agent="a")
+        r2 = make_rule(room="ops", name="ops", connector="rc", agent="a")
+        self.assertNotEqual(config_digest(_config(rules=[r1, r2])),
+                            config_digest(_config(rules=[r2, r1])))
+
     def test_a_changed_value_changes_the_digest(self):
         self.assertNotEqual(config_digest(_config(connectors=[_connector(token="old")])),
                             config_digest(_config(connectors=[_connector(token="new")])))

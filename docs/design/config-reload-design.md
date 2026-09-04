@@ -143,22 +143,33 @@ never one pass per change:
    agent turn finishes on its own, and a processor the reload restarts is
    drained by its own stop.
 3. **Stop pass**, in shutdown order: removed and restarted connectors'
-   managers shut down; their orphaned state files are swept (AUDIT line per
-   record); changed and removed agents stop.
+   managers shut down — a teardown that raises **refuses the rest of the
+   apply** (the old entry stays tracked, degraded; a replacement is never
+   started beside a connector that may still hold transport tasks on its
+   account); then the processors of every changed *or removed* agent are
+   drained concurrently, while their backends are still alive; then the
+   orphaned state files are swept (AUDIT line per record) and those agents
+   stop.
 4. **Rebuild**: the one shared agents dict and the core config are updated in
    place (every lifecycle holds them by reference); new entries replace old
    ones in candidate order, in the same list and dict the control server and
    scheduler hold; kept managers take the candidate's rules.
-5. **Start pass**, in boot order: agents; then each new connector settles its
-   records, connects, passes the identity barrier and syncs. A failure
-   leaves a **degraded** entry, never a half-started one.
-6. Kept managers **re-arm** (the lifecycle's disarm was a one-way shutdown
-   flag until this; `rearm_transitions` is the inverse), reconcile against
-   the new rules, and start every *was-active* record of a changed agent —
-   the processors step 3 stopped, and rooms an earlier reload left down
-   because the agent did not come up then (not twice for a record the
-   reconciliation already restarted; an idle room stays idle). Then the
-   scheduler, the active config, the digest.
+5. **Start pass**, in boot order: agents first. Then the kept managers
+   **re-arm** (the lifecycle's disarm was a one-way shutdown flag until
+   this; `rearm_transitions` is the inverse) and reconcile against the new
+   rules — *before* the new connectors, because the identity barrier folds
+   each connector's persisted DM records into its claim, and a DM record a
+   deleted rule left behind must be gone by then (boot's own order: settle,
+   connect, identity). A reconciliation that raises degrades that entry.
+   Then each new connector settles its records, connects, passes the
+   identity barrier and syncs; a failure leaves a **degraded** entry, never a
+   half-started one.
+6. Kept managers start what step 3 stopped — wherever each record now
+   points, since the reconciliation may have moved it to an agent that did
+   not change — and every *was-active* record of a changed agent, including
+   rooms an earlier reload left down because the agent did not come up then
+   (not twice for a record the reconciliation already restarted; an idle
+   room stays idle). Then the scheduler, the active config, the digest.
 
 The processors of a changing agent are stopped in step 3 **before** their
 backend, while it is still alive: a processor's stop drains its queue by
@@ -168,10 +179,18 @@ fail into the room. The kept lifecycles are also told which agents came up
 
 If the apply itself raises part-way (a defect, not a degraded section), the
 daemon is left consistent rather than half-swapped: the kept managers are
-re-armed, the scheduler restarted, every connector the candidate names has
-an entry (the ones the apply lost, marked degraded with the error), and the
-candidate becomes the active config — so the next reload diffs against what
-the daemon actually holds and retries the degraded entries.
+re-armed, the scheduler restarted, every connector the candidate names — and
+every one the apply was tearing down — has an entry (the ones it lost,
+marked degraded with the error), and the **previous** config stays active.
+Kept managers may hold half-applied rules or a half-swapped core config,
+and only a diff against the previous config finds that again: `config show`
+says the file is not applied, and the next reload re-diffs everything, replaces
+the leftover entries (an existing entry under an *added* name is torn down
+first) and retries what did not land.
+
+`shutdown()` takes the reload lock after closing the control socket: a
+reload already applying finishes first, because its stop and start passes
+touch the very entries the teardown is about to visit.
 
 A room offer that arrives on a kept connector during the window **parks**
 rather than declines (`WatcherManager._park_if_reloading` raises a retryable
@@ -224,7 +243,9 @@ computed twice.
 ### 2.8 Digest and `config show`
 
 The digest is SHA-256 over a canonical serialization (sorted keys) of the
-**resolved** config — templates and inheritance expanded — so semantically
+**resolved** config — templates and inheritance expanded, connectors keyed
+by name so that reordering them is no change to the digest just as it is
+none to the diff (rule order stays significant in both) — so semantically
 identical files hash identically and comments never matter. It is over the
 unredacted values: a rotated secret changes it, which is the point of a
 fingerprint. `config show` prints it with a flattened dump (connectors keyed
