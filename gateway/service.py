@@ -534,6 +534,18 @@ class GatewayService:
         """
         for path, name in orphaned_state_files(e.name for e in self._entries):
             records = load_state(name)  # format already preflighted in __init__
+            try:
+                path.unlink()
+            except OSError as exc:
+                # Not released: the file, and the records in it, are still
+                # there and the next start finds them again. No AUDIT line —
+                # that would announce a release that did not happen, twice.
+                logger.warning(
+                    "Could not remove orphaned state file %s (%d record(s) of "
+                    "connector '%s' remain until the next start): %s",
+                    path, len(records), name, exc,
+                )
+                continue
             for record in records:
                 log_session_released(
                     logger,
@@ -544,11 +556,6 @@ class GatewayService:
                     session_id=record.session_id,
                     reason="connector-removed",
                 )
-            try:
-                path.unlink()
-            except OSError as exc:
-                logger.warning("Could not remove orphaned state file %s: %s", path, exc)
-                continue
             logger.warning(
                 "Removed state file %s — connector '%s' is no longer configured; "
                 "its %d record(s) are logged above", path.name, name, len(records),

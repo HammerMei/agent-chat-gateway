@@ -832,6 +832,14 @@ first-match for its room against the connector's current ordered rules.
   too: one AUDIT line per record, then the file is removed. Nothing would
   ever open it again.
 
+Reconciliation matches the room **as the record describes it** — the name the
+record carries, which the inbound stream refreshes on every frame
+(`observe_room_name`). A room renamed while the daemon was down is therefore
+matched under its old name at this boot; the first frame teaches the new name,
+and the next reconciliation (the next boot, or a `config reload`) applies the
+rules to it. That is the same "sticky between reconciliations" rule as for
+rule edits, and it keeps this pass free of network calls.
+
 Boot has no operator to ask, so it applies the plan and logs it — one summary
 line, plus one line per record that changed. The preview is `config reload
 --dry-run` (next increment), which renders the same plan without acting.

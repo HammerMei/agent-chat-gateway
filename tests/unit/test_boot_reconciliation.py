@@ -275,3 +275,25 @@ class TestSessionsAcrossReMaterialization(IsolatedTestCase):
         row = await _listed(mgr, "eng-backend")
         self.assertEqual(row["session_id"], "sess-nameless")
         self.assertTrue(any("no room name recorded" in line for line in logs.output), logs.output)
+
+
+class TestAnExpiryThatDidNotApplyIsLoud(IsolatedTestCase):
+
+    async def test_a_failed_reclamation_is_reported_as_still_running(self):
+        """The shared tail swallows a failed reclamation because its other
+        callers are re-discovered later; nothing re-discovers this one before
+        the next boot, so the record still being installed is an ERROR."""
+        from unittest.mock import AsyncMock
+
+        eng = make_rule(room="eng-backend", name="eng", agent="a")
+        record = make_record_from_rule(eng, ROOM, session_id="sess-stuck",
+                                       dropped_at="2026-09-01T01:00:00-07:00")
+        mgr, loaded = _booted([record], [])
+        mgr._lifecycle.reclaim_room = AsyncMock(side_effect=OSError("disk full"))
+
+        with loaded, self.assertLogs("agent-chat-gateway.core.session_manager", level="ERROR") as logs:
+            await mgr.sync_only()
+
+        row = await _listed(mgr, "eng-backend")
+        self.assertEqual(row["session_id"], "sess-stuck", "still installed, honestly")
+        self.assertTrue(any("could NOT be expired" in line for line in logs.output), logs.output)

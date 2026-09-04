@@ -44,3 +44,26 @@ class TestOrphanedStateFiles(unittest.IsolatedAsyncioTestCase):
                  if "AUDIT: session released" in line and "sess-ghost-7777" in line]
         self.assertEqual(len(audit), 1, logs.output)
         self.assertIn("connector-removed", audit[0])
+
+    async def test_a_file_that_cannot_be_removed_is_not_reported_released(self):
+        from unittest.mock import patch
+
+        from gateway.service import GatewayService
+
+        self._write_state("ghost", [{
+            "watcher_name": "ghost:old-room", "session_id": "sess-ghost-8888",
+            "room_id": "r-old", "connector": "ghost", "agent": "default",
+            "rule_name": "eng", "rule": {"name": "eng"},
+            "config": {"name": "ghost:old-room", "connector": "ghost",
+                       "room": "old-room", "agent": "default"},
+        }])
+        service = GatewayService(write_gateway_config(self.tmp))
+
+        with patch("pathlib.Path.unlink", side_effect=OSError("read-only")), \
+                self.assertLogs("agent-chat-gateway", level="WARNING") as logs:
+            service._reclaim_orphaned_state_files()
+
+        self.assertTrue((self.runtime / "state.ghost.json").exists())
+        self.assertFalse(any("AUDIT: session released" in line for line in logs.output),
+                         "a release that did not happen is not announced")
+        self.assertTrue(any("remain until the next start" in line for line in logs.output))

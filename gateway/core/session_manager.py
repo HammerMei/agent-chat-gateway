@@ -558,6 +558,19 @@ class SessionManager:
                 )
             finally:
                 self._lifecycle._exit_verb()
+            if self._lifecycle.record_for_room(action.room_id) is record:
+                # The shared tail swallows a failed reclamation (a transient
+                # save error re-installs the record dormant) because its
+                # other callers are re-discovered by the membership
+                # reconciliation. Nothing re-discovers this one before the
+                # next boot, so say what is still running and why.
+                logger.error(
+                    "Reconciliation (%s): watcher '%s' (room %s) could NOT be "
+                    "expired — its record is still installed and may be "
+                    "recreated from a rule config.yaml no longer has, until the "
+                    "next start reconciles it again",
+                    self._connector_name, action.watcher_name, action.room_id,
+                )
         if rewritten:
             self._lifecycle.save_state()
         logger.info("Reconciliation (%s): %s", self._connector_name, plan.summary())
