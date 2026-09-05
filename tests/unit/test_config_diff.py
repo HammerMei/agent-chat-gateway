@@ -29,22 +29,9 @@ from gateway.config_diff import (
 )
 from gateway.core.config import ToolRule
 from gateway.core.watcher_rule import WatcherRule
+from tests.helpers import make_connector_config as _connector
+from tests.helpers import make_gateway_config as _config
 from tests.helpers import make_rule
-
-
-def _connector(name="rc", **raw):
-    return ConnectorConfig(name=name, type="rocketchat",
-                           raw={"server": {"url": "https://rc.example", **raw}})
-
-
-def _config(connectors=None, agents=None, rules=None, **kw):
-    return GatewayConfig(
-        connectors=connectors if connectors is not None else [_connector()],
-        agents=agents if agents is not None else {"a": AgentConfig(name="a")},
-        watcher_rules=rules if rules is not None else [
-            make_rule(room="eng", name="eng", connector="rc", agent="a")],
-        **kw,
-    )
 
 
 class TestEveryFieldIsClassified(unittest.TestCase):
@@ -108,12 +95,11 @@ class TestDiff(unittest.TestCase):
         diff = diff_configs(_config(connectors=[_connector(token="old")]),
                             _config(connectors=[_connector(token="new")]))
         self.assertEqual(diff.connectors.changed, ["rc"])
-        self.assertEqual(diff.restarted_connectors, ["rc"])
 
     def test_an_agent_working_directory_change_restarts_the_agent(self):
         diff = diff_configs(_config(), _config(agents={"a": AgentConfig(name="a",
                                                                       working_directory="/x")}))
-        self.assertEqual(diff.restarted_agents, ["a"])
+        self.assertEqual(diff.agents.changed, ["a"])
 
     def test_a_rule_edit_is_a_rules_change(self):
         rule = make_rule(room="eng-*", name="eng", connector="rc", agent="a")

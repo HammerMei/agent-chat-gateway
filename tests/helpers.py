@@ -448,6 +448,78 @@ async def settle_routing_tasks(connector):
         await asyncio.sleep(0)
 
 
+def make_bare_gateway_service(**attrs):
+    """A `GatewayService` built without `__init__`, every collaborator a double.
+
+    For tests that drive `run()`/`shutdown()` against mocked phases (the
+    handshake pipe, the identity barrier's ordering). Sets every attribute
+    `__init__` sets — a hand-built subset describes an object no code path
+    produces, and the first method to read an unset field fails several layers
+    from the cause; two copies of this fixture once broke together when
+    `_agent_errors` arrived. `attrs` override any of them.
+    """
+    import asyncio
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+
+    from gateway.service import GatewayService
+
+    svc = GatewayService.__new__(GatewayService)
+    svc._config = None
+    svc._config_path = None
+    svc._config_digest = ""
+    svc._config_loaded_at = ""
+    svc._reload_lock = asyncio.Lock()
+    svc._reloading = False
+    svc._shutdown_holds_reload_lock = False
+    svc._notifier = None
+    svc._agent_errors = {}
+    svc._core_config = MagicMock()
+    svc._registry = MagicMock()
+    svc._maps = SimpleNamespace(connector_view={})
+    svc._expiry_task = None
+    svc._scheduler_task = None
+    svc._agents = {}
+    svc._runtime_manager = MagicMock()
+    svc._runtime_manager.start_all = AsyncMock(return_value=[])
+    svc._runtime_manager.has_active_brokers = False
+    svc._runtime_manager.unavailable_agents = set()
+    svc._runtime_manager.stop_all = AsyncMock()
+    svc._dm_claims = {}
+    svc._entries = []
+    svc._job_store = None
+    svc._session_managers = {}
+    svc._job_scheduler = MagicMock()
+    svc._control = MagicMock()
+    svc._control.start = AsyncMock()
+    svc._control.stop = AsyncMock()
+    for name, value in attrs.items():
+        setattr(svc, name, value)
+    return svc
+
+
+def make_connector_config(name="rc", type="rocketchat", **server):
+    """A `ConnectorConfig` with a `server:` block — `server` keys land in `raw`."""
+    from gateway.config import ConnectorConfig
+
+    return ConnectorConfig(name=name, type=type,
+                           raw={"server": {"url": "https://rc.example", **server}})
+
+
+def make_gateway_config(connectors=None, agents=None, rules=None, **kw):
+    """A `GatewayConfig` through the real constructor: one rocketchat connector
+    `rc`, one agent `a`, one rule `eng` on room `eng` unless overridden."""
+    from gateway.config import GatewayConfig
+
+    return GatewayConfig(
+        connectors=connectors if connectors is not None else [make_connector_config()],
+        agents=agents if agents is not None else {"a": AgentConfig(name="a")},
+        watcher_rules=rules if rules is not None else [
+            make_rule(room="eng", name="eng", connector="rc", agent="a")],
+        **kw,
+    )
+
+
 def make_bare_session_manager(**attrs):
     """A `SessionManager` built without `__init__`, every collaborator a double.
 

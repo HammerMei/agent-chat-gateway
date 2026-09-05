@@ -1192,6 +1192,10 @@ class _ConfigCLIBase(_CLITestBase):
         self._write_config()
 
     def _write_config(self, rules: str = "") -> None:
+        # Local on purpose: `tests.helpers.gateway_config_text` writes script
+        # connectors only, and these tests need a rocketchat one — its `server`
+        # block carries the password `config show` must redact and the URL the
+        # validator checks.
         Path(self.cfg_path).write_text(textwrap.dedent(f"""\
             connectors:
               - name: rc

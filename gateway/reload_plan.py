@@ -73,6 +73,8 @@ class Degraded:
 
 @dataclass
 class ReloadPlan:
+    """What a reload does — planned, applied, or refused — in one shape."""
+
     dry_run: bool
     # Computed with no daemon, from the state files: the next boot's plan. The
     # connector/agent restart section does not apply — a boot restarts all.
@@ -108,13 +110,16 @@ class ReloadPlan:
         return 0
 
     def of(self, action: WatcherAction) -> list[WatcherChange]:
+        """The watcher changes of one kind."""
         return [w for w in self.watchers if w.action == action]
 
     @classmethod
     def refused(cls, error: str, *, dry_run: bool, findings: Iterable[dict] = ()) -> "ReloadPlan":
+        """A plan that never got to planning: invalid file, lock held, wrong path."""
         return cls(dry_run=dry_run, ok=False, error=error, findings=list(findings))
 
     def take_diff(self, diff: ConfigDiff) -> None:
+        """Copy the entity-level changes out of a `ConfigDiff`."""
         self.connectors = diff.connectors
         self.agents = diff.agents
         self.rules = diff.rules
@@ -122,6 +127,7 @@ class ReloadPlan:
         self.values = [{"path": v.path, "old": v.old, "new": v.new} for v in diff.values]
 
     def to_dict(self) -> dict:
+        """The `--json` document; `from_dict` is its inverse."""
         return {
             "ok": self.ok,
             "dry_run": self.dry_run,
@@ -208,7 +214,7 @@ class ReloadPlan:
             lines.append("  rules: reordered (first match wins — records are re-matched)")
         for v in self.values:
             lines.append(f"  {v['path']}: {v['old']} → {v['new']}")
-        if self.offline and (self.connectors or self.agents):
+        if self.offline:
             lines.append("  (connector and agent restarts do not apply — a start restarts all)")
 
         if self.watchers:
@@ -276,8 +282,8 @@ def plan_connector_records(
     """What the reload does to one connector's records.
 
     The reconciliation engine decides re-materialize and expire; a reload adds
-    `restart` for a **resident** record (a running processor, named by
-    watcher) whose connector restarts as a whole or whose agent restarts. A
+    `restart` for a **resident** record (a running processor, by room id)
+    whose connector restarts as a whole or whose agent restarts. A
     record that is re-materialized is restarted too if resident — the
     re-materialization line already implies it, so it is not listed twice. A
     record no processor holds is not "restarted": its next wake reads
@@ -299,7 +305,7 @@ def plan_connector_records(
             out.append(WatcherChange(action="expire", reason=action.reason, **common))
         elif action.action == "rematerialize":
             out.append(WatcherChange(action="rematerialize", **common))
-        elif action.watcher_name in resident and (
+        elif action.room_id in resident and (
                 restart_all or record.agent in restarted_agents):
             out.append(WatcherChange(
                 action="restart",
@@ -349,6 +355,15 @@ def orphan_removals(
     return names, changes
 
 
+def plan_persisted_records(connector: str, config: GatewayConfig) -> list[WatcherChange]:
+    """What settling a connector's state FILE does: the prune of static-era
+    records, then the reconciliation. Boot for every connector; a reload for a
+    connector it adds — a fresh manager hydrates the file the same way."""
+    records = load_state(connector)
+    return (static_era_changes(connector, records)
+            + plan_connector_records(connector, records, config.rules_for(connector)))
+
+
 def boot_plan(config: GatewayConfig) -> ReloadPlan:
     """The record-level plan the next start executes, from the state files.
 
@@ -366,10 +381,7 @@ def boot_plan(config: GatewayConfig) -> ReloadPlan:
     plan = ReloadPlan(dry_run=True, offline=True, digest=config_digest(config))
     configured = [c.name for c in config.connectors]
     for name in configured:
-        rules = [r for r in config.watcher_rules if r.connector == name]
-        records = load_state(name)
-        plan.watchers.extend(static_era_changes(name, records))
-        plan.watchers.extend(plan_connector_records(name, records, rules))
+        plan.watchers.extend(plan_persisted_records(name, config))
     names, changes = orphan_removals(configured)
     plan.connectors.removed.extend(names)
     plan.watchers.extend(changes)

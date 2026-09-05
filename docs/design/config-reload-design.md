@@ -212,7 +212,9 @@ refused by the apply lock.
 Apply is per section. A connector that fails to connect or sync, an agent
 whose backend fails to start, or a new connector caught by the identity
 barrier (boot fails fast there; a reload cannot take the running connectors
-down for it, so the *new* ones are refused) is left as a **degraded** entry:
+down for it, so the barrier runs once per new connector against the fleet
+accepted so far, and the one whose *addition* makes the conflict is refused
+— the others still come up) is left as a **degraded** entry:
 present in the mapping, no processors, visible in `status`, no automatic
 retry. The operator fixes what was wrong and reloads again — and **every
 reload retries the degraded sections**, whether or not their own entry

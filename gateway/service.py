@@ -66,7 +66,7 @@ from .reload_plan import (
     connector_removed_changes,
     orphan_removals,
     plan_connector_records,
-    static_era_changes,
+    plan_persisted_records,
 )
 
 logger = logging.getLogger("agent-chat-gateway.service")
@@ -339,6 +339,7 @@ class GatewayService:
         self._config_loaded_at = now_iso()
         self._reload_lock = asyncio.Lock()
         self._reloading = False
+        self._shutdown_holds_reload_lock = False
         self._notifier: ConnectorPermissionNotifier | None = None
         # Why each unavailable agent is unavailable — the start error, kept so
         # `status` can say more than "failed to start".
@@ -444,9 +445,7 @@ class GatewayService:
             # Rules give the manager runtime effect (§2.8). Filtered like the
             # watcher configs: a rule binds to one connector by name, and the
             # manager keys its matches on that same name.
-            watcher_rules=[
-                r for r in config.watcher_rules if r.connector == cc.name
-            ],
+            watcher_rules=config.rules_for(cc.name),
             # The membership-remove handler's job cancellation (§2.7).
             # The expiry-exemption oracle that used to sit here is gone with
             # the exemption itself: a job records the room it targets and can
@@ -868,9 +867,8 @@ class GatewayService:
         # handler in flight, and that handler is stopping, replacing and
         # starting the very entries the steps below tear down. Taken and never
         # released — nothing after this may reload.
-        lock = getattr(self, "_reload_lock", None)
-        if lock is not None and not getattr(self, "_shutdown_holds_reload_lock", False):
-            await lock.acquire()
+        if not self._shutdown_holds_reload_lock:
+            await self._reload_lock.acquire()
             self._shutdown_holds_reload_lock = True
         # Step 2: cancel the job scheduler before session managers stop.
         # This prevents a scheduler tick from trying to inject into a processor
@@ -1049,10 +1047,9 @@ class GatewayService:
             if e.name in removed:
                 plan.watchers.extend(connector_removed_changes(e.name, records))
                 continue
-            rules = [r for r in candidate.watcher_rules if r.connector == e.name]
             plan.watchers.extend(plan_connector_records(
-                e.name, records, rules,
-                resident=e.session_manager.resident_watcher_names(),
+                e.name, records, candidate.rules_for(e.name),
+                resident=e.session_manager.resident_rooms(),
                 restart_all=e.name in restarted,
                 restarted_agents=restarted_agents,
             ))
@@ -1062,10 +1059,7 @@ class GatewayService:
         # An added connector hydrates whatever state file already carries its
         # name (a connector renamed back, say); those records reconcile too.
         for name in diff.connectors.added:
-            rules = [r for r in candidate.watcher_rules if r.connector == name]
-            records = load_state(name)
-            plan.watchers.extend(static_era_changes(name, records))
-            plan.watchers.extend(plan_connector_records(name, records, rules))
+            plan.watchers.extend(plan_persisted_records(name, candidate))
         # Files on disk no candidate connector owns — the same sweep boot runs.
         # A removed entry's own file is planned above from its live records.
         names, changes = orphan_removals(candidate_names, skip={e.name for e in self._entries})
@@ -1188,8 +1182,7 @@ class GatewayService:
                     fleet.append(by_name[cc.name])
             self._install_entries(fleet)
             for e in kept:
-                e.session_manager.replace_rules(
-                    [r for r in candidate.watcher_rules if r.connector == e.name])
+                e.session_manager.replace_rules(candidate.rules_for(e.name))
 
             # 5. Start pass — agents first.
             if new_backends:
@@ -1313,17 +1306,22 @@ class GatewayService:
                 await self._degrade(e, f"failed to connect: {exc}", plan)
                 continue
             connected.append(e)
-        if connected:
-            try:
-                self._check_bot_identities([e for e in self._entries if not e.degraded])
-            except (DuplicateBotIdentityError, ConnectorIdentityError) as exc:
-                # Boot fails fast here; a reload cannot take the running
-                # connectors down for it, so the NEW ones are the ones refused
-                # — for a conflict, and for an identity nothing could read.
-                for e in connected:
-                    await self._degrade(e, f"bot identity check failed: {exc}", plan)
-                connected = []
+        # The identity barrier, one new connector at a time: boot fails fast on a
+        # conflict, a reload cannot take the running connectors down for one, so
+        # the new connector whose ADDITION creates the conflict is the one refused
+        # — for a conflict, and for an identity nothing could read — and the
+        # others still come up.
+        accepted = [e for e in self._entries if not e.degraded and e not in connected]
+        passing: list[ConnectorEntry] = []
         for e in connected:
+            try:
+                self._check_bot_identities(accepted + [e])
+            except (DuplicateBotIdentityError, ConnectorIdentityError) as exc:
+                await self._degrade(e, f"bot identity check failed: {exc}", plan)
+                continue
+            accepted.append(e)
+            passing.append(e)
+        for e in passing:
             try:
                 errors = await e.session_manager.sync_only(unavailable_agents=unavailable)
                 for msg in errors:

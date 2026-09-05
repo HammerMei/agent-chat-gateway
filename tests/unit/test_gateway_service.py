@@ -17,19 +17,11 @@ from gateway.core.bot_identity import (
 )
 from gateway.core.session_manager import JOBS_CANCELLED_BOT_REMOVED as REMOVED
 from gateway.service import GatewayService
+from tests.helpers import make_bare_gateway_service
 
 
 def _make_service() -> GatewayService:
-    service = GatewayService.__new__(GatewayService)
-    service._registry = MagicMock()
-    service._maps = SimpleNamespace(connector_view={})
-    service._expiry_task = None
-    service._runtime_manager = MagicMock()
-    service._control = MagicMock()
-    service._entries = []
-    service._dm_owner_connectors = set()
-    service._agent_errors = {}
-    return service
+    return make_bare_gateway_service()
 
 
 def _accountless():
@@ -672,20 +664,7 @@ class TestServiceRunFatalHandshake(unittest.IsolatedAsyncioTestCase):
     """GatewayService.run() fatal paths must not emit 'ok' to the handshake pipe."""
 
     def _make_svc(self):
-        svc = GatewayService.__new__(GatewayService)
-        svc._registry = MagicMock()
-        svc._maps = SimpleNamespace(connector_view={})
-        svc._expiry_task = None
-        svc._runtime_manager = MagicMock()
-        svc._runtime_manager.start_all = AsyncMock(return_value=[])
-        svc._runtime_manager.has_active_brokers = False
-        svc._runtime_manager.unavailable_agents = set()
-        svc._runtime_manager.stop_all = AsyncMock()
-        svc._control = MagicMock()
-        svc._control.stop = AsyncMock()
-        svc._entries = []
-        svc._agent_errors = {}
-        return svc
+        return make_bare_gateway_service()
 
     async def test_exception_during_startup_no_ok_in_pipe(self):
         """RuntimeError during startup must not produce 'ok' in the pipe."""

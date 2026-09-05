@@ -599,9 +599,9 @@ class SessionManager:
         """This connector's in-memory records — what a reload plans over."""
         return list(self._lifecycle.states().values())
 
-    def resident_watcher_names(self) -> set[str]:
-        """The watchers with a running processor — the ones a restart reaches."""
-        return {ws.watcher_name for ws in self._lifecycle.states().values()
+    def resident_rooms(self) -> set[str]:
+        """The rooms with a running processor — the ones a restart reaches."""
+        return {ws.room_id for ws in self._lifecycle.states().values()
                 if self._lifecycle.processor_for_room(ws.room_id) is not None}
 
     def set_unavailable_agents(self, names: set[str]) -> None:

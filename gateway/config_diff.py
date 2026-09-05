@@ -106,6 +106,7 @@ class EntityChanges:
         return bool(self.added or self.changed or self.removed)
 
     def to_dict(self) -> dict:
+        """The `--json` shape of one entity kind's changes."""
         return {"added": list(self.added), "changed": list(self.changed),
                 "removed": list(self.removed)}
 
@@ -121,6 +122,8 @@ class ValueChange:
 
 @dataclass
 class ConfigDiff:
+    """What changed between the active and the candidate config, by entity."""
+
     connectors: EntityChanges = field(default_factory=EntityChanges)
     agents: EntityChanges = field(default_factory=EntityChanges)
     rules: EntityChanges = field(default_factory=EntityChanges)
@@ -136,14 +139,6 @@ class ConfigDiff:
 
     def __bool__(self) -> bool:
         return bool(self.connectors or self.agents or self.rules_changed or self.values)
-
-    @property
-    def restarted_connectors(self) -> list[str]:
-        return list(self.connectors.changed)
-
-    @property
-    def restarted_agents(self) -> list[str]:
-        return list(self.agents.changed)
 
 
 def _entity_changes(old: dict[str, Any], new: dict[str, Any]) -> EntityChanges:
@@ -208,6 +203,20 @@ def canonical(value: Any) -> Any:
     return value
 
 
+def _identity_keyed(config: GatewayConfig) -> dict:
+    """The canonical form with connectors keyed by name — the shape both the
+    digest and the dump use.
+
+    Connectors are an identity-keyed set, and the diff treats them as one; the
+    digest must agree, or reordering two connectors would be "no changes" to
+    reload and "differs" to `config show`, forever. Rule order stays
+    significant — first match wins — and is not touched.
+    """
+    data = canonical(config)
+    data["connectors"] = {c["name"]: c for c in data["connectors"]}
+    return data
+
+
 def config_digest(config: GatewayConfig) -> str:
     """SHA-256 (hex) of the canonical serialization of the RESOLVED config.
 
@@ -217,13 +226,7 @@ def config_digest(config: GatewayConfig) -> str:
     changes it (the digest is over the unredacted values; it is a fingerprint,
     not a dump).
     """
-    data = canonical(config)
-    # Connectors are an identity-keyed set, and the diff treats them as one;
-    # the digest must agree, or reordering two connectors would be "no
-    # changes" to reload and "differs" to `config show`, forever. Rule order
-    # stays significant — first match wins — and is not touched.
-    data["connectors"] = {c["name"]: c for c in data["connectors"]}
-    payload = json.dumps(data, sort_keys=True, separators=(",", ":"))
+    payload = json.dumps(_identity_keyed(config), sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(payload.encode()).hexdigest()
 
 
@@ -237,48 +240,47 @@ def is_secret_key(key: str) -> bool:
     return any(marker in lowered for marker in SECRET_KEY_MARKERS)
 
 
-def flatten_config(config: GatewayConfig, *, redact: bool = True) -> list[tuple[str, Any]]:
-    """`(dotted.path, value)` pairs over the canonical form, for `config show`.
+def _redact(value: Any, key: str = "") -> Any:
+    """The one redaction walk: a scalar under a key that names a password,
+    token or secret becomes `***`, at any depth — inside a connector's
+    type-specific `raw` block included; a list under such a key redacts each
+    element (the key is the list's)."""
+    if key and is_secret_key(key) and not isinstance(value, (dict, list)):
+        return REDACTED
+    if isinstance(value, dict):
+        return {k: _redact(v, k) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_redact(v, key) for v in value]
+    return value
+
+
+def redacted_config(config: GatewayConfig) -> dict:
+    """The canonical form with secrets redacted, for `--json` output."""
+    return _redact(canonical(config))
+
+
+def flatten_config(config: GatewayConfig) -> list[tuple[str, Any]]:
+    """`(dotted.path, value)` pairs over the redacted canonical form, for `config show`.
 
     Lists index as `[n]`; connectors are keyed by name rather than position so
-    two machines' dumps line up. With `redact`, a value under a key that
-    names a password, token or secret is replaced by `***` — whatever depth
-    it sits at, including inside a connector's type-specific `raw` block.
+    two machines' dumps line up.
     """
-    data = canonical(config)
-    data["connectors"] = {c["name"]: c for c in data["connectors"]}
     out: list[tuple[str, Any]] = []
 
-    def walk(prefix: str, value: Any, key: str) -> None:
-        if redact and key and is_secret_key(key) and not isinstance(value, (dict, list)):
-            out.append((prefix, REDACTED))
-            return
+    def walk(prefix: str, value: Any) -> None:
         if isinstance(value, dict):
             if not value:
                 out.append((prefix, {}))
             for k in sorted(value):
-                walk(f"{prefix}.{k}" if prefix else k, value[k], k)
+                walk(f"{prefix}.{k}" if prefix else k, value[k])
             return
         if isinstance(value, list):
             if not value:
                 out.append((prefix, []))
             for i, item in enumerate(value):
-                walk(f"{prefix}[{i}]", item, key)
+                walk(f"{prefix}[{i}]", item)
             return
         out.append((prefix, value))
 
-    walk("", data, "")
+    walk("", _redact(_identity_keyed(config)))
     return out
-
-
-def redacted_config(config: GatewayConfig) -> dict:
-    """The canonical form with secrets redacted, for `--json` output."""
-    def scrub(value: Any, key: str) -> Any:
-        if key and is_secret_key(key) and not isinstance(value, (dict, list)):
-            return REDACTED
-        if isinstance(value, dict):
-            return {k: scrub(v, k) for k, v in value.items()}
-        if isinstance(value, list):
-            return [scrub(v, key) for v in value]
-        return value
-    return scrub(canonical(config), "")

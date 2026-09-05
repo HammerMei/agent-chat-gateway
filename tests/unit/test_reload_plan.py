@@ -58,14 +58,14 @@ class TestPlanConnectorRecords(unittest.TestCase):
     def test_a_connector_restart_restarts_only_resident_records(self):
         out = plan_connector_records(
             "rc", [self.rec_eng, self.rec_ops], [self.eng, self.ops],
-            resident={self.rec_eng.watcher_name}, restart_all=True)
+            resident={self.rec_eng.room_id}, restart_all=True)
         self.assertEqual([(w.action, w.handle, w.reason) for w in out],
                          [("restart", self.rec_eng.watcher_name, "connector restarts")])
 
     def test_an_agent_restart_restarts_resident_records_on_that_agent(self):
         out = plan_connector_records(
             "rc", [self.rec_eng, self.rec_ops], [self.eng, self.ops],
-            resident={self.rec_eng.watcher_name, self.rec_ops.watcher_name},
+            resident={self.rec_eng.room_id, self.rec_ops.room_id},
             restarted_agents={"b"})
         self.assertEqual([(w.action, w.handle, w.reason) for w in out],
                          [("restart", self.rec_ops.watcher_name, "agent 'b' restarts")])
@@ -73,7 +73,7 @@ class TestPlanConnectorRecords(unittest.TestCase):
     def test_a_rematerialized_resident_record_is_listed_once(self):
         eng2 = make_rule(room="eng", name="eng", connector="rc", agent="b")
         out = plan_connector_records("rc", [self.rec_eng], [eng2],
-                                     resident={self.rec_eng.watcher_name}, restart_all=True)
+                                     resident={self.rec_eng.room_id}, restart_all=True)
         self.assertEqual([w.action for w in out], ["rematerialize"])
 
     def test_connector_removed_expires_every_record(self):
@@ -185,6 +185,11 @@ class TestRendering(unittest.TestCase):
         self.assertIn("connectors: - ghost (removed)", text)
         self.assertIn("do not apply", text)
         self.assertIn("next start", text)
+
+    def test_offline_render_says_so_even_with_record_changes_only(self):
+        plan = self._plan(offline=True, watchers=[WatcherChange(
+            "rc", "r1", "rc:eng", "a", "expire", session_id="s", reason="no-rule-matches")])
+        self.assertIn("do not apply", plan.render(), "the section is marked, not dropped")
 
 
 if __name__ == "__main__":

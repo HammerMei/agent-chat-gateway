@@ -453,6 +453,44 @@ class TestConnectorChanges(_ReloadCase):
         self.assertEqual(self.service.describe_config()["digest"], result["digest"],
                          "the config IS active — the operator fixes and reloads again")
 
+    async def test_only_the_new_connector_that_collides_is_degraded_at_the_identity_barrier(self):
+        """Boot fails fast on a shared bot account; a reload cannot take the running
+        connectors down for it, so the new connector whose addition makes the
+        conflict is refused — and only that one."""
+        from gateway.connectors import connector_factory as real_factory
+        from gateway.core.bot_identity import BotIdentity
+
+        identities = {
+            "script": BotIdentity("rocketchat", "https://chat.example", "acct-1"),
+            "second": BotIdentity("rocketchat", "https://chat.example", "acct-2"),
+            "third": BotIdentity("rocketchat", "https://chat.example", "acct-1"),  # same as script
+        }
+
+        def _factory(cc):
+            connector = real_factory(cc)
+            connector.bot_identity = lambda: identities[cc.name]
+            return connector
+
+        with patch("gateway.service.connector_factory", side_effect=_factory):
+            await self._boot()
+            self._rewrite(self._text(connectors=("script", "second", "third"), rules=[
+                {"name": "w1", "agent": "default", "connector": "script",
+                 "rooms": {"include": ["script"]}},
+                {"name": "w2", "agent": "default", "connector": "second",
+                 "rooms": {"include": ["script"]}},
+                {"name": "w3", "agent": "default", "connector": "third",
+                 "rooms": {"include": ["script"]}},
+            ]))
+            result = await self._reload()
+
+        self.assertEqual(result["exit_code"], 2, result)
+        self.assertEqual([(d["kind"], d["name"]) for d in result["degraded"]],
+                         [("connector", "third")])
+        self.assertIn("same bot account", result["degraded"][0]["error"])
+        rows = await self._rows()
+        self.assertEqual(rows["second:script"]["state"], "active", "the other new one came up")
+        self.assertEqual(rows["script:script"]["state"], "active", "the running one was not touched")
+
     async def test_a_degraded_connector_is_retried_by_the_next_reload_even_if_unchanged(self):
         await self._boot()
         self._rewrite(self._two())
@@ -615,6 +653,15 @@ class TestValuesAndRefusals(_ReloadCase):
                          [{"path": "max_queue_depth", "old": 100, "new": 7}])
         self.assertEqual(result["watchers"], [])
         self.assertEqual(self.service._core_config.max_queue_depth, 7)
+
+    async def test_scheduler_settings_are_swapped_in_place_without_restarts(self):
+        await self._boot()
+        self._rewrite(self._text(extra="scheduler:\n  completed_job_ttl_days: 1\n"))
+        result = await self._reload()
+        self.assertEqual(result["changes"]["values"],
+                         [{"path": "scheduler.completed_job_ttl_days", "old": 7, "new": 1}])
+        self.assertEqual(result["watchers"], [])
+        self.assertEqual(self.service._job_scheduler.completed_job_ttl_days, 1)
 
     async def test_an_invalid_file_is_refused_with_findings_and_nothing_changes(self):
         await self._boot()
