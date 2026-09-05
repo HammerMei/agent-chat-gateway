@@ -214,11 +214,14 @@ class RoomPattern:
             elif t.kind is _Kind.ANY_RUN:
                 out.append("*")
             else:
-                # A marker in BOTH cases, so a sorted member `!` or `^` can never
-                # land where the parser would read it as negation: `[a!]` and
-                # `[!a]` are different classes and must spell differently. Not
-                # a valid glob — this is a fingerprint, `raw` is for reading.
-                out.append("[" + ("!" if t.negated else "=") + "".join(sorted(t.members)) + "]")
+                # Members as comma-separated code points: the body holds only hex
+                # digits and commas, so the first `]` closes the class and a
+                # member `]`, `!` or `^` can never be misread (`[]=]` vs `[=]]`,
+                # `[a!]` vs `[!a]`). A literal `[` cannot occur (it always opens a
+                # class), so `[` unambiguously starts a class token. Not a valid
+                # glob — this is a fingerprint, `raw` is for reading.
+                body = ",".join(format(ord(c), "x") for c in sorted(t.members))
+                out.append("[" + ("!" if t.negated else "=") + body + "]")
         return "".join(out)
 
     def __hash__(self) -> int:

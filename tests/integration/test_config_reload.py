@@ -468,6 +468,26 @@ class TestAgentRestartOrdering(_ReloadCase):
         self.assertEqual(self.service._entries[0].degraded, "", "the connector runs on")
         self.assertEqual((await self._rows())["script:script"]["state"], "failed")
 
+    async def test_a_room_whose_stop_raised_late_is_still_started_again(self):
+        """`_stop_processor` raises at the unsubscribe AFTER removing the processor;
+        the room is stopped, noisily, and must come back like the others."""
+        await self._boot()
+        sm = self.service._session_managers["script"]
+
+        async def _unsub_fails(*a, **kw):
+            raise RuntimeError("unsubscribe timed out")
+
+        self._rewrite(self._text(agents={"default": {
+            "type": "claude", "working_directory": str(self.tmp), "timeout": 99}}))
+        with patch.object(sm._connector, "unsubscribe_room", side_effect=_unsub_fails):
+            result = await self._reload()
+
+        self.assertEqual(result["exit_code"], 2, result)
+        self.assertTrue(any("stopped with errors" in d["error"] for d in result["degraded"]),
+                        result["degraded"])
+        self.assertEqual((await self._rows())["script:script"]["state"], "active",
+                         "reported, and still brought back on the new backend")
+
     async def test_a_kept_lifecycle_learns_which_agents_are_unavailable(self):
         await self._boot()
         sm = self.service._session_managers["script"]
@@ -813,17 +833,21 @@ class TestConnectorChanges(_ReloadCase):
         self.assertIn("kaboom", result["error"])
         self.assertEqual([e.name for e in self.service._entries], ["script", "second"],
                          "every connector the candidate names has an entry")
+        self.assertTrue(self.service._entries[0].degraded,
+                        "the kept manager may be half-applied — degraded until restarted")
         self.assertTrue(self.service._entries[1].degraded)
         self.assertFalse(sm._lifecycle.transitions_disarmed, "the kept manager is re-armed")
         self.assertIsNotNone(self.service._scheduler_task)
         status = await self._dispatch(cmd="config-show", include_config=False)
-        self.assertEqual([d["name"] for d in status["degraded"]], ["second"])
+        self.assertEqual([d["name"] for d in status["degraded"]], ["script", "second"])
         self.assertEqual(status["digest"], before,
                          "the previous config stays active — the file is NOT applied")
-        # The next reload re-diffs against the previous config and lands everything.
+        # The next reload re-diffs against the previous config, restarts the
+        # degraded kept manager whole and lands everything.
         second = await self._reload()
         self.assertEqual(second["exit_code"], 0, second)
         self.assertEqual(second["changes"]["connectors"]["added"], ["second"])
+        self.assertEqual(second["changes"]["connectors"]["changed"], ["script"])
         self.assertEqual((await self._rows())["second:script"]["state"], "active")
         self.assertEqual(self.service.describe_config()["digest"], second["digest"])
         self.assertEqual(len(self.service._entries), 2, "the placeholder was replaced, not doubled")
@@ -841,8 +865,11 @@ class TestConnectorChanges(_ReloadCase):
 
         self.assertEqual(result["exit_code"], 0, result)
         self.assertEqual(result["changes"]["connectors"]["removed"], ["second"])
+        self.assertEqual(result["changes"]["connectors"]["changed"], ["script"],
+                         "the kept manager the failed apply may have half-updated is restarted")
         self.assertEqual([e.name for e in self.service._entries], ["script"])
         self.assertEqual(self.service.describe_config()["degraded"], [])
+        self.assertEqual((await self._rows())["script:script"]["state"], "active")
 
     async def test_a_connector_whose_teardown_fails_is_replaced_and_kept_as_a_leftover(self):
         await self._boot()
@@ -1059,6 +1086,26 @@ class TestShutdownAndReload(_ReloadCase):
         self.service._reload_lock.release()
         await asyncio.wait_for(shutting, timeout=10)
         self.assertTrue(self.service._reload_lock.locked(), "held for good once shutting down")
+
+
+class TestMembershipRemovalDuringReload(_ReloadCase):
+
+    async def test_a_removal_that_arrives_while_quiesced_is_handled_after_rearm(self):
+        await self._boot()
+        sm = self.service._session_managers["script"]
+        reclaimed: list[str] = []
+
+        async def _reclaim(room_id, **kw):
+            reclaimed.append(room_id)
+
+        # Quiesce as the apply does, deliver the platform's "bot removed", re-arm.
+        with patch.object(sm, "_reclaim_removed_room", side_effect=_reclaim):
+            await sm.quiesce("a config reload is in progress")
+            await sm._on_membership_removed("script")
+            self.assertEqual(reclaimed, [], "deferred, not dropped, not acted on yet")
+            await sm.rearm()
+        self.assertEqual(reclaimed, ["script"])
+        self.assertEqual(sm._deferred_removals, [])
 
 
 class TestApplyIsQuiescent(_ReloadCase):

@@ -230,6 +230,16 @@ class TestDigest(unittest.TestCase):
         self.assertEqual(flat["max_queue_depth"], 100)
         self.assertNotIn("hunter2", json.dumps(flat))
 
+    def test_a_mapping_under_a_secret_key_is_redacted_whole(self):
+        cfg = _config(connectors=[_connector(client_secret={"value": "s3cret", "id": "app"},
+                                             api_tokens=[{"value": "t0k"}])])
+        flat = dict(flatten_config(cfg))
+        self.assertEqual(flat["connectors.rc.raw.server.client_secret"], "***")
+        self.assertEqual(flat["connectors.rc.raw.server.api_tokens"], "***")
+        text = json.dumps(flat) + json.dumps(redacted_config(cfg))
+        self.assertNotIn("s3cret", text)
+        self.assertNotIn("t0k", text)
+
     def test_redacted_json_document_is_serializable_and_scrubbed(self):
         cfg = _config(connectors=[_connector(token="t0k")])
         doc = json.dumps(redacted_config(cfg))

@@ -168,6 +168,13 @@ class SessionManager:
         # connect (`settle_records`); `sync_only` runs them itself when nothing
         # did — `run_once` and the tests boot a manager on its own.
         self._records_settled = False
+        # Bot-membership removals that arrived while a reload had this manager
+        # quiesced (#144): replayed on `rearm`, because the sweep's membership
+        # reconciliation covers paused and idle records only — an ACTIVE
+        # watcher removed from its room mid-reload would otherwise keep its
+        # session and its jobs indefinitely.
+        self._deferred_removals: list[str] = []
+        self._quiesced = False
 
     # ── Main entry point ──────────────────────────────────────────────────────
 
@@ -642,16 +649,22 @@ class SessionManager:
         the processors of an agent that IS are drained by `stop_watchers_on_agents`
         before that backend stops. `rearm` is the inverse.
         """
+        self._quiesced = True
         await self._watcher_manager.drain(reason)
         await self._lifecycle.drain_verbs()
         if self._sweep is not None:
             await self._sweep.stop()
 
-    def rearm(self) -> None:
-        """Open the manager again after a reload's apply window."""
+    async def rearm(self) -> None:
+        """Open the manager again after a reload's apply window, then handle
+        the membership removals that arrived while it was quiesced."""
         self._lifecycle.rearm_transitions()
+        self._quiesced = False
         if self._sweep is not None:
             self._sweep.start()
+        deferred, self._deferred_removals = self._deferred_removals, []
+        for room_id in deferred:
+            await self._on_membership_removed(room_id)
 
     async def reconcile_live(self) -> tuple[list[str], list[str]]:
         """Reconcile a RUNNING fleet against the rules just installed (#144).
@@ -706,16 +719,23 @@ class SessionManager:
         """
         targets = [r for r in self.records() if r.agent in agents]
 
-        async def _stop(record):
-            stopped = False
+        def gone(record) -> bool:
+            return self._lifecycle.processor_for_room(record.room_id) is None
 
-            async def once():
-                nonlocal stopped
-                stopped = await self._lifecycle.stop_resident(record.room_id)
-
-            err = await stop_with_retries(
-                f"connector '{self._connector_name}' watcher '{record.watcher_name}'", once)
-            return stopped, err
+        async def _stop(record) -> tuple[bool, BaseException | None]:
+            """(stopped, error). A stop that raised AFTER removing the processor
+            — at the unsubscribe — is a stop, noisily: not retried (a retry would
+            find nothing resident and "succeed", hiding the error), but reported,
+            and the room is started again like the others."""
+            try:
+                return await self._lifecycle.stop_resident(record.room_id), None
+            except Exception as first:
+                if gone(record):
+                    return True, first
+                err = await stop_with_retries(
+                    f"connector '{self._connector_name}' watcher '{record.watcher_name}'",
+                    lambda: self._lifecycle.stop_resident(record.room_id))
+                return gone(record), err
 
         results = await asyncio.gather(*[_stop(r) for r in targets])
         rooms: list[str] = []
@@ -724,9 +744,10 @@ class SessionManager:
             if err is not None:
                 failures.append(
                     f"Connector '{self._connector_name}': watcher '{record.watcher_name}' "
-                    f"could not be stopped before agent '{record.agent}' restarts ({err}); "
-                    f"its processor may still hold the old backend")
-            elif stopped:
+                    f"{'stopped with errors' if stopped else 'could not be stopped'} before "
+                    f"agent '{record.agent}' restarts ({err})"
+                    + ("" if stopped else "; its processor may still hold the old backend"))
+            if stopped:
                 rooms.append(record.room_id)
         return rooms, failures
 
@@ -1079,7 +1100,11 @@ class SessionManager:
         end state. Gated on disarm like the add: a reclaim racing stop_all
         would dismantle state the shutdown is flushing.
         """
-        if self._watcher_manager is None or self._watcher_manager.disarmed:
+        if self._watcher_manager is None:
+            return
+        if self._watcher_manager.disarmed:
+            if self._quiesced:
+                self._deferred_removals.append(room_id)  # a reload; replayed on rearm
             return
         # Counted in the shutdown barrier (Codex round 10): a removal past
         # the gate above but parked on the watcher lock or mid-reclaim was

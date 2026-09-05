@@ -1365,7 +1365,7 @@ class GatewayService:
             #    behind must be gone by then, or a legitimate second connector
             #    on the same account is refused for a room nothing answers.
             for e in kept:
-                e.session_manager.rearm()
+                await e.session_manager.rearm()
             restarted_rooms: dict[str, set[str]] = {}
             if diff.rules_changed:
                 for e in kept:
@@ -1411,7 +1411,8 @@ class GatewayService:
             # file is not applied and the next reload re-diffs everything. The
             # error itself goes back to the operator.
             logger.exception("config reload: apply failed part-way — re-arming what is running")
-            self._settle_after_failed_apply(candidate, kept, started, new_connectors, plan, exc)
+            await self._settle_after_failed_apply(
+                candidate, kept, started, new_connectors, plan, exc)
             raise
         finally:
             self._reloading = False
@@ -1436,7 +1437,7 @@ class GatewayService:
                 f"{msg} — the connector runs on; the room shows as failed in 'list': "
                 f"'resume' it, or send a message in the room"))
 
-    def _settle_after_failed_apply(
+    async def _settle_after_failed_apply(
         self, candidate: GatewayConfig, kept: "list[ConnectorEntry]", started: set[str],
         new_connectors: dict[str, Connector], plan: ReloadPlan, exc: BaseException,
     ) -> None:
@@ -1444,14 +1445,15 @@ class GatewayService:
 
         Every existing entry stays tracked (the final shutdown must visit a
         connector that was mid-teardown); every candidate connector without an
-        entry gets a degraded placeholder. An entry that is neither kept nor
-        known to have started is degraded with the error, so `status` shows it
-        and the next reload replaces it. The active config is NOT advanced:
-        kept managers may hold half-applied rules or a half-swapped core
-        config, and only a diff against the previous config finds that again.
+        entry gets a degraded placeholder. Every entry except the ones known to
+        have started cleanly is degraded with the error — the KEPT ones too,
+        because the apply may have swapped their rules or the shared core
+        config before it raised, and nothing short of a restart says which:
+        `status` shows them, and the next reload — even of the file put back —
+        restarts them whole. The active config is NOT advanced.
         """
         by_name = {e.name: e for e in self._entries}
-        untouched = {e.name for e in kept} | started
+        untouched = set(started)
         fleet: list[ConnectorEntry] = []
         for cc in candidate.connectors:
             entry = by_name.pop(cc.name, None)
@@ -1467,7 +1469,7 @@ class GatewayService:
         self._install_entries(fleet)
         for e in kept:
             try:
-                e.session_manager.rearm()
+                await e.session_manager.rearm()
             except Exception:
                 logger.exception("config reload: could not re-arm connector '%s'", e.name)
         self._start_scheduler()

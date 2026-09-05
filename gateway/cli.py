@@ -695,8 +695,15 @@ def _run_config_reload(args) -> None:
             timeout=600.0,
         )
         if "exit_code" not in response:
-            # Not a plan: the control server itself refused the request.
-            print(f"Error: {response.get('error', 'unknown error')}", file=sys.stderr)
+            # Not a plan: the control server itself refused the request. Still
+            # a document under --json — the failure path is where a script
+            # most needs `ok` and `error` as data.
+            error = response.get("error", "unknown error")
+            if args.json:
+                print(json.dumps(ReloadPlan.refused(error, dry_run=bool(args.dry_run)).to_dict(),
+                                 indent=2))
+            else:
+                print(f"Error: {error}", file=sys.stderr)
             sys.exit(1)
         plan = ReloadPlan.from_dict(response)
         _emit_plan(plan, args.json)

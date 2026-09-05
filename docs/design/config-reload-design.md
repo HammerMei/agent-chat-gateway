@@ -150,9 +150,12 @@ never one pass per change:
    connector keeps its scheduled jobs" is met, with no new scheduler state.
 2. **Quiesce every kept manager**: no new wake, join or operator verb — each
    refused with "a config reload is in progress" — and in-flight ones are
-   waited out; the sweep is stopped. Processors keep running: an in-flight
-   agent turn finishes on its own, and a processor the reload restarts is
-   drained by its own stop.
+   waited out; the sweep is stopped. A bot-membership removal that arrives
+   meanwhile is queued and handled when the manager re-arms (the sweep's
+   reconciliation covers paused and idle records only; an active watcher
+   removed from its room mid-reload would otherwise keep its session and
+   jobs). Processors keep running: an in-flight agent turn finishes on its
+   own, and a processor the reload restarts is drained by its own stop.
 3. **Stop pass**, in shutdown order. A removed connector's records go
    through the shared reclamation tail first, while its manager and the
    backends are still alive (backend session deleted where the backend can,
@@ -223,10 +226,11 @@ managers are re-armed, the scheduler restarted, every connector the candidate
 names — and every one the apply was tearing down — has an entry (the ones it
 lost, marked degraded with the error), and the **previous** config stays
 active. Kept managers may hold half-applied rules or a half-swapped core
-config, and only a diff against the previous config finds that again: `config
-show` says the file is not applied, and the next reload re-diffs everything,
-replaces the leftover entries (an existing entry under an *added* name is torn
-down first) and retries what did not land.
+config, and nothing short of a restart says which — so they are marked
+degraded too, and the next reload, even of the file put back, restarts them
+whole; `config show` says the file is not applied, and that reload re-diffs
+everything, replaces the leftover entries (an existing entry under an *added*
+name is torn down first) and retries what did not land.
 
 `shutdown()` takes the reload lock after closing the control socket: a
 reload already applying finishes first, because its stop and start passes

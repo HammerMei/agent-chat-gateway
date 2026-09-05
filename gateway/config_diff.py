@@ -255,11 +255,11 @@ def is_secret_key(key: str) -> bool:
 
 
 def _redact(value: Any, key: str = "") -> Any:
-    """The one redaction walk: a scalar under a key that names a password,
-    token or secret becomes `***`, at any depth — inside a connector's
-    type-specific `raw` block included; a list under such a key redacts each
-    element (the key is the list's)."""
-    if key and is_secret_key(key) and not isinstance(value, (dict, list)):
+    """The one redaction walk: WHATEVER sits under a key that names a password,
+    token or secret becomes `***` — a scalar, a list of them, or a mapping such
+    as `client_secret: {value: …}` — at any depth, a connector's type-specific
+    `raw` block included. Once a key is secret its whole subtree is."""
+    if key and is_secret_key(key):
         return REDACTED
     if isinstance(value, dict):
         return {k: _redact(v, k) for k, v in value.items()}

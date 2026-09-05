@@ -1330,6 +1330,14 @@ class TestCLIConfigReload(_ConfigCLIBase):
         self.assertEqual(code, 1)
         self.assertIn("nope", stderr)
 
+    def test_a_control_server_refusal_is_still_a_document_under_json(self):
+        self._start_daemon({"config-reload": {"ok": False, "error": "nope"}})
+        stdout, _, code = self._run_with(
+            ["config", "reload", "--config", self.cfg_path, "--json"], running=True)
+        self.assertEqual(code, 1)
+        doc = json.loads(stdout)
+        self.assertEqual((doc["ok"], doc["error"], doc["exit_code"]), (False, "nope", 1))
+
     def test_offline_dry_run_is_the_next_starts_plan(self):
         from gateway.core.state import save_state
         from gateway.core.watcher_manager import RoomRef
