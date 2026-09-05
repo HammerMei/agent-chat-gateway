@@ -322,6 +322,8 @@ async def boot_gateway_service(testcase, tmp, runtime, config, *, config_path=No
 
     patches = [
         patch("gateway.service._build_agent_backend", side_effect=_backend),
+        # A stop that fails is retried a few seconds apart; tests need not wait.
+        patch("gateway.core.retry_stop.STOP_RETRY_DELAY", 0.0),
         patch("gateway.control.CONTROL_SOCK", runtime / "control.sock"),
         patch("gateway.service.JobStore", side_effect=lambda: JobStore(runtime / "jobs.json")),
     ]
@@ -485,6 +487,9 @@ def make_bare_gateway_service(**attrs):
     svc._runtime_manager.has_active_brokers = False
     svc._runtime_manager.unavailable_agents = set()
     svc._runtime_manager.stop_all = AsyncMock()
+    svc._runtime_manager.retry_leftovers = AsyncMock()
+    svc._runtime_manager.leftovers = []
+    svc._leftover_entries = []
     svc._dm_claims = {}
     svc._entries = []
     svc._job_store = None

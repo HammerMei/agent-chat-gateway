@@ -32,6 +32,7 @@ from .injected_context_builder import InjectedContextBuilder
 from .lifecycle_sweep import LifecycleSweep
 from .permission import PermissionRegistry
 from .reconcile import RecordAction, reconcile_records, rematerialized_fields
+from .retry_stop import stop_with_retries
 from .session_maps import SessionMaps
 from .state import (
     StateFilter,
@@ -63,6 +64,10 @@ JOBS_CANCELLED_BOT_REMOVED = (
 JOBS_CANCELLED_ROOM_UNSERVED = (
     "the room is no longer available to this connector",
     "recreate the job if the room becomes available to this connector again.",
+)
+JOBS_CANCELLED_CONNECTOR_REMOVED = (
+    "its connector was removed from config.yaml",
+    "recreate the job against a current watcher if the connector returns.",
 )
 JOBS_CANCELLED_BY_RECONCILIATION = (
     "its watcher was expired by reconciliation — no rule in config.yaml covers the room any more",
@@ -686,7 +691,7 @@ class SessionManager:
         failures.extend(eager)
         return restarted, failures
 
-    async def stop_watchers_on_agents(self, agents: set[str]) -> list[str]:
+    async def stop_watchers_on_agents(self, agents: set[str]) -> tuple[list[str], list[str]]:
         """Drain and stop every resident processor bound to one of `agents` (#144).
 
         The first half of a reload's agent restart, run BEFORE the backend
@@ -694,24 +699,50 @@ class SessionManager:
         backend must still be alive for the drain to be a drain and not a
         string of failures posted to the room. The drains run concurrently,
         as `stop_all`'s do — each may take the full queue timeout, and one
-        busy agent can have many rooms. Returns the room ids stopped, so the
-        reload can start them again wherever their records point afterwards.
+        busy agent can have many rooms — and a stop that raises is retried
+        (`stop_with_retries`). Returns the room ids stopped, so the reload can
+        start them again wherever their records point afterwards, and one
+        message per room that would not stop.
         """
         targets = [r for r in self.records() if r.agent in agents]
-        results = await asyncio.gather(
-            *[self._lifecycle.stop_resident(r.room_id) for r in targets],
-            return_exceptions=True)
-        stopped: list[str] = []
-        for record, result in zip(targets, results, strict=True):
-            if isinstance(result, BaseException):
-                logger.error(
-                    "Connector '%s': watcher '%s' could not be stopped before agent "
-                    "'%s' restarts: %s", self._connector_name, record.watcher_name,
-                    record.agent, result,
-                )
-            elif result:
-                stopped.append(record.room_id)
-        return stopped
+
+        async def _stop(record):
+            stopped = False
+
+            async def once():
+                nonlocal stopped
+                stopped = await self._lifecycle.stop_resident(record.room_id)
+
+            err = await stop_with_retries(
+                f"connector '{self._connector_name}' watcher '{record.watcher_name}'", once)
+            return stopped, err
+
+        results = await asyncio.gather(*[_stop(r) for r in targets])
+        rooms: list[str] = []
+        failures: list[str] = []
+        for record, (stopped, err) in zip(targets, results, strict=True):
+            if err is not None:
+                failures.append(
+                    f"Connector '{self._connector_name}': watcher '{record.watcher_name}' "
+                    f"could not be stopped before agent '{record.agent}' restarts ({err}); "
+                    f"its processor may still hold the old backend")
+            elif stopped:
+                rooms.append(record.room_id)
+        return rooms, failures
+
+    async def reclaim_all(self, *, reason: str, jobs: tuple[str, str]) -> None:
+        """Reclaim every record — the removal path's shared tail, per room (#144).
+
+        For a connector `config reload` removes: with the manager and the
+        backends still alive, each record goes through `reclaim_room` (backend
+        session deleted where the backend can, prompt file and attachment
+        workspace removed, one AUDIT line) and its jobs are cancelled — what
+        boot's orphan sweep cannot do for a file whose connector is gone, and
+        what unlinking the file alone would leave behind.
+        """
+        for record in self.records():
+            await self._reclaim_removed_room(
+                record.room_id, reason=reason, expected=record, jobs=jobs)
 
     async def start_watchers_on_agents(
         self, agents: set[str], *, rooms: Collection[str] = (),

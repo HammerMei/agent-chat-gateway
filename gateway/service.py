@@ -48,8 +48,9 @@ from .core.permission import (
     PermissionRegistry,
 )
 from .core.reconcile import orphan_decisions
+from .core.retry_stop import STOP_ATTEMPTS, stop_with_retries
 from .core.scheduler import JobScheduler
-from .core.session_manager import SessionManager
+from .core.session_manager import JOBS_CANCELLED_CONNECTOR_REMOVED, SessionManager
 from .core.session_maps import SessionMaps
 from .core.session_release import log_session_released
 from .core.state import (
@@ -131,6 +132,10 @@ class AgentRuntimeManager:
         self._agents = agents
         self._brokers: dict[str, PermissionBroker] = {}
         self._unavailable: set[str] = set()
+        # Backends and brokers a reload replaced but could not stop (#144):
+        # `(agent, kind, object, error)`. Tracked so the final shutdown tries
+        # them again and `status` names them; nothing else is done to them.
+        self._leftovers: list[tuple[str, str, object, str]] = []
 
     async def start_all(
         self,
@@ -247,36 +252,55 @@ class AgentRuntimeManager:
         return errors
 
     async def stop_all(self) -> None:
-        """Stop all brokers and backends (reverse of start order). Best-effort:
-        shutdown logs a backend that would not stop and carries on."""
+        """Stop all brokers and backends (reverse of start order), then try the
+        leftovers of earlier reloads once more. Best-effort: shutdown logs what
+        would not stop and carries on."""
         await self.stop_some(set(self._agents))
+        await self.retry_leftovers()
 
-    async def stop_some(self, names: set[str]) -> dict[str, BaseException]:
+    async def stop_some(self, names: set[str]) -> dict[str, str]:
         """Stop the brokers and backends of `names` (reverse of start order).
 
-        Idempotent per the backend contract; an agent not in the dict is
-        skipped. Returns the backends that raised, by agent name: `stop_all`
-        (shutdown) only logs them, but `config reload` must not replace a
-        backend that may still own its sidecar — the old instance would be
-        untracked, and nothing would ever stop it.
+        Each stop is retried (`stop_with_retries`); one that still raises is
+        kept in `leftovers` — tracked, tried again at shutdown, named by
+        `status` — and reported by agent name in the return value. A broker
+        that would not stop counts as that agent failing, exactly like its
+        backend: the reload replaces the agent regardless and says so; it
+        does not roll back or try another way to kill anything.
         """
+        failed: dict[str, str] = {}
         for name in [n for n in names if n in self._brokers]:
-            try:
-                await self._brokers.pop(name).stop()
-            except Exception as e:
-                logger.error("Error stopping broker for agent '%s': %s", name, e)
+            broker = self._brokers.pop(name)
+            err = await stop_with_retries(f"agent '{name}' permission broker", broker.stop)
+            if err is not None:
+                self._leftovers.append((name, "permission broker", broker, str(err)))
+                failed[name] = (f"its permission broker did not stop after {STOP_ATTEMPTS} "
+                                f"attempts: {err}")
 
         stopping = [(name, self._agents[name]) for name in names if name in self._agents]
-        backend_results = await asyncio.gather(
-            *[backend.stop() for _name, backend in stopping],
-            return_exceptions=True,
-        )
-        failed: dict[str, BaseException] = {}
-        for (name, _backend), result in zip(stopping, backend_results, strict=False):
-            if isinstance(result, BaseException):
-                logger.error("Error stopping backend for agent '%s': %s", name, result)
-                failed[name] = result
+        results = await asyncio.gather(*[
+            stop_with_retries(f"agent '{name}' backend", backend.stop)
+            for name, backend in stopping])
+        for (name, backend), err in zip(stopping, results, strict=True):
+            if err is not None:
+                self._leftovers.append((name, "backend", backend, str(err)))
+                msg = f"its backend did not stop after {STOP_ATTEMPTS} attempts: {err}"
+                failed[name] = f"{failed[name]}; {msg}" if name in failed else msg
         return failed
+
+    @property
+    def leftovers(self) -> list[tuple[str, str, str]]:
+        """`(agent, kind, error)` for every backend or broker still not stopped."""
+        return [(name, kind, err) for name, kind, _obj, err in self._leftovers]
+
+    async def retry_leftovers(self) -> None:
+        """Try once more to stop what earlier reloads could not; drop what stops."""
+        still: list[tuple[str, str, object, str]] = []
+        for name, kind, obj, err in self._leftovers:
+            again = await stop_with_retries(f"agent '{name}' leftover {kind}", obj.stop)
+            if again is not None:
+                still.append((name, kind, obj, str(again)))
+        self._leftovers = still
 
     def replace(self, name: str, backend: AgentBackend | None) -> None:
         """Install a rebuilt backend under `name`, or drop the agent (`None`).
@@ -352,6 +376,11 @@ class GatewayService:
         # Why each unavailable agent is unavailable — the start error, kept so
         # `status` can say more than "failed to start".
         self._agent_errors: dict[str, str] = {}
+        # Connector instances a reload replaced but could not shut down (#144):
+        # `(entry, error)`. Only ever DISCONNECTED again — at the next reload
+        # and at shutdown — never saved again: their records belong to the
+        # replacement now. `status` names them until they go.
+        self._leftover_entries: list[tuple[ConnectorEntry, str]] = []
         # Preflight — and settle — the persisted state BEFORE building anything.
         # Two read-only checks (they raise) around one write (the orphan sweep
         # removes files no configured connector owns; see below for why it must
@@ -905,6 +934,12 @@ class GatewayService:
                     entry.name,
                     result,
                 )
+        # Step 3b: the connector instances earlier reloads could not shut down —
+        # disconnected once more, never saved (their records are the
+        # replacement's now).
+        for entry, _err in self._leftover_entries:
+            await stop_with_retries(f"leftover connector '{entry.name}'",
+                                    entry.connector.disconnect)
         # Step 4: stop agent runtime (brokers, backends).
         try:
             await self._runtime_manager.stop_all()
@@ -958,8 +993,19 @@ class GatewayService:
                 Degraded("connector", e.name, e.degraded).to_dict()
                 for e in self._entries if e.degraded
             ] + [
+                Degraded("connector", e.name,
+                         f"a previous instance did not shut down ({err}); it is disconnected "
+                         f"again at the next reload and at shutdown — check the process now"
+                         ).to_dict()
+                for e, err in self._leftover_entries
+            ] + [
                 Degraded("agent", name, self._agent_errors.get(name, "failed to start")).to_dict()
                 for name in sorted(self._runtime_manager.unavailable_agents)
+            ] + [
+                Degraded("agent", name,
+                         f"a previous {kind} did not stop ({err}); it is stopped again at the "
+                         f"next reload and at shutdown — check the process now").to_dict()
+                for name, kind, err in self._runtime_manager.leftovers
             ],
         }
         if include_config:
@@ -1006,6 +1052,7 @@ class GatewayService:
                     dry_run=dry_run, findings=findings).to_dict()
             candidate = result.config
             diff = diff_configs(self._config, candidate)
+            await self._retry_leftovers()
             conflict = self._kept_identity_conflict(diff, candidate)
             if conflict:
                 return ReloadPlan.refused(conflict, dry_run=dry_run, findings=findings).to_dict()
@@ -1028,6 +1075,20 @@ class GatewayService:
             plan.applied = True
             logger.info("config reload: %s", plan.render().splitlines()[-1])
             return plan.to_dict()
+
+    async def _retry_leftovers(self) -> None:
+        """Once more, at every reload: disconnect the connector instances and
+        stop the backends earlier reloads could not. What stops leaves the
+        degraded list; what does not stays there, and the operator is told
+        again. No other means are tried."""
+        still: list[tuple[ConnectorEntry, str]] = []
+        for entry, err in self._leftover_entries:
+            again = await stop_with_retries(f"leftover connector '{entry.name}'",
+                                            entry.connector.disconnect)
+            if again is not None:
+                still.append((entry, str(again)))
+        self._leftover_entries = still
+        await self._runtime_manager.retry_leftovers()
 
     def _kept_identity_conflict(self, diff: ConfigDiff, candidate: GatewayConfig) -> str | None:
         """Would the candidate's rules make two KEPT connectors claim one account's DMs?
@@ -1137,23 +1198,34 @@ class GatewayService:
         Order, and why:
 
         0. Everything new is CONSTRUCTED first — backends, connectors. A factory
-           that raises refuses the whole reload with nothing touched.
+           that raises refuses the whole reload with nothing touched. That is
+           the LAST refusal: from here on, whatever fails degrades its section
+           and is reported; nothing is rolled back and nothing is killed by
+           another route (owner, 2026-09-05 — a rollback can fail too, and
+           even one that succeeds has not reloaded the config).
         1. The scheduler is paused (as shutdown does) so no fire lands in the
            window; a job due meanwhile fires on the restart's catch-up.
         2. Every kept manager is quiesced — no new wake, join or verb — so no
            watcher can start against a backend about to be stopped.
-        3. Stop pass, in shutdown order: removed and restarted connectors'
-           managers shut down (drain processors, save, disconnect); their
-           orphaned files are swept; changed and removed agents stop.
+        3. Stop pass, in shutdown order: a removed connector's records are
+           reclaimed through the shared tail while everything is alive; going
+           managers shut down; the processors of every changed or removed
+           agent are drained, while their backends are still alive; those
+           agents stop. Every stop is retried a few times; one that still will
+           not stop is kept as a LEFTOVER (tried again at the next reload and
+           at shutdown, named by `status`), the replacement proceeds, and the
+           plan carries a degraded finding saying so.
         4. Rebuild: the shared agents dict and the core config are updated in
            place; new entries replace old ones in candidate order; kept
            managers take the candidate's rules.
-        5. Start pass, in boot order: agents, then each new connector settles
-           its records, connects, passes the identity barrier and syncs. A
-           failure leaves a DEGRADED entry, never a half-started one.
-        6. Kept managers re-arm, reconcile against the new rules (restarting
-           re-materialized resident processors) and restart the processors of
-           changed agents. Then the scheduler, the active config, the digest.
+        5. Start pass, in boot order: agents; kept managers re-arm and
+           reconcile (before the identity barrier, as boot settles before it);
+           each new connector settles its records, connects, passes the
+           barrier and syncs. A failure leaves a DEGRADED entry, never a
+           half-started one.
+        6. Kept managers start what step 3 stopped and every was-active room
+           of a changed agent. Then the scheduler, the active config, the
+           digest.
         """
         removed = set(diff.connectors.removed)
         restarted = set(diff.connectors.changed)
@@ -1179,49 +1251,49 @@ class GatewayService:
         self._reloading = True
         kept: list[ConnectorEntry] = []
         started: set[str] = set()
-        # What a refusal after the drain has to undo: the rooms drained per kept
-        # connector, started again on their (restarted) backends by the settle.
-        rollback_rooms: dict[str, list[str]] = {}
-        rollback_agents: set[str] = set()
         try:
             # 1–2. Pause the scheduler, still the kept managers. An entry that
             #      already exists under an ADDED name is one a failed apply left
             #      behind (a degraded placeholder, or a half-started connector):
             #      it goes the way a restarted one does, so its replacement is
-            #      never started beside it.
+            #      never started beside it. An entry neither config names — a
+            #      leftover once the file was put back — is a removal.
             await self._stop_scheduler()
             live = {e.name for e in self._entries}
-            # An entry neither config names — a failed apply's leftover once the
-            # file was put back — is a removal like any other.
-            stray = live - {c.name for c in candidate.connectors} - removed
-            removed |= stray
+            removed |= live - {c.name for c in candidate.connectors} - removed
             replacing = removed | restarted | (added & live)
             kept = [e for e in self._entries if e.name not in replacing]
             for e in kept:
                 await e.session_manager.quiesce(RELOAD_IN_PROGRESS)
 
-            # 3. Stop pass. Every step that can REFUSE comes before the first
-            #    step that cannot be undone (the orphan sweep, the rebuild), and
-            #    the one reversible step between them — draining processors —
-            #    is rolled back if the refusal comes after it. The going
-            #    connectors first: a teardown that fails refuses the rest of
-            #    the apply, because a manager that raised on the way down may
-            #    still hold transport tasks on its account, and starting a
-            #    replacement beside it would be two instances on one account
-            #    and one state file. Nothing has been touched yet; the except
-            #    path keeps the old entry, degraded, for the next reload.
+            # 3. Stop pass.
             going = [e for e in self._entries if e.name in replacing]
-            results = await asyncio.gather(
-                *[e.session_manager.shutdown() for e in going], return_exceptions=True)
-            failed = [(e, r) for e, r in zip(going, results, strict=True)
-                      if isinstance(r, BaseException)]
-            for e, result in failed:
-                logger.error("config reload: connector '%s' did not shut down cleanly: %s",
-                             e.name, result)
-            if failed:
-                names = ", ".join(f"'{e.name}'" for e, _ in failed)
-                raise RuntimeError(
-                    f"connector(s) {names} did not shut down cleanly — nothing was replaced")
+            #    A removed connector's records first, through the shared
+            #    reclamation tail — session deleted where the backend can,
+            #    prompt file and attachment workspace removed, jobs cancelled,
+            #    one AUDIT line each — while its manager and the backends are
+            #    still alive. Boot's orphan sweep cannot do this for a file
+            #    whose connector is gone; here nothing is gone yet.
+            for e in going:
+                if e.name in removed:
+                    await e.session_manager.reclaim_all(
+                        reason="connector-removed",  # boot's sweep spells it so; one grep
+                        jobs=JOBS_CANCELLED_CONNECTOR_REMOVED)
+            #    Then the going managers shut down. One that will not — after
+            #    the retries — is a leftover: still tracked, disconnected again
+            #    later, never saved again; its replacement goes ahead.
+            results = await asyncio.gather(*[
+                stop_with_retries(f"connector '{e.name}'", e.session_manager.shutdown)
+                for e in going])
+            for e, err in zip(going, results, strict=True):
+                if err is not None:
+                    self._leftover_entries.append((e, str(err)))
+                    plan.degraded.append(Degraded(
+                        "connector", e.name,
+                        f"its previous instance did not shut down after {STOP_ATTEMPTS} "
+                        f"attempts ({err}); the new configuration was applied beside it and "
+                        f"it is disconnected again at the next reload and at shutdown — it "
+                        f"may still hold the account's connection: check the process now"))
             #    Then the processors of every agent that stops or goes, while
             #    its backend is still alive: a processor's stop drains its queue
             #    by processing it, and against a stopped sidecar every drained
@@ -1232,30 +1304,20 @@ class GatewayService:
             stopping_agents = changed_agents | removed_agents
             stopped_rooms: dict[str, list[str]] = {}
             if stopping_agents:
-                # Across connectors as within one: the drains are independent,
-                # and their timeouts must not add up inside the operator's request.
                 drained = await asyncio.gather(
                     *[e.session_manager.stop_watchers_on_agents(stopping_agents) for e in kept])
-                stopped_rooms = {e.name: rooms for e, rooms in zip(kept, drained, strict=True)}
+                for e, (rooms, failures) in zip(kept, drained, strict=True):
+                    stopped_rooms[e.name] = rooms
+                    self._report_room_failures(plan, e.name, failures)
+            #    Then those agents' backends and brokers. One that will not stop
+            #    is a leftover — the agent is replaced regardless and reported.
             not_stopped = await self._runtime_manager.stop_some(stopping_agents)
-            if not_stopped:
-                # Same rule as a connector's teardown: a backend that would not
-                # stop may still own its sidecar, and a replacement started
-                # beside it would leave the old one untracked forever. The
-                # backends that DID stop start again here; the drained rooms
-                # are started by the settle, once the kept managers re-arm.
-                rollback_agents, rollback_rooms = stopping_agents, stopped_rooms
-                stopped_ok = stopping_agents - set(not_stopped)
-                if stopped_ok:
-                    notifier = (self._notifier
-                                or ConnectorPermissionNotifier(self._maps.connector_view))
-                    errors = await self._runtime_manager.start_some(
-                        stopped_ok, self._registry, notifier, self._maps)
-                    self._note_agent_errors(errors)
-                names = ", ".join(f"'{n}'" for n in sorted(not_stopped))
-                raise RuntimeError(
-                    f"agent backend(s) {names} did not stop cleanly — nothing was replaced")
-            # From here on nothing refuses: a failure degrades its section.
+            for name, err in sorted(not_stopped.items()):
+                plan.degraded.append(Degraded(
+                    "agent", name,
+                    f"{err}; the new backend was started beside the old one, which is "
+                    f"stopped again at the next reload and at shutdown — check the "
+                    f"process now"))
             self._install_entries(kept)
             self._reclaim_orphaned_state_files({c.name for c in candidate.connectors})
 
@@ -1340,34 +1402,32 @@ class GatewayService:
             self._config_digest = plan.digest
             self._config_loaded_at = now_iso()
         except BaseException as exc:
-            # A defect in the apply must not leave the daemon wedged or lying.
-            # What is running keeps running (kept managers re-armed, scheduler
-            # back); every connector the candidate names — and every one this
-            # apply was tearing down — has an entry, the ones it lost marked
-            # degraded with the error; and the PREVIOUS config stays active, so
-            # `config show` says the file is not applied and the next reload
-            # re-diffs everything and retries what did not land. The error
-            # itself goes back to the operator.
+            # A DEFECT in the apply (nothing above raises by design) must not
+            # leave the daemon wedged or lying. What is running keeps running
+            # (kept managers re-armed, scheduler back); every connector the
+            # candidate names — and every one this apply was tearing down —
+            # has an entry, the ones it lost marked degraded with the error;
+            # and the PREVIOUS config stays active, so `config show` says the
+            # file is not applied and the next reload re-diffs everything. The
+            # error itself goes back to the operator.
             logger.exception("config reload: apply failed part-way — re-arming what is running")
-            await self._settle_after_failed_apply(
-                candidate, kept, started, new_connectors, plan, exc,
-                rollback_agents=rollback_agents, rollback_rooms=rollback_rooms)
+            self._settle_after_failed_apply(candidate, kept, started, new_connectors, plan, exc)
             raise
         finally:
             self._reloading = False
 
     @staticmethod
     def _report_room_failures(plan: ReloadPlan, connector: str, failures: list[str]) -> None:
-        """One room did not come back; the connector runs on.
+        """One room did not come back (or did not stop); the connector runs on.
 
-        Every per-watcher failure on the apply path — a re-materialized
-        processor that would not restart, a room of a changed agent, an eager
-        room a new rule names, a new connector's own start errors — lands here
-        and nowhere else: as a degraded finding on the plan (exit 2) that
-        names the remedy, WITHOUT marking the connector degraded (its other
-        rooms are answering, and a degraded entry refuses every verb). `list`
-        shows the room failed; `resume`, or the room's next message, brings
-        it back.
+        Every per-watcher failure on the apply path — a processor that would
+        not stop before its agent changed, a re-materialized one that would
+        not restart, a room of a changed agent, an eager room a new rule
+        names, a new connector's own start errors — lands here and nowhere
+        else: as a degraded finding on the plan (exit 2) that names the
+        remedy, WITHOUT marking the connector degraded (its other rooms are
+        answering, and a degraded entry refuses every verb). `list` shows the
+        room failed; `resume`, or the room's next message, brings it back.
         """
         for msg in failures:
             logger.error("config reload: %s", msg)
@@ -1376,23 +1436,19 @@ class GatewayService:
                 f"{msg} — the connector runs on; the room shows as failed in 'list': "
                 f"'resume' it, or send a message in the room"))
 
-    async def _settle_after_failed_apply(
+    def _settle_after_failed_apply(
         self, candidate: GatewayConfig, kept: "list[ConnectorEntry]", started: set[str],
-        new_connectors: dict[str, Connector], plan: ReloadPlan, exc: BaseException, *,
-        rollback_agents: set[str], rollback_rooms: dict[str, list[str]],
+        new_connectors: dict[str, Connector], plan: ReloadPlan, exc: BaseException,
     ) -> None:
-        """Leave a consistent fleet behind a failed apply (see the caller).
+        """Leave a consistent fleet behind an apply that RAISED (a defect).
 
         Every existing entry stays tracked (the final shutdown must visit a
-        connector whose teardown failed); every candidate connector without an
+        connector that was mid-teardown); every candidate connector without an
         entry gets a degraded placeholder. An entry that is neither kept nor
         known to have started is degraded with the error, so `status` shows it
         and the next reload replaces it. The active config is NOT advanced:
         kept managers may hold half-applied rules or a half-swapped core
         config, and only a diff against the previous config finds that again.
-        Rooms the stop pass drained before a refusal (`rollback_rooms`) are
-        started again once their managers re-arm — their backends were
-        restarted by the refusing step.
         """
         by_name = {e.name: e for e in self._entries}
         untouched = {e.name for e in kept} | started
@@ -1414,17 +1470,6 @@ class GatewayService:
                 e.session_manager.rearm()
             except Exception:
                 logger.exception("config reload: could not re-arm connector '%s'", e.name)
-        for e in kept:
-            rooms = rollback_rooms.get(e.name)
-            if not rooms:
-                continue
-            try:
-                for msg in await e.session_manager.start_watchers_on_agents(
-                        rollback_agents, rooms=rooms):
-                    logger.error("config reload (rollback): %s", msg)
-            except Exception:
-                logger.exception("config reload (rollback): could not restart the drained "
-                                 "rooms of connector '%s'", e.name)
         self._start_scheduler()
 
     async def _start_entries(self, entries: "list[ConnectorEntry]", plan: ReloadPlan) -> set[str]:

@@ -153,21 +153,22 @@ never one pass per change:
    waited out; the sweep is stopped. Processors keep running: an in-flight
    agent turn finishes on its own, and a processor the reload restarts is
    drained by its own stop.
-3. **Stop pass**, in shutdown order — arranged so that **every step that can
-   refuse comes before the first step that cannot be undone**. Removed and
-   restarted connectors' managers shut down first; a teardown that raises
-   refuses the rest of the apply with nothing else touched (the old entry
-   stays tracked, degraded; a replacement is never started beside a connector
-   that may still hold transport tasks on its account). Then the processors
-   of every changed *or removed* agent are drained concurrently, while their
-   backends are still alive — the one reversible step. Then those agents
-   stop; a backend that raises on stop refuses too (it may still own its
-   sidecar; a replacement beside it would be untracked forever), and the
-   refusal rolls the drain back: the backends that did stop are started
-   again and the drained rooms restarted once their managers re-arm. Only
-   after that are the orphaned state files swept (AUDIT line per record) and
-   the fleet rebuilt; from there on nothing refuses — a failure degrades its
-   section.
+3. **Stop pass**, in shutdown order. A removed connector's records go
+   through the shared reclamation tail first, while its manager and the
+   backends are still alive (backend session deleted where the backend can,
+   prompt file and attachment workspace removed, jobs cancelled, one AUDIT
+   line each — what boot's orphan sweep cannot do for a file whose connector
+   is gone). Then the going managers shut down; then the processors of every
+   changed *or removed* agent are drained, concurrently, while their backends
+   are still alive; then those backends and brokers stop. **Every stop is
+   retried** a few times, a few seconds apart (`core.retry_stop`), and that
+   is the whole recovery. What still will not stop is a **leftover**: kept
+   tracked (disconnected or stopped once more at the next reload and at
+   shutdown — never saved again, its records belong to the replacement), named
+   by `status`, reported on the plan as a degraded finding that tells the
+   operator to look at the process now. The replacement proceeds regardless.
+   A permission broker that will not stop is that agent's failure, exactly
+   like its backend. Then the orphaned state files are swept.
 4. **Rebuild**: the one shared agents dict and the core config are updated in
    place (every lifecycle holds them by reference); new entries replace old
    ones in candidate order, in the same list and dict the control server and
@@ -206,16 +207,26 @@ processing it, and against a stopped sidecar every drained message would
 fail into the room. The kept lifecycles are also told which agents came up
 (`set_blocked_agents`) — boot writes that set once; a reload rewrites it.
 
-If the apply itself raises part-way (a defect, not a degraded section), the
-daemon is left consistent rather than half-swapped: the kept managers are
-re-armed, the scheduler restarted, every connector the candidate names — and
-every one the apply was tearing down — has an entry (the ones it lost,
-marked degraded with the error), and the **previous** config stays active.
-Kept managers may hold half-applied rules or a half-swapped core config,
-and only a diff against the previous config finds that again: `config show`
-says the file is not applied, and the next reload re-diffs everything, replaces
-the leftover entries (an existing entry under an *added* name is torn down
-first) and retries what did not land.
+**Nothing refuses after construction, and nothing is rolled back** (owner,
+2026-09-05). A rollback can fail too, and even one that succeeds has not
+reloaded the config; another way of killing a process that would not stop
+forks the behaviour without knowing why it was stuck. So when something
+unexpected happens the apply stops treating it as its problem: it logs, marks
+the section degraded, tells the operator which connector, agent or watcher
+may no longer be working and that action is needed now, and exits 2 — a
+reload with a degraded section is a failed reload, whatever else applied. The
+same rule holds for a section that fails to *start* at reload.
+
+If the apply itself raises part-way (a defect — nothing in it raises by
+design), the daemon is left consistent rather than half-swapped: the kept
+managers are re-armed, the scheduler restarted, every connector the candidate
+names — and every one the apply was tearing down — has an entry (the ones it
+lost, marked degraded with the error), and the **previous** config stays
+active. Kept managers may hold half-applied rules or a half-swapped core
+config, and only a diff against the previous config finds that again: `config
+show` says the file is not applied, and the next reload re-diffs everything,
+replaces the leftover entries (an existing entry under an *added* name is torn
+down first) and retries what did not land.
 
 `shutdown()` takes the reload lock after closing the control socket: a
 reload already applying finishes first, because its stop and start passes

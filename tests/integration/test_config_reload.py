@@ -359,7 +359,9 @@ class TestAgentRestartOrdering(_ReloadCase):
         after = (await self._rows())["script:script"]
         self.assertEqual((after["agent_name"], after["state"]), ("other", "active"))
 
-    async def test_a_backend_that_will_not_stop_is_not_replaced(self):
+    async def test_a_backend_that_will_not_stop_is_replaced_and_reported(self):
+        """No refusal, no rollback: the agent is replaced, the old backend is a
+        tracked leftover, the plan says so and exits 2 (owner, 2026-09-05)."""
         await self._boot()
         old_backend = self.service._agents["default"]
 
@@ -371,39 +373,62 @@ class TestAgentRestartOrdering(_ReloadCase):
             "type": "claude", "working_directory": str(self.tmp), "timeout": 99}}))
         result = await self._reload()
 
-        self.assertFalse(result["ok"])
-        self.assertIn("did not stop cleanly", result["error"])
-        self.assertIs(self.service._agents["default"], old_backend,
-                      "the backend that may still own its sidecar stays tracked")
-        self.assertEqual(self.service._core_config.agent_config("default").timeout, 360,
-                         "the previous config stays active")
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(result["exit_code"], 2)
+        self.assertTrue(result["applied"])
+        agent_findings = [d for d in result["degraded"] if d["kind"] == "agent"]
+        self.assertEqual([d["name"] for d in agent_findings], ["default"])
+        self.assertIn("did not stop after 3 attempts", agent_findings[0]["error"])
+        self.assertIn("check the process now", agent_findings[0]["error"])
+        self.assertIsNot(self.service._agents["default"], old_backend, "replaced regardless")
+        self.assertEqual(self.service._core_config.agent_config("default").timeout, 99,
+                         "the config IS applied")
+        self.assertEqual([(n, k) for n, k, _ in self.service._runtime_manager.leftovers],
+                         [("default", "backend")])
+        status = await self._dispatch(cmd="config-show", include_config=False)
+        self.assertIn("previous backend did not stop", status["degraded"][0]["error"])
+        self.assertEqual((await self._rows())["script:script"]["state"], "active",
+                         "the room runs on the new backend")
 
-    async def test_a_refused_backend_stop_rolls_the_drained_rooms_back(self):
-        """Draining happens before the backends stop; a refusal there must start the
-        drained rooms again on the backends it restarted — the previous config
-        stays active, so nothing else would."""
-        await self._boot(self._text(
-            agents={"default": {"type": "claude", "working_directory": str(self.tmp)},
-                    "other": {"type": "claude", "working_directory": str(self.tmp)}}))
-        other = self.service._agents["other"]
+    async def test_a_stop_that_succeeds_on_retry_is_not_degraded(self):
+        await self._boot()
+        backend = self.service._agents["default"]
+        real_stop = backend.stop
+        calls = {"n": 0}
 
-        async def _stuck():
-            raise RuntimeError("sidecar refuses to die")
+        async def _flaky():
+            calls["n"] += 1
+            if calls["n"] < 3:
+                raise RuntimeError("busy")
+            await real_stop()
 
-        other.stop = _stuck
-        self._rewrite(self._text(agents={
-            "default": {"type": "claude", "working_directory": str(self.tmp), "timeout": 99},
-            "other": {"type": "claude", "working_directory": str(self.tmp), "timeout": 99}}))
+        backend.stop = _flaky
+        self._rewrite(self._text(agents={"default": {
+            "type": "claude", "working_directory": str(self.tmp), "timeout": 99}}))
         result = await self._reload()
 
-        self.assertFalse(result["ok"])
-        self.assertIn("'other'", result["error"])
-        self.assertEqual((await self._rows())["script:script"]["state"], "active",
-                         "drained before the refusal, started again after it")
-        self.assertEqual([e.name for e in self.service._entries], ["script"])
-        self.assertEqual(self.service._entries[0].degraded, "")
+        self.assertEqual(result["exit_code"], 0, result)
+        self.assertEqual(calls["n"], 3, "two failures, then the retry that stopped it")
+        self.assertEqual(self.service._runtime_manager.leftovers, [])
 
-    async def test_a_removed_connector_stays_tracked_when_a_later_step_refuses(self):
+    async def test_a_broker_that_will_not_stop_is_the_agents_failure(self):
+        from unittest.mock import AsyncMock, MagicMock
+        await self._boot()
+        broker = MagicMock(stop=AsyncMock(side_effect=RuntimeError("port still bound")))
+        self.service._runtime_manager._brokers["default"] = broker
+        self._rewrite(self._text(agents={"default": {
+            "type": "claude", "working_directory": str(self.tmp), "timeout": 99}}))
+        result = await self._reload()
+
+        self.assertEqual(result["exit_code"], 2, result)
+        agent_findings = [d for d in result["degraded"] if d["kind"] == "agent"]
+        self.assertEqual([d["name"] for d in agent_findings], ["default"])
+        self.assertIn("permission broker did not stop", agent_findings[0]["error"])
+        self.assertEqual(broker.stop.await_count, 3)
+        self.assertEqual([(n, k) for n, k, _ in self.service._runtime_manager.leftovers],
+                         [("default", "permission broker")])
+
+    async def test_a_removed_connector_is_removed_even_when_a_backend_will_not_stop(self):
         await self._boot(self._text(connectors=("script", "second"), rules=[
             {"name": "w1", "agent": "default", "connector": "script",
              "rooms": {"include": ["script"]}},
@@ -415,27 +440,16 @@ class TestAgentRestartOrdering(_ReloadCase):
             raise RuntimeError("sidecar refuses to die")
 
         backend.stop = _stuck
-        # Remove `second` AND change the agent: the agent's stop refuses after
-        # `second` was shut down. It must stay tracked, degraded — the previous
-        # config still names it.
         self._rewrite(self._text(agents={"default": {
             "type": "claude", "working_directory": str(self.tmp), "timeout": 99}}))
         result = await self._reload()
 
-        self.assertFalse(result["ok"])
-        self.assertEqual([e.name for e in self.service._entries], ["script", "second"])
-        self.assertTrue(self.service._entries[1].degraded)
-        self.assertTrue((self.runtime / "state.second.json").exists(),
-                        "nothing destructive happened before the refusal")
-        status = await self._dispatch(cmd="config-show", include_config=False)
-        self.assertEqual([d["name"] for d in status["degraded"]], ["second"])
-
-        backend.stop = type(backend).stop.__get__(backend)  # the sidecar dies now
-        second = await self._reload()  # file unchanged
-        self.assertEqual(second["exit_code"], 0, second)
-        self.assertEqual(second["changes"]["connectors"]["removed"], ["second"])
+        self.assertEqual(result["exit_code"], 2, result)
         self.assertEqual([e.name for e in self.service._entries], ["script"])
         self.assertFalse((self.runtime / "state.second.json").exists())
+        self.assertEqual([d["name"] for d in result["degraded"] if d["kind"] == "agent"],
+                         ["default"])
+        self.assertEqual(self.service.describe_config()["digest"], result["digest"])
 
     async def test_a_room_that_fails_to_start_after_its_agent_changed_is_reported(self):
         await self._boot()
@@ -529,6 +543,25 @@ class TestConnectorChanges(_ReloadCase):
         self.assertEqual(result["exit_code"], 2, result)
         self.assertIn("nope", result["degraded"][0]["error"])
         self.assertEqual(self.service._entries[1].degraded, "", "the connector itself is up")
+
+    async def test_a_removed_connectors_records_go_through_the_shared_reclamation_tail(self):
+        await self._boot(self._two())
+        created = await self._dispatch(cmd="schedule-create", watcher="second:script",
+                                       message="ping", cron="0 9 * * *", times=0)
+        self.assertTrue(created["ok"], created)
+        sm = self.service._session_managers["second"]
+        real_reclaim = sm._lifecycle.reclaim_room
+        self._rewrite(self._text())
+
+        with patch.object(sm._lifecycle, "reclaim_room", wraps=real_reclaim) as reclaim:
+            result = await self._reload()
+
+        self.assertEqual(result["exit_code"], 0, result)
+        self.assertEqual(reclaim.await_count, 1, "each record through reclaim_room")
+        self.assertEqual(reclaim.await_args.kwargs["reason"], "connector-removed")
+        jobs = await self._dispatch(cmd="schedule-list", include_completed=True)
+        self.assertEqual([j["status"] for j in jobs["jobs"]], ["cancelled"], jobs)
+        self.assertIn("removed from config.yaml", jobs["jobs"][0]["cancel_reason"])
 
     async def test_a_removed_connector_expires_its_records_and_deletes_its_state_file(self):
         await self._boot(self._two())
@@ -811,31 +844,69 @@ class TestConnectorChanges(_ReloadCase):
         self.assertEqual([e.name for e in self.service._entries], ["script"])
         self.assertEqual(self.service.describe_config()["degraded"], [])
 
-    async def test_a_connector_whose_teardown_fails_is_not_replaced(self):
+    async def test_a_connector_whose_teardown_fails_is_replaced_and_kept_as_a_leftover(self):
         await self._boot()
         sm = self.service._session_managers["script"]
         entry = self.service._entries[0]
         self._rewrite(self._text().replace("- name: script\n  type: script",
                                            "- name: script\n  type: script\n  timezone: UTC"))
-        real_shutdown = sm.shutdown
 
-        async def _fail_once():
-            sm.shutdown = real_shutdown
-            raise OSError("disk full while saving state")
+        async def _stuck():
+            raise OSError("transport will not close")
 
-        sm.shutdown = _fail_once
+        # The realistic failure: processors stopped, state saved, then the
+        # transport will not close — `shutdown()` raises at its last step.
+        sm._connector.disconnect = _stuck
         result = await self._reload()
 
-        self.assertFalse(result["ok"])
-        self.assertIn("did not shut down cleanly", result["error"])
-        self.assertIs(self.service._entries[0], entry, "the old entry stays tracked")
-        self.assertTrue(entry.degraded)
-        self.assertEqual(len(self.service._entries), 1, "no replacement started beside it")
-
-        second = await self._reload()
-        self.assertEqual(second["exit_code"], 0, second)
-        self.assertIsNot(self.service._entries[0], entry)
+        self.assertEqual(result["exit_code"], 2, result)
+        finding = [d for d in result["degraded"] if d["kind"] == "connector"][0]
+        self.assertIn("previous instance did not shut down after 3 attempts", finding["error"])
+        self.assertIn("check the process now", finding["error"])
+        self.assertIsNot(self.service._entries[0], entry, "replaced regardless")
+        self.assertEqual(len(self.service._entries), 1)
+        self.assertEqual([e.name for e, _ in self.service._leftover_entries], ["script"])
         self.assertEqual((await self._rows())["script:script"]["state"], "active")
+        status = await self._dispatch(cmd="config-show", include_config=False)
+        self.assertIn("previous instance did not shut down", status["degraded"][0]["error"])
+
+        # Shutdown disconnects the leftover once more (retried) — and never saves it.
+        disconnects = {"n": 0}
+
+        async def _count():
+            disconnects["n"] += 1
+            raise OSError("still will not close")
+
+        entry.connector.disconnect = _count
+        with patch.object(entry.session_manager._lifecycle, "save_state") as save:
+            await self.service.shutdown()
+        self.assertEqual(disconnects["n"], 3, "three attempts, no other means")
+        save.assert_not_called()
+
+    async def test_a_leftover_that_disconnects_at_the_next_reload_leaves_the_degraded_list(self):
+        await self._boot()
+        sm = self.service._session_managers["script"]
+        self._rewrite(self._text().replace("- name: script\n  type: script",
+                                           "- name: script\n  type: script\n  timezone: UTC"))
+
+        real_disconnect = sm._connector.disconnect
+        calls = {"n": 0}
+
+        async def _stuck_then_fine():
+            calls["n"] += 1
+            if calls["n"] <= 3:
+                raise OSError("transport will not close")
+            await real_disconnect()
+
+        sm._connector.disconnect = _stuck_then_fine
+        first = await self._reload()
+        self.assertEqual(first["exit_code"], 2)
+        self.assertEqual(len(self.service.describe_config()["degraded"]), 1)
+
+        second = await self._reload()  # unchanged file; the leftover's disconnect now works
+        self.assertEqual(second["exit_code"], 0, second)
+        self.assertEqual(self.service._leftover_entries, [])
+        self.assertEqual(self.service.describe_config()["degraded"], [])
 
     async def test_a_reconciliation_failure_degrades_the_entry_and_is_retried(self):
         await self._boot()

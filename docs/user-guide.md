@@ -774,11 +774,14 @@ expired with its full session id logged (`AUDIT: session released`).
 
 **Exit codes:** `0` applied cleanly, or no changes; `1` the file is invalid or
 the command was refused (nothing changed); `2` applied, but a section is
-**degraded** — a connector that failed to reconnect or an agent whose backend
-failed to start. A degraded section stays visible in `status`, keeps its
-scheduled jobs, and is not retried on its own: fix what was wrong and reload
-again — every reload retries the degraded sections, even when the file did
-not change.
+**degraded** — a connector that failed to reconnect, an agent whose backend
+or permission broker failed to start or to stop, a watcher that did not come
+back. Treat `2` as a failed reload and act on it now: the output names the
+section and what to do; `status` keeps showing it. Nothing is rolled back and
+nothing is force-killed — a stop is retried a few times, and what still will
+not stop is left for you to look at (it is stopped again at the next reload
+and at shutdown). Fix what was wrong and reload again: every reload retries
+the degraded sections, even when the file did not change.
 
 **What it does not guarantee.** Messages arriving on a connector while it
 restarts may be lost, the same as for any connector restart. A reload cannot
