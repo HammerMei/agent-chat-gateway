@@ -144,6 +144,21 @@ class TestRuleChanges(_ReloadCase):
         self.assertEqual(load_state("script")[0].rule["session_idle_days"], 3,
                          "the record was re-materialized all the same")
 
+    async def test_an_expiry_that_does_not_go_through_is_not_a_clean_apply(self):
+        await self._boot()
+        sm = self.service._session_managers["script"]
+        self._rewrite(self._text(rules=[]))
+
+        async def _reclaim_fails(*a, **kw):
+            raise OSError("state file is read-only")
+
+        with patch.object(sm._lifecycle, "reclaim_room", side_effect=_reclaim_fails):
+            result = await self._reload()
+
+        self.assertEqual(result["exit_code"], 2, result)
+        self.assertIn("could not be expired", result["degraded"][0]["error"])
+        self.assertIn("script:script", await self._rows(), "the record is still installed")
+
     async def test_a_removed_rule_expires_the_record_and_logs_the_session_id(self):
         await self._boot()
         session = (await self._rows())["script:script"]["session_id"]
@@ -648,6 +663,56 @@ class TestConnectorChanges(_ReloadCase):
         self.assertEqual(rows["second:script"]["state"], "active", "the other new one came up")
         self.assertEqual(rows["script:script"]["state"], "active", "the running one was not touched")
 
+    async def test_a_rule_change_that_would_share_an_accounts_dms_is_refused_before_anything(self):
+        """Two connectors on one Mattermost bot account, safe while their teams keep
+        them apart; a rule-only reload opting both into `direct:` connects
+        nothing, so the barrier would never run — the pre-check refuses instead.
+        At the service seam: the loader refuses `direct:` on a script connector,
+        so the candidate is built from rule objects."""
+        from gateway.config_diff import diff_configs
+        from gateway.core.bot_identity import BotIdentity
+        from gateway.core.room_pattern import RoomPattern
+        from gateway.core.watcher_rule import RoomMatcher, WatcherRule
+        from tests.helpers import make_gateway_config
+
+        await self._boot(self._two())
+        for e in self.service._entries:
+            e.connector.bot_identity = (
+                lambda name=e.name: BotIdentity("mattermost", "https://mm.example", "acct-1",
+                                                scope=f"team-{name}"))
+
+        def _rule(name, connector, direct):
+            return WatcherRule(name=name, connector=connector, agent="default",
+                               rooms=RoomMatcher(include=(RoomPattern("script"),), direct=direct))
+
+        active = self.service._config
+        candidate = make_gateway_config(
+            connectors=list(active.connectors), agents=dict(active.agents),
+            rules=[_rule("w1", "script", True), _rule("w2", "second", True)])
+        conflict = self.service._kept_identity_conflict(diff_configs(active, candidate), candidate)
+        self.assertIsNotNone(conflict)
+        self.assertIn("direct messages", conflict)
+
+        safe = make_gateway_config(
+            connectors=list(active.connectors), agents=dict(active.agents),
+            rules=[_rule("w1", "script", True), _rule("w2", "second", False)])
+        self.assertIsNone(self.service._kept_identity_conflict(diff_configs(active, safe), safe))
+
+        # The wiring: a conflict refuses the reload — dry run and apply alike.
+        digest = self.service.describe_config()["digest"]
+        self._rewrite(self._text(connectors=("script", "second"), rules=[
+            {"name": "w1", "agent": "default", "connector": "script",
+             "rooms": {"include": ["script", "ops"]}},
+            {"name": "w2", "agent": "default", "connector": "second",
+             "rooms": {"include": ["script"]}}]))
+        with patch.object(self.service, "_kept_identity_conflict", return_value="would share DMs"):
+            dry = await self._reload(dry_run=True)
+            result = await self._reload()
+        for r in (dry, result):
+            self.assertFalse(r["ok"], r)
+            self.assertEqual(r["error"], "would share DMs")
+        self.assertEqual(self.service.describe_config()["digest"], digest, "nothing changed")
+
     async def test_a_degraded_connector_is_retried_by_the_next_reload_even_if_unchanged(self):
         await self._boot()
         self._rewrite(self._two())
@@ -730,6 +795,22 @@ class TestConnectorChanges(_ReloadCase):
         self.assertEqual(self.service.describe_config()["digest"], second["digest"])
         self.assertEqual(len(self.service._entries), 2, "the placeholder was replaced, not doubled")
 
+    async def test_a_leftover_entry_neither_config_names_is_removed_when_the_file_is_put_back(self):
+        await self._boot()
+        self._rewrite(self._two())
+        sm = self.service._session_managers["script"]
+        with patch.object(sm, "replace_rules", side_effect=RuntimeError("kaboom")):
+            await self._reload()
+        self.assertEqual([e.name for e in self.service._entries], ["script", "second"])
+
+        self._rewrite(self._text())  # the operator gives up and restores the file
+        result = await self._reload()
+
+        self.assertEqual(result["exit_code"], 0, result)
+        self.assertEqual(result["changes"]["connectors"]["removed"], ["second"])
+        self.assertEqual([e.name for e in self.service._entries], ["script"])
+        self.assertEqual(self.service.describe_config()["degraded"], [])
+
     async def test_a_connector_whose_teardown_fails_is_not_replaced(self):
         await self._boot()
         sm = self.service._session_managers["script"]
@@ -800,6 +881,29 @@ class TestConnectorChanges(_ReloadCase):
         self.assertIsNotNone(self.service._scheduler_task, "the scheduler is running again")
 
 
+class TestSymlinkedConfig(_ReloadCase):
+
+    async def test_a_repointed_config_symlink_is_followed_by_the_next_reload(self):
+        import os
+        real = self.tmp / "config.yaml"
+        link = self.tmp / "current.yaml"
+        write_gateway_config(self.tmp, text=self._text())
+        os.symlink(real, link)
+        from gateway.config import GatewayConfig
+        self.service = await boot_gateway_service(
+            self, self.tmp, self.runtime, GatewayConfig.from_file(str(link)), config_path=link)
+
+        newer = self.tmp / "config.v2.yaml"
+        newer.write_text(self._text(extra="max_queue_depth: 7\n"))
+        os.unlink(link)
+        os.symlink(newer, link)
+
+        result = await self._dispatch(cmd="config-reload", dry_run=False, config_path=str(link))
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(result["changes"]["values"][0]["new"], 7)
+        self.assertEqual(self.service._core_config.max_queue_depth, 7)
+
+
 class TestValuesAndRefusals(_ReloadCase):
 
     async def test_max_queue_depth_is_swapped_in_place_without_restarts(self):
@@ -867,7 +971,9 @@ class TestValuesAndRefusals(_ReloadCase):
         self.assertTrue(result["ok"])
         self.assertEqual(len(result["digest"]), 64)
         self.assertEqual(result["config"]["connectors"][0]["name"], "script")
-        self.assertEqual(result["config_path"], str(self.config_path.resolve()))
+        import os
+        self.assertEqual(result["config_path"], os.path.abspath(self.config_path),
+                         "absolute but not resolved — a symlink stays a symlink")
         self.assertTrue(result["loaded_at"])
 
 

@@ -691,7 +691,7 @@ def _run_config_reload(args) -> None:
     if running:
         response = _send_command(
             {"cmd": "config-reload", "dry_run": bool(args.dry_run),
-             "config_path": str(Path(args.config).resolve())},
+             "config_path": os.path.abspath(args.config)},
             timeout=600.0,
         )
         if "exit_code" not in response:
@@ -769,7 +769,7 @@ def _run_config_show(args) -> None:
 
     if args.json:
         print(json.dumps({
-            "config_path": str(Path(args.config).resolve()),
+            "config_path": os.path.abspath(args.config),
             "digest": digest,
             "active": active,
             "in_sync": in_sync,

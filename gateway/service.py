@@ -20,7 +20,6 @@ import asyncio
 import logging
 import os
 from dataclasses import dataclass
-from pathlib import Path
 
 from .agents import AgentBackend, GatewayBrokerConfig, check_backend_signatures
 from .agents.claude import ClaudeBackend
@@ -340,7 +339,10 @@ class GatewayService:
         # `config_path` is where a reload re-reads from; None (tests, scripts)
         # means reload has nothing to read and refuses.
         self._config = config
-        self._config_path = str(Path(config_path).resolve()) if config_path else None
+        # Absolute, NOT resolved: a deployment that repoints a `config.yaml`
+        # symlink expects the next reload to read the new target, and the CLI
+        # to be accepted with the path it has always passed.
+        self._config_path = os.path.abspath(config_path) if config_path else None
         self._config_digest = config_digest(config)
         self._config_loaded_at = now_iso()
         self._reload_lock = asyncio.Lock()
@@ -613,12 +615,25 @@ class GatewayService:
         rather than degrade quietly — a daemon that silently drops a connector looks
         healthy while half its rooms go unanswered.
         """
+        conflicts = find_identity_conflicts(self._identities(
+            self._entries if entries is None else entries, self._dm_claims, fold_records=True))
+        if conflicts:
+            raise DuplicateBotIdentityError("\n".join(conflicts))
+
+    def _identities(
+        self, entries: "list[ConnectorEntry]", claims: dict[str, DmClaim], *, fold_records: bool,
+    ) -> list[ConnectorIdentity]:
+        """Each connector's account and DM claim, as the barrier compares them."""
         identities: list[ConnectorIdentity] = []
-        for e in (self._entries if entries is None else entries):
+        for e in entries:
             identity = e.connector.bot_identity()
             if identity is None:
                 continue  # declares no shared account to collide over
-            claim = self._dm_claims.get(e.name, DmClaim())
+            claim = claims.get(e.name, DmClaim())
+            if not fold_records:
+                identities.append(ConnectorIdentity(
+                    connector_name=e.name, identity=identity, dms=claim))
+                continue
             # Widened by the connector's persisted DM records (Codex round
             # 6): sticky binding keeps a record answering its room after its
             # rule is deleted, so a rule-only claim misses exactly the
@@ -640,9 +655,7 @@ class GatewayService:
                     dms=claim,
                 )
             )
-        conflicts = find_identity_conflicts(identities)
-        if conflicts:
-            raise DuplicateBotIdentityError("\n".join(conflicts))
+        return identities
 
     def _reclaim_orphaned_state_files(self, configured: set[str]) -> None:
         """Remove state files of connectors that are no longer configured (#143).
@@ -976,7 +989,7 @@ class GatewayService:
             return ReloadPlan.refused(
                 "this daemon was not started from a config file — nothing to reload",
                 dry_run=dry_run).to_dict()
-        if config_path and str(Path(config_path).resolve()) != self._config_path:
+        if config_path and os.path.abspath(config_path) != self._config_path:
             return ReloadPlan.refused(
                 f"the daemon runs {self._config_path}, not {config_path} — pass that "
                 f"path, or restart the daemon on the new one", dry_run=dry_run).to_dict()
@@ -993,6 +1006,9 @@ class GatewayService:
                     dry_run=dry_run, findings=findings).to_dict()
             candidate = result.config
             diff = diff_configs(self._config, candidate)
+            conflict = self._kept_identity_conflict(diff, candidate)
+            if conflict:
+                return ReloadPlan.refused(conflict, dry_run=dry_run, findings=findings).to_dict()
             retried = self._retry_degraded(diff, candidate)
             try:
                 plan = self._plan_reload(diff, candidate, findings, dry_run=dry_run)
@@ -1012,6 +1028,35 @@ class GatewayService:
             plan.applied = True
             logger.info("config reload: %s", plan.render().splitlines()[-1])
             return plan.to_dict()
+
+    def _kept_identity_conflict(self, diff: ConfigDiff, candidate: GatewayConfig) -> str | None:
+        """Would the candidate's rules make two KEPT connectors claim one account's DMs?
+
+        The identity barrier runs when a connector connects, so a rule-only
+        reload — nothing connects — would otherwise let two Mattermost
+        connectors on one bot account, safe while their teams kept them apart,
+        both opt into `direct:` and answer the same private conversation. The
+        check is the barrier's own, over the connectors that stay up and the
+        candidate's rule-derived claims, and it REFUSES before anything is
+        touched: a refusal here is cheap, a duplicate answer is not. Persisted
+        DM records are not folded in — the ones a deleted rule leaves are
+        expired by this very reload, which is what boot's settle-then-barrier
+        order relies on too.
+        """
+        if not diff.rules_changed:
+            return None
+        names = {c.name for c in candidate.connectors}
+        kept = [e for e in self._entries
+                if not e.degraded and e.name in names and e.name not in diff.connectors.changed]
+        try:
+            conflicts = find_identity_conflicts(
+                self._identities(kept, dm_claims(candidate.watcher_rules), fold_records=False))
+        except ConnectorIdentityError as exc:
+            return f"could not check bot identities for the rule change — nothing changed: {exc}"
+        if conflicts:
+            return ("the rule change would make connectors share a bot account's direct "
+                    "messages — nothing changed:\n" + "\n".join(conflicts))
+        return None
 
     def _retry_degraded(self, diff: ConfigDiff, candidate: GatewayConfig) -> list[str]:
         """Fold the degraded sections into the diff as changed, so a reload
@@ -1057,7 +1102,9 @@ class GatewayService:
             if e.name in diff.connectors.added:
                 continue  # a failed apply's leftover — planned from its file below
             records = e.session_manager.records()
-            if e.name in removed:
+            if e.name in removed or e.name not in candidate_names:
+                if e.name not in plan.connectors.removed:
+                    plan.connectors.removed.append(e.name)  # a leftover neither config names
                 plan.watchers.extend(connector_removed_changes(e.name, records))
                 continue
             plan.watchers.extend(plan_connector_records(
@@ -1143,7 +1190,12 @@ class GatewayService:
             #      it goes the way a restarted one does, so its replacement is
             #      never started beside it.
             await self._stop_scheduler()
-            replacing = removed | restarted | (added & {e.name for e in self._entries})
+            live = {e.name for e in self._entries}
+            # An entry neither config names — a failed apply's leftover once the
+            # file was put back — is a removal like any other.
+            stray = live - {c.name for c in candidate.connectors} - removed
+            removed |= stray
+            replacing = removed | restarted | (added & live)
             kept = [e for e in self._entries if e.name not in replacing]
             for e in kept:
                 await e.session_manager.quiesce(RELOAD_IN_PROGRESS)
@@ -1180,9 +1232,11 @@ class GatewayService:
             stopping_agents = changed_agents | removed_agents
             stopped_rooms: dict[str, list[str]] = {}
             if stopping_agents:
-                for e in kept:
-                    stopped_rooms[e.name] = await e.session_manager.stop_watchers_on_agents(
-                        stopping_agents)
+                # Across connectors as within one: the drains are independent,
+                # and their timeouts must not add up inside the operator's request.
+                drained = await asyncio.gather(
+                    *[e.session_manager.stop_watchers_on_agents(stopping_agents) for e in kept])
+                stopped_rooms = {e.name: rooms for e, rooms in zip(kept, drained, strict=True)}
             not_stopped = await self._runtime_manager.stop_some(stopping_agents)
             if not_stopped:
                 # Same rule as a connector's teardown: a backend that would not

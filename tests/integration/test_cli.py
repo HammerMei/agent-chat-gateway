@@ -1286,7 +1286,7 @@ class TestCLIConfigReload(_ConfigCLIBase):
         "notes": [], "degraded": [],
     }
 
-    def test_running_daemon_receives_dry_run_and_the_resolved_path(self):
+    def test_running_daemon_receives_dry_run_and_the_absolute_path(self):
         received: list[dict] = []
 
         def _capture(req):
@@ -1298,7 +1298,9 @@ class TestCLIConfigReload(_ConfigCLIBase):
             ["config", "reload", "--config", self.cfg_path, "--dry-run"], running=True)
         self.assertEqual(code, 0)
         self.assertEqual(received[0]["dry_run"], True)
-        self.assertEqual(received[0]["config_path"], str(Path(self.cfg_path).resolve()))
+        import os
+        self.assertEqual(received[0]["config_path"], os.path.abspath(self.cfg_path),
+                         "absolute, not resolved — the daemon compares it the same way")
         self.assertIn("rules: ~ w1 (changed)", stdout)
         self.assertIn("rematerialize w1 → w1", stdout)
         self.assertIn("Dry run", stdout)

@@ -112,6 +112,17 @@ Every field of every config entity is classified once, in `RELOAD_ACTIONS`,
 and `tests/unit/test_config_diff.py` enumerates the dataclasses against it:
 a new field cannot arrive without saying what a reload does about it.
 
+A rule-only reload connects nothing, so the identity barrier would never run
+— yet a rule can change what a kept connector claims of its account's direct
+messages, and two Mattermost connectors on one bot account, safe while their
+teams kept them apart, could both opt into `direct:`. The plan step therefore
+runs the barrier's own check over the kept connectors with the candidate's
+rule-derived claims and **refuses** the reload before anything is touched.
+An entry the runtime holds that neither the active nor the candidate config
+names — a failed apply's leftover once the file was put back — is removed like
+any other. The config path is kept absolute but unresolved, so a repointed
+`config.yaml` symlink is followed by the next reload.
+
 ### 2.5 Diff → action table
 
 | Change | Action |

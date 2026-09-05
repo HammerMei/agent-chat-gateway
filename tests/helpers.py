@@ -298,7 +298,7 @@ def write_gateway_config(tmp, connector_name="script", *, working_directory=None
     return GatewayConfig.from_file(str(path))
 
 
-async def boot_gateway_service(testcase, tmp, runtime, config):
+async def boot_gateway_service(testcase, tmp, runtime, config, *, config_path=None):
     """Boot a real `GatewayService` on `config` and return it once its control
     socket is up; torn down with the test.
 
@@ -329,7 +329,7 @@ async def boot_gateway_service(testcase, tmp, runtime, config):
         p.start()
         testcase.addCleanup(p.stop)
 
-    service = GatewayService(config, config_path=str(tmp / "config.yaml"))
+    service = GatewayService(config, config_path=str(config_path or tmp / "config.yaml"))
     task = asyncio.create_task(service.run())
 
     async def _teardown():

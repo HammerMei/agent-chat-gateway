@@ -513,5 +513,9 @@ class TestCanonicalSpelling(unittest.TestCase):
         self.assertEqual(RoomPattern("x[cba]").canonical(), RoomPattern("x[abc]").canonical())
         self.assertEqual(RoomPattern("x[!ba]").canonical(), "x[!ab]")
 
+    def test_a_member_bang_is_not_read_as_negation(self):
+        self.assertNotEqual(RoomPattern("[a!]"), RoomPattern("[!a]"))
+        self.assertNotEqual(RoomPattern("[a!]").canonical(), RoomPattern("[!a]").canonical())
+
     def test_raw_is_kept_for_display(self):
         self.assertEqual(RoomPattern("eng-**").raw, "eng-**")

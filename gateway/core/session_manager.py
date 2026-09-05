@@ -537,7 +537,7 @@ class SessionManager:
         self._records_settled = True
         return errors
 
-    async def _reconcile_records(self) -> list[str]:
+    async def _reconcile_records(self) -> tuple[list[str], list[str]]:
         """Run the current rules over every hydrated record (§2.4, #143).
 
         Applies the plan `reconcile_records` returns: re-materialized records
@@ -550,7 +550,10 @@ class SessionManager:
         Boot-independent: boot runs it over a still fleet from `settle_records`;
         `config reload` runs it on a live manager through `reconcile_live`,
         which then restarts the resident processors of the records this
-        rewrote — returned here by room id for exactly that.
+        rewrote — returned here by room id for exactly that, together with the
+        watchers an expiry could NOT remove (their records are still
+        installed; the log says why), so a reload does not report a clean
+        apply over a record its rules no longer cover.
         """
         plan = reconcile_records(
             self._lifecycle.states().values(),
@@ -567,9 +570,10 @@ class SessionManager:
         if not plan.changes:
             logger.info("Reconciliation (%s): %s — nothing to change",
                         self._connector_name, plan.summary())
-            return []
+            return [], []
         rules_by_name = {r.name: r for r in self._watcher_rules}
         rewritten: list[str] = []
+        not_expired: list[str] = []
         expired = 0
         for action in plan.changes:
             record = self._lifecycle.record_for_room(action.room_id)
@@ -584,14 +588,17 @@ class SessionManager:
             except RuntimeError:
                 break  # shutting down — leave the rest as it is, save what was done
             try:
-                expired += await self._apply_expire(record, action)
+                went = await self._apply_expire(record, action)
             finally:
                 self._lifecycle._exit_verb()
+            expired += went
+            if not went:
+                not_expired.append(action.watcher_name)
         if rewritten:
             self._lifecycle.save_state()
         logger.info("Reconciliation (%s): %s", self._connector_name,
                     plan.format_counts(len(plan.of("keep")), len(rewritten), expired))
-        return rewritten
+        return rewritten, not_expired
 
     # ── Config reload (#144) ─────────────────────────────────────────────────
 
@@ -659,9 +666,13 @@ class SessionManager:
         `list` until `resume` or its next message, and the caller must not
         report a clean apply over it.
         """
-        rewritten = await self._reconcile_records()
+        rewritten, not_expired = await self._reconcile_records()
         restarted: list[str] = []
-        failures: list[str] = []
+        failures: list[str] = [
+            f"Connector '{self._connector_name}': watcher '{name}' could not be expired — its "
+            f"record is still installed and no rule covers its room; 'expire {name}' by hand"
+            for name in not_expired
+        ]
         for room_id in rewritten:
             try:
                 if await self._lifecycle.restart_resident(room_id):
