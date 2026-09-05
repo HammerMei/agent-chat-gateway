@@ -82,9 +82,15 @@ def _mock_lifecycle():
     # flag — a truthy mock would disarm every test's manager (the
     # bot_username lesson, again).
     lifecycle.transitions_disarmed = False
+    # Same lesson for the reload flag (#144): a truthy mock would park every
+    # offer in every test as "a reload is in progress".
+    lifecycle.disarmed_for_reload = False
+    lifecycle.disarm_reason = "the gateway is shutting down"
 
-    def _disarm():
+    def _disarm(reason="the gateway is shutting down"):
         lifecycle.transitions_disarmed = True
+        lifecycle.disarm_reason = reason
+        lifecycle.disarmed_for_reload = reason != "the gateway is shutting down"
 
     lifecycle.disarm_transitions = MagicMock(side_effect=_disarm)
     return lifecycle
@@ -206,6 +212,27 @@ class TestANewRoomTakingARenamedAwayName(unittest.IsolatedAsyncioTestCase):
         await manager.get_or_create("rc", _room())
 
         connector.room_ref_by_id.assert_not_awaited()
+
+
+class TestAnOfferDuringAReload(unittest.IsolatedAsyncioTestCase):
+    """#144: a reload's disarm parks an offer (retryable) where shutdown's
+    declines it (final) — a declined offer remembers ids a kept connector
+    would never forget."""
+
+    async def test_a_reload_disarm_raises_a_retryable_error(self):
+        from gateway.core.watcher_manager import ReloadInProgressError
+        manager, lifecycle, _ = _manager()
+        manager.disarm("a config reload is in progress — retry when it finishes")
+        with self.assertRaises(ReloadInProgressError) as cm:
+            await manager.get_or_create("rc", _room())
+        self.assertIn("reload is in progress", str(cm.exception))
+        lifecycle.start_watcher_in_room.assert_not_called()
+
+    async def test_a_shutdown_disarm_still_declines(self):
+        manager, lifecycle, _ = _manager()
+        manager.disarm()
+        self.assertIsNone(await manager.get_or_create("rc", _room()))
+        lifecycle.start_watcher_in_room.assert_not_called()
 
 
 class TestCreation(unittest.IsolatedAsyncioTestCase):

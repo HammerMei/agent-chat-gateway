@@ -154,6 +154,15 @@ class JobScheduler:
         self._session_managers = session_managers
         self._ttl_days = completed_job_ttl_days
 
+    @property
+    def completed_job_ttl_days(self) -> int:
+        return self._ttl_days
+
+    @completed_job_ttl_days.setter
+    def completed_job_ttl_days(self, days: int) -> None:
+        """Swapped in place by `config reload` (#144) — read at the next purge."""
+        self._ttl_days = days
+
     async def run(self) -> None:
         """Main scheduler loop.  Runs until cancelled."""
         logger.info("JobScheduler started (tick_interval=%ds, ttl_days=%d)", _TICK_INTERVAL, self._ttl_days)
