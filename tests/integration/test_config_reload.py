@@ -123,6 +123,27 @@ class TestRuleChanges(_ReloadCase):
         self.assertEqual(load_state("script")[0].rule["session_idle_days"], 3)
         self.assertEqual(self.service.describe_config()["digest"], result["digest"])
 
+    async def test_a_rematerialized_watcher_that_fails_to_restart_is_not_a_clean_apply(self):
+        await self._boot()
+        sm = self.service._session_managers["script"]
+        self._rewrite(self._text(rules=[{
+            "name": "w1", "agent": "default", "connector": "script",
+            "rooms": {"include": ["script"]}, "session_idle_days": 3}]))
+
+        async def _start_fails(*a, **kw):
+            raise RuntimeError("backend down")
+
+        with patch.object(sm._lifecycle, "start_watcher_in_room", side_effect=_start_fails):
+            result = await self._reload()
+
+        self.assertEqual(result["exit_code"], 2, result)
+        self.assertIn("could not be restarted", result["degraded"][0]["error"])
+        self.assertEqual(self.service._entries[0].degraded, "",
+                         "the connector runs on; one room is down")
+        self.assertEqual((await self._rows())["script:script"]["state"], "failed")
+        self.assertEqual(load_state("script")[0].rule["session_idle_days"], 3,
+                         "the record was re-materialized all the same")
+
     async def test_a_removed_rule_expires_the_record_and_logs_the_session_id(self):
         await self._boot()
         session = (await self._rows())["script:script"]["session_id"]
@@ -300,6 +321,25 @@ class TestAgentRestartOrdering(_ReloadCase):
         self.assertEqual(result["exit_code"], 0, result)
         after = (await self._rows())["script:script"]
         self.assertEqual((after["agent_name"], after["state"]), ("other", "active"))
+
+    async def test_a_backend_that_will_not_stop_is_not_replaced(self):
+        await self._boot()
+        old_backend = self.service._agents["default"]
+
+        async def _stuck():
+            raise RuntimeError("sidecar refuses to die")
+
+        old_backend.stop = _stuck
+        self._rewrite(self._text(agents={"default": {
+            "type": "claude", "working_directory": str(self.tmp), "timeout": 99}}))
+        result = await self._reload()
+
+        self.assertFalse(result["ok"])
+        self.assertIn("did not stop cleanly", result["error"])
+        self.assertIs(self.service._agents["default"], old_backend,
+                      "the backend that may still own its sidecar stays tracked")
+        self.assertEqual(self.service._core_config.agent_config("default").timeout, 360,
+                         "the previous config stays active")
 
     async def test_a_kept_lifecycle_learns_which_agents_are_unavailable(self):
         await self._boot()
@@ -653,6 +693,7 @@ class TestValuesAndRefusals(_ReloadCase):
                          [{"path": "max_queue_depth", "old": 100, "new": 7}])
         self.assertEqual(result["watchers"], [])
         self.assertEqual(self.service._core_config.max_queue_depth, 7)
+        self.assertTrue(any("started from now on" in n for n in result["notes"]), result["notes"])
 
     async def test_scheduler_settings_are_swapped_in_place_without_restarts(self):
         await self._boot()

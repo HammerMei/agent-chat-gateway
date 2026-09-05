@@ -122,7 +122,7 @@ a new field cannot arrive without saying what a reload does about it.
 | Any agent field | Stop the backend (an OpenCode sidecar restarts) and its broker, rebuild both, restart every resident processor on that agent. A changed backend identity (type or working directory) is settled by the existing provisioning check: a fresh session, the old id on the AUDIT line. |
 | Agent removed | Stop and drop it. Config loading refuses a rule naming an unknown agent, so its records have already re-materialized or expired. |
 | Any change in the rules block, including a reorder | Reconcile every record of every kept connector (§2.4 of the dynamic-watcher design). A re-materialized record with a resident processor is restarted; on an eager connector the new rules' literal rooms are started. |
-| `max_queue_depth`, `scheduler.*` | Replace the value in place. |
+| `max_queue_depth`, `scheduler.*` | Replace the value in place. A processor's queue is sized when it is built, so `max_queue_depth` reaches watchers started from then on; the plan says so. |
 | `description` on any entity | Nothing — it is not a field. |
 
 ### 2.6 Apply order
@@ -149,7 +149,9 @@ never one pass per change:
    account); then the processors of every changed *or removed* agent are
    drained concurrently, while their backends are still alive; then the
    orphaned state files are swept (AUDIT line per record) and those agents
-   stop.
+   stop — a backend that raises on stop refuses the rest of the apply for the
+   same reason a connector's teardown does (it may still own its sidecar; a
+   replacement beside it would be untracked forever).
 4. **Rebuild**: the one shared agents dict and the core config are updated in
    place (every lifecycle holds them by reference); new entries replace old
    ones in candidate order, in the same list and dict the control server and
@@ -161,9 +163,13 @@ never one pass per change:
    each connector's persisted DM records into its claim, and a DM record a
    deleted rule left behind must be gone by then (boot's own order: settle,
    connect, identity). A reconciliation that raises degrades that entry.
-   Then each new connector settles its records, connects, passes the
-   identity barrier and syncs; a failure leaves a **degraded** entry, never a
-   half-started one.
+   Then the new connectors settle their records and connect concurrently
+   (as boot's phases do — slow logins must not add up inside one request),
+   pass the identity barrier one at a time, and sync concurrently; a failure
+   leaves a **degraded** entry, never a half-started one. A re-materialized
+   watcher whose restart fails leaves the connector running and that one
+   room `failed` in `list` (`resume`, or its next message, brings it back);
+   the command still exits 2 over it.
 6. Kept managers start what step 3 stopped — wherever each record now
    points, since the reconciliation may have moved it to an agent that did
    not change — and every *was-active* record of a changed agent, including
@@ -246,9 +252,11 @@ computed twice.
 
 The digest is SHA-256 over a canonical serialization (sorted keys) of the
 **resolved** config — templates and inheritance expanded, connectors keyed
-by name so that reordering them is no change to the digest just as it is
-none to the diff (rule order stays significant in both) — so semantically
-identical files hash identically and comments never matter. It is over the
+by name and room patterns in their canonical spelling (`RoomPattern.canonical`,
+the form `==` compares) so that whatever the diff calls unchanged the digest
+does too (rule order stays significant in both); dates and other loader
+scalars in a connector's open `raw` block serialize as strings — so
+semantically identical files hash identically and comments never matter. It is over the
 unredacted values: a rotated secret changes it, which is the point of a
 fingerprint. `config show` prints it with a flattened dump (connectors keyed
 by name so two machines' dumps line up) in which values under a key naming a

@@ -22,6 +22,7 @@ Three things live here, all pure:
 
 from __future__ import annotations
 
+import datetime
 import hashlib
 import json
 from dataclasses import dataclass, field, fields, is_dataclass
@@ -183,15 +184,20 @@ def diff_configs(active: GatewayConfig, candidate: GatewayConfig) -> ConfigDiff:
 def canonical(value: Any) -> Any:
     """A resolved config as JSON-safe data, walking dataclass fields.
 
-    `RoomPattern` becomes the string it was compiled from (the only form an
-    operator can compare with their file); an enum its value; a path its
-    string. Dicts keep their keys — `json.dumps(sort_keys=True)` orders them.
+    `RoomPattern` becomes its canonical spelling (`RoomPattern.canonical` — the
+    form `==` compares, so two equivalent spellings digest alike); an enum its
+    value; a path, a date or a time its ISO string — a connector's `raw` block
+    is open-ended, and an unquoted `2026-09-05` in it is a `datetime.date` out
+    of the YAML loader, which `json.dumps` would refuse. Anything else the
+    loader could produce falls back to `str`, so a fingerprint is always
+    computable for a config that loaded. Dicts keep their keys —
+    `json.dumps(sort_keys=True)` orders them.
     """
     if isinstance(value, RoomPattern):
-        return value.raw
+        return value.canonical()
     if isinstance(value, Enum):
         return value.value
-    if isinstance(value, Path):
+    if isinstance(value, (Path, datetime.date, datetime.time)):
         return str(value)
     if is_dataclass(value) and not isinstance(value, type):
         return {f.name: canonical(getattr(value, f.name)) for f in fields(value)}
@@ -200,7 +206,9 @@ def canonical(value: Any) -> Any:
     if isinstance(value, (list, tuple, set, frozenset)):
         items = [canonical(v) for v in value]
         return sorted(items, key=repr) if isinstance(value, (set, frozenset)) else items
-    return value
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return value
+    return str(value)
 
 
 def _identity_keyed(config: GatewayConfig) -> dict:

@@ -1256,6 +1256,21 @@ class TestCLIConfigValidateJson(_ConfigCLIBase):
         self.assertEqual(doc["findings"][0]["level"], "error")
 
 
+class TestCLILargeResponses(_ConfigCLIBase):
+
+    def test_a_response_beyond_64_kib_is_read_whole(self):
+        """asyncio's default StreamReader limit is 64 KiB and `readline` raises
+        past it; a reload plan or a `list` for a few hundred rooms is bigger."""
+        rows = [{"watcher_name": f"rc:room-{i}", "room_name": f"room-{i}", "room_id": f"r{i}",
+                 "connector": "rc", "agent_name": "a", "session_id": "s" * 40,
+                 "participants": [], "state": "active"} for i in range(600)]
+        self.assertGreater(len(json.dumps({"ok": True, "data": rows})), 64 * 1024)
+        self._start_daemon({"list": {"ok": True, "data": rows, "errors": []}})
+        stdout, stderr, code = self._run_with(["list"], running=True)
+        self.assertEqual(code, 0, stderr)
+        self.assertIn("rc:room-599", stdout)
+
+
 class TestCLIConfigReload(_ConfigCLIBase):
 
     _PLAN = {

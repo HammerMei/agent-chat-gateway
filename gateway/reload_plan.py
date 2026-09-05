@@ -24,7 +24,7 @@ from typing import Collection, Iterable, Literal
 
 from .config import GatewayConfig
 from .config_diff import ConfigDiff, EntityChanges, config_digest
-from .core.reconcile import orphaned_state_files, reconcile_records
+from .core.reconcile import orphan_decisions, reconcile_records
 from .core.state import WatcherState, load_state
 from .core.watcher_rule import WatcherRule
 
@@ -291,6 +291,7 @@ def plan_connector_records(
     """
     records = list(records)
     by_room = {r.room_id: r for r in records}
+    rules_by_name = {r.name: r for r in rules}
     plan = reconcile_records(records, rules, connector=connector)
     out: list[WatcherChange] = []
     resident = set(resident)
@@ -304,6 +305,9 @@ def plan_connector_records(
         if action.action == "expire":
             out.append(WatcherChange(action="expire", reason=action.reason, **common))
         elif action.action == "rematerialize":
+            # The agent the record will run on AFTER the apply — what a script
+            # reading the plan wants to know; an expiry keeps the agent it had.
+            common["agent"] = rules_by_name[action.to_rule].agent
             out.append(WatcherChange(action="rematerialize", **common))
         elif action.room_id in resident and (
                 restart_all or record.agent in restarted_agents):
@@ -340,19 +344,29 @@ def connector_removed_changes(connector: str, records: Iterable[WatcherState]) -
 
 def orphan_removals(
     configured: Iterable[str], *, skip: Collection[str] = (),
-) -> tuple[list[str], list[WatcherChange]]:
-    """The connectors whose state files boot's orphan sweep removes, and the
-    expiries that sweep releases — one loop for the daemon's plan and the
-    offline one. `skip` names connectors planned elsewhere (a live entry
-    being removed plans from its in-memory records, not its file)."""
+) -> tuple[list[str], list[WatcherChange], list[str]]:
+    """The connectors whose state files boot's orphan sweep removes, the
+    expiries that sweep releases, and a note for each file it KEEPS — one loop
+    for the daemon's plan and the offline one, deciding with the sweep's own
+    function so the plan never advertises a removal the sweep declines (a
+    file with a record it could not parse stays, for repair by hand). `skip`
+    names connectors planned elsewhere (a live entry being removed plans from
+    its in-memory records, not its file)."""
     names: list[str] = []
     changes: list[WatcherChange] = []
-    for _path, name in orphaned_state_files(configured):
-        if name in skip:
+    notes: list[str] = []
+    for decision in orphan_decisions(configured):
+        if decision.connector in skip:
             continue
-        names.append(name)
-        changes.extend(connector_removed_changes(name, load_state(name)))
-    return names, changes
+        if decision.keep_reason:
+            notes.append(
+                f"state file {decision.path.name} (connector '{decision.connector}', no "
+                f"longer configured) is KEPT because {decision.keep_reason} — fix or delete "
+                f"it by hand; its {len(decision.records)} readable record(s) are not released")
+            continue
+        names.append(decision.connector)
+        changes.extend(connector_removed_changes(decision.connector, decision.records))
+    return names, changes, notes
 
 
 def plan_persisted_records(connector: str, config: GatewayConfig) -> list[WatcherChange]:
@@ -382,7 +396,8 @@ def boot_plan(config: GatewayConfig) -> ReloadPlan:
     configured = [c.name for c in config.connectors]
     for name in configured:
         plan.watchers.extend(plan_persisted_records(name, config))
-    names, changes = orphan_removals(configured)
+    names, changes, notes = orphan_removals(configured)
     plan.connectors.removed.extend(names)
     plan.watchers.extend(changes)
+    plan.notes.extend(notes)
     return plan

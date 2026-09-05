@@ -1689,9 +1689,17 @@ def _send_command(request: dict, timeout: float = 60.0) -> dict:
         sys.exit(1)
 
 
+# The largest one-line response the CLI will read. asyncio's default
+# StreamReader limit is 64 KiB, and `readline()` RAISES past it rather than
+# returning a partial line — a reload plan for a few hundred rooms, or a
+# `list` of as many, would fail on the client after the daemon had already
+# acted (#144). 16 MiB is far beyond any fleet the state files could hold.
+_RESPONSE_LIMIT = 16 * 1024 * 1024
+
+
 async def _send_command_async(request: dict, timeout: float = 60.0) -> dict:
     """Async helper to send command over Unix socket."""
-    reader, writer = await asyncio.open_unix_connection(str(CONTROL_SOCK))
+    reader, writer = await asyncio.open_unix_connection(str(CONTROL_SOCK), limit=_RESPONSE_LIMIT)
     try:
         writer.write(json.dumps(request).encode() + b"\n")
         await writer.drain()

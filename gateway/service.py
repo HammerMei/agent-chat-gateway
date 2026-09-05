@@ -248,15 +248,18 @@ class AgentRuntimeManager:
         return errors
 
     async def stop_all(self) -> None:
-        """Stop all brokers and backends (reverse of start order)."""
+        """Stop all brokers and backends (reverse of start order). Best-effort:
+        shutdown logs a backend that would not stop and carries on."""
         await self.stop_some(set(self._agents))
 
-    async def stop_some(self, names: set[str]) -> None:
+    async def stop_some(self, names: set[str]) -> dict[str, BaseException]:
         """Stop the brokers and backends of `names` (reverse of start order).
 
         Idempotent per the backend contract; an agent not in the dict is
-        skipped. `config reload` calls this for the agents it is about to
-        rebuild or drop, and `stop_all` for everything at shutdown.
+        skipped. Returns the backends that raised, by agent name: `stop_all`
+        (shutdown) only logs them, but `config reload` must not replace a
+        backend that may still own its sidecar — the old instance would be
+        untracked, and nothing would ever stop it.
         """
         for name in [n for n in names if n in self._brokers]:
             try:
@@ -269,9 +272,12 @@ class AgentRuntimeManager:
             *[backend.stop() for _name, backend in stopping],
             return_exceptions=True,
         )
+        failed: dict[str, BaseException] = {}
         for (name, _backend), result in zip(stopping, backend_results, strict=False):
-            if isinstance(result, Exception):
+            if isinstance(result, BaseException):
                 logger.error("Error stopping backend for agent '%s': %s", name, result)
+                failed[name] = result
+        return failed
 
     def replace(self, name: str, backend: AgentBackend | None) -> None:
         """Install a rebuilt backend under `name`, or drop the agent (`None`).
@@ -1036,6 +1042,13 @@ class GatewayService:
         """What this reload will do, record by record, from the running fleet."""
         plan = ReloadPlan(dry_run=dry_run, findings=findings, digest=config_digest(candidate))
         plan.take_diff(diff)
+        if any(v.path == "max_queue_depth" for v in diff.values):
+            # Honest about what a value swap reaches: a processor's queue is
+            # sized when it is built, and this reload deliberately restarts none
+            # of them for a tuning value.
+            plan.notes.append(
+                "max_queue_depth applies to watchers started from now on; a resident "
+                "watcher keeps its current queue size until it next restarts")
         removed = set(diff.connectors.removed)
         restarted = set(diff.connectors.changed)
         restarted_agents = set(diff.agents.changed)
@@ -1062,9 +1075,11 @@ class GatewayService:
             plan.watchers.extend(plan_persisted_records(name, candidate))
         # Files on disk no candidate connector owns — the same sweep boot runs.
         # A removed entry's own file is planned above from its live records.
-        names, changes = orphan_removals(candidate_names, skip={e.name for e in self._entries})
+        names, changes, notes = orphan_removals(
+            candidate_names, skip={e.name for e in self._entries})
         plan.connectors.removed.extend(n for n in names if n not in plan.connectors.removed)
         plan.watchers.extend(changes)
+        plan.notes.extend(notes)
         return plan
 
     async def _apply_reload(
@@ -1162,7 +1177,14 @@ class GatewayService:
                         stopping_agents)
             self._install_entries(kept)
             self._reclaim_orphaned_state_files({c.name for c in candidate.connectors})
-            await self._runtime_manager.stop_some(stopping_agents)
+            not_stopped = await self._runtime_manager.stop_some(stopping_agents)
+            if not_stopped:
+                # Same rule as a connector's teardown: a backend that would not
+                # stop may still own its sidecar, and a replacement started
+                # beside it would leave the old one untracked forever.
+                names = ", ".join(f"'{n}'" for n in sorted(not_stopped))
+                raise RuntimeError(
+                    f"agent backend(s) {names} did not stop cleanly — nothing was replaced")
 
             # 4. Rebuild.
             for name in removed_agents:
@@ -1213,7 +1235,17 @@ class GatewayService:
             if diff.rules_changed:
                 for e in kept:
                     try:
-                        restarted_rooms[e.name] = set(await e.session_manager.reconcile_live())
+                        rooms, failures = await e.session_manager.reconcile_live()
+                        restarted_rooms[e.name] = set(rooms)
+                        for room_id, err in failures.items():
+                            # The connector runs on; ONE room does not. `list`
+                            # shows it failed and `resume` brings it back — but
+                            # the command must not exit 0 over it.
+                            plan.degraded.append(Degraded(
+                                "connector", e.name,
+                                f"the re-materialized watcher for room {room_id} could not be "
+                                f"restarted ({err}); it shows as failed in 'list' — 'resume' "
+                                f"it, or send a message in the room"))
                     except Exception as exc:
                         # On the entry, not only in the response: `status` must
                         # show it, and the next reload must retry it (as a whole
@@ -1298,14 +1330,20 @@ class GatewayService:
         unavailable = self._runtime_manager.unavailable_agents
         connected: list[ConnectorEntry] = []
         started: set[str] = set()
-        for e in entries:
-            try:
-                await e.session_manager.settle_records(unavailable_agents=unavailable)
-                await e.session_manager.connect_only()
-            except Exception as exc:
-                await self._degrade(e, f"failed to connect: {exc}", plan)
-                continue
-            connected.append(e)
+
+        async def _settle_and_connect(e: ConnectorEntry) -> None:
+            await e.session_manager.settle_records(unavailable_agents=unavailable)
+            await e.session_manager.connect_only()
+
+        # Concurrently, as boot's `_settle` phases are: several slow logins
+        # must not add up inside the operator's one request.
+        results = await asyncio.gather(
+            *[_settle_and_connect(e) for e in entries], return_exceptions=True)
+        for e, result in zip(entries, results, strict=True):
+            if isinstance(result, BaseException):
+                await self._degrade(e, f"failed to connect: {result}", plan)
+            else:
+                connected.append(e)
         # The identity barrier, one new connector at a time: boot fails fast on a
         # conflict, a reload cannot take the running connectors down for one, so
         # the new connector whose ADDITION creates the conflict is the one refused
@@ -1321,14 +1359,16 @@ class GatewayService:
                 continue
             accepted.append(e)
             passing.append(e)
-        for e in passing:
-            try:
-                errors = await e.session_manager.sync_only(unavailable_agents=unavailable)
-                for msg in errors:
-                    logger.error("config reload: %s", msg)
-                started.add(e.name)
-            except Exception as exc:
-                await self._degrade(e, f"failed to start: {exc}", plan)
+        results = await asyncio.gather(
+            *[e.session_manager.sync_only(unavailable_agents=unavailable) for e in passing],
+            return_exceptions=True)
+        for e, result in zip(passing, results, strict=True):
+            if isinstance(result, BaseException):
+                await self._degrade(e, f"failed to start: {result}", plan)
+                continue
+            for msg in result:
+                logger.error("config reload: %s", msg)
+            started.add(e.name)
         return started
 
     async def _degrade(self, entry: ConnectorEntry, error: str, plan: ReloadPlan) -> None:

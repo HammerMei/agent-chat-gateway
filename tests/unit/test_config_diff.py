@@ -190,6 +190,19 @@ class TestDigest(unittest.TestCase):
         self.assertNotEqual(config_digest(_config(rules=[r1, r2])),
                             config_digest(_config(rules=[r2, r1])))
 
+    def test_equivalent_pattern_spellings_digest_alike_as_they_compare_alike(self):
+        a = _config(rules=[make_rule(room="eng-*", name="eng", connector="rc", agent="a")])
+        b = _config(rules=[make_rule(room="eng-**", name="eng", connector="rc", agent="a")])
+        self.assertFalse(diff_configs(a, b), "== says they are the same rule")
+        self.assertEqual(config_digest(a), config_digest(b), "so must the digest")
+
+    def test_a_yaml_date_in_a_connectors_raw_block_still_digests(self):
+        import datetime
+        cfg = _config(connectors=[_connector(build_date=datetime.date(2026, 9, 5))])
+        self.assertRegex(config_digest(cfg), r"^[0-9a-f]{64}$")
+        self.assertEqual(dict(flatten_config(cfg))["connectors.rc.raw.server.build_date"],
+                         "2026-09-05")
+
     def test_a_changed_value_changes_the_digest(self):
         self.assertNotEqual(config_digest(_config(connectors=[_connector(token="old")])),
                             config_digest(_config(connectors=[_connector(token="new")])))

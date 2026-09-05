@@ -112,6 +112,35 @@ class TestBootPlan(unittest.TestCase):
         self.assertEqual(plan.of("restart"), [], "residency is unknown offline")
         self.assertEqual(len(plan.digest), 64)
 
+    def test_an_orphan_file_the_sweep_keeps_is_not_planned_as_removed(self):
+        import dataclasses
+        import json
+
+        from gateway.core.state import STATE_FORMAT_VERSION
+        config = write_gateway_config(self.tmp)
+        good = make_record_from_rule(
+            make_rule(room="x", name="g", connector="ghost", agent="default"),
+            RoomRef(id="r3", kind=RoomKind.CHANNEL, name="x"), session_id="s-ghost")
+        bad = dict(dataclasses.asdict(good), room_id="r4", paused="yes please")  # unparseable
+        (self.runtime / "state.ghost.json").write_text(json.dumps({
+            "version": STATE_FORMAT_VERSION,
+            "watchers": [dataclasses.asdict(good), bad]}))
+
+        plan = boot_plan(config)
+
+        self.assertEqual(plan.connectors.removed, [], "boot keeps that file")
+        self.assertEqual(plan.of("expire"), [], "so nothing in it is released")
+        self.assertTrue(any("KEPT" in n and "state.ghost.json" in n for n in plan.notes), plan.notes)
+
+    def test_a_rematerialized_record_reports_its_destination_agent(self):
+        eng_a = make_rule(room="eng", name="eng", connector="rc", agent="a")
+        eng_b = make_rule(room="eng", name="eng", connector="rc", agent="b")
+        record = make_record_from_rule(eng_a, ENG)
+        out = plan_connector_records("rc", [record], [eng_b])
+        self.assertEqual([(w.action, w.agent) for w in out], [("rematerialize", "b")])
+        gone = plan_connector_records("rc", [record], [])
+        self.assertEqual([(w.action, w.agent) for w in gone], [("expire", "a")])
+
     def test_static_era_records_are_listed_as_the_prune_boot_runs(self):
         from gateway.core.state import WatcherState
         config = write_gateway_config(self.tmp)
