@@ -142,16 +142,21 @@ never one pass per change:
    waited out; the sweep is stopped. Processors keep running: an in-flight
    agent turn finishes on its own, and a processor the reload restarts is
    drained by its own stop.
-3. **Stop pass**, in shutdown order: removed and restarted connectors'
-   managers shut down — a teardown that raises **refuses the rest of the
-   apply** (the old entry stays tracked, degraded; a replacement is never
-   started beside a connector that may still hold transport tasks on its
-   account); then the processors of every changed *or removed* agent are
-   drained concurrently, while their backends are still alive; then the
-   orphaned state files are swept (AUDIT line per record) and those agents
-   stop — a backend that raises on stop refuses the rest of the apply for the
-   same reason a connector's teardown does (it may still own its sidecar; a
-   replacement beside it would be untracked forever).
+3. **Stop pass**, in shutdown order — arranged so that **every step that can
+   refuse comes before the first step that cannot be undone**. Removed and
+   restarted connectors' managers shut down first; a teardown that raises
+   refuses the rest of the apply with nothing else touched (the old entry
+   stays tracked, degraded; a replacement is never started beside a connector
+   that may still hold transport tasks on its account). Then the processors
+   of every changed *or removed* agent are drained concurrently, while their
+   backends are still alive — the one reversible step. Then those agents
+   stop; a backend that raises on stop refuses too (it may still own its
+   sidecar; a replacement beside it would be untracked forever), and the
+   refusal rolls the drain back: the backends that did stop are started
+   again and the drained rooms restarted once their managers re-arm. Only
+   after that are the orphaned state files swept (AUDIT line per record) and
+   the fleet rebuilt; from there on nothing refuses — a failure degrades its
+   section.
 4. **Rebuild**: the one shared agents dict and the core config are updated in
    place (every lifecycle holds them by reference); new entries replace old
    ones in candidate order, in the same list and dict the control server and
@@ -166,10 +171,17 @@ never one pass per change:
    Then the new connectors settle their records and connect concurrently
    (as boot's phases do — slow logins must not add up inside one request),
    pass the identity barrier one at a time, and sync concurrently; a failure
-   leaves a **degraded** entry, never a half-started one. A re-materialized
-   watcher whose restart fails leaves the connector running and that one
-   room `failed` in `list` (`resume`, or its next message, brings it back);
-   the command still exits 2 over it.
+   leaves a **degraded** entry, never a half-started one.
+
+   **One room down is reported, never swallowed.** Every per-watcher failure
+   on the apply path — a re-materialized processor that would not restart, a
+   room of a changed agent that would not start, an eager room a new rule
+   names, a new connector's own start errors — becomes a degraded finding on
+   the plan (exit 2) naming the remedy, without marking the connector
+   degraded: its other rooms are answering, and a degraded entry refuses
+   every verb. `list` shows the room failed; `resume`, or its next message,
+   brings it back. Rooms of an agent that did not come up are not reported
+   again one by one — the agent's own finding covers them.
 6. Kept managers start what step 3 stopped — wherever each record now
    points, since the reconciliation may have moved it to an agent that did
    not change — and every *was-active* record of a changed agent, including
@@ -254,9 +266,12 @@ The digest is SHA-256 over a canonical serialization (sorted keys) of the
 **resolved** config — templates and inheritance expanded, connectors keyed
 by name and room patterns in their canonical spelling (`RoomPattern.canonical`,
 the form `==` compares) so that whatever the diff calls unchanged the digest
-does too (rule order stays significant in both); dates and other loader
-scalars in a connector's open `raw` block serialize as strings — so
-semantically identical files hash identically and comments never matter. It is over the
+does too (rule order stays significant in both); a date or other non-JSON
+scalar in a connector's open `raw` block serializes type-tagged, so
+`build_date: 2026-09-05` and `build_date: "2026-09-05"` — different dicts to
+the diff — are different to the digest too — so semantically identical files
+hash identically and comments never matter. The offline dry run carries the
+file's validation warnings like the online one. It is over the
 unredacted values: a rotated secret changes it, which is the point of a
 fingerprint. `config show` prints it with a flattened dump (connectors keyed
 by name so two machines' dumps line up) in which values under a key naming a

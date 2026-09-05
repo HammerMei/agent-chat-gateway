@@ -173,6 +173,28 @@ class TestRuleChanges(_ReloadCase):
         self.assertEqual(rows["script:ops"]["state"], "active")
         self.assertEqual(rows["script:script"]["state"], "active", "the other room was not touched")
 
+    async def test_an_eager_room_a_new_rule_names_that_will_not_start_is_reported(self):
+        await self._boot()
+        sm = self.service._session_managers["script"]
+        real_start = sm._lifecycle.start_watcher_in_room
+
+        async def _ops_fails(wc, *a, **kw):
+            if wc.name == "script:ops":
+                raise RuntimeError("no such room")
+            return await real_start(wc, *a, **kw)
+
+        self._rewrite(self._text(rules=[
+            {"name": "w1", "agent": "default", "connector": "script",
+             "rooms": {"include": ["script"]}},
+            {"name": "w2", "agent": "default", "connector": "script",
+             "rooms": {"include": ["ops"]}}]))
+        with patch.object(sm._lifecycle, "start_watcher_in_room", side_effect=_ops_fails):
+            result = await self._reload()
+
+        self.assertEqual(result["exit_code"], 2, result)
+        self.assertIn("no such room", result["degraded"][0]["error"])
+        self.assertEqual((await self._rows())["script:script"]["state"], "active")
+
     async def test_reordering_rules_is_applied_as_a_reconciliation(self):
         await self._boot(self._text(rules=[
             {"name": "w1", "agent": "default", "connector": "script",
@@ -341,6 +363,82 @@ class TestAgentRestartOrdering(_ReloadCase):
         self.assertEqual(self.service._core_config.agent_config("default").timeout, 360,
                          "the previous config stays active")
 
+    async def test_a_refused_backend_stop_rolls_the_drained_rooms_back(self):
+        """Draining happens before the backends stop; a refusal there must start the
+        drained rooms again on the backends it restarted — the previous config
+        stays active, so nothing else would."""
+        await self._boot(self._text(
+            agents={"default": {"type": "claude", "working_directory": str(self.tmp)},
+                    "other": {"type": "claude", "working_directory": str(self.tmp)}}))
+        other = self.service._agents["other"]
+
+        async def _stuck():
+            raise RuntimeError("sidecar refuses to die")
+
+        other.stop = _stuck
+        self._rewrite(self._text(agents={
+            "default": {"type": "claude", "working_directory": str(self.tmp), "timeout": 99},
+            "other": {"type": "claude", "working_directory": str(self.tmp), "timeout": 99}}))
+        result = await self._reload()
+
+        self.assertFalse(result["ok"])
+        self.assertIn("'other'", result["error"])
+        self.assertEqual((await self._rows())["script:script"]["state"], "active",
+                         "drained before the refusal, started again after it")
+        self.assertEqual([e.name for e in self.service._entries], ["script"])
+        self.assertEqual(self.service._entries[0].degraded, "")
+
+    async def test_a_removed_connector_stays_tracked_when_a_later_step_refuses(self):
+        await self._boot(self._text(connectors=("script", "second"), rules=[
+            {"name": "w1", "agent": "default", "connector": "script",
+             "rooms": {"include": ["script"]}},
+            {"name": "w2", "agent": "default", "connector": "second",
+             "rooms": {"include": ["script"]}}]))
+        backend = self.service._agents["default"]
+
+        async def _stuck():
+            raise RuntimeError("sidecar refuses to die")
+
+        backend.stop = _stuck
+        # Remove `second` AND change the agent: the agent's stop refuses after
+        # `second` was shut down. It must stay tracked, degraded — the previous
+        # config still names it.
+        self._rewrite(self._text(agents={"default": {
+            "type": "claude", "working_directory": str(self.tmp), "timeout": 99}}))
+        result = await self._reload()
+
+        self.assertFalse(result["ok"])
+        self.assertEqual([e.name for e in self.service._entries], ["script", "second"])
+        self.assertTrue(self.service._entries[1].degraded)
+        self.assertTrue((self.runtime / "state.second.json").exists(),
+                        "nothing destructive happened before the refusal")
+        status = await self._dispatch(cmd="config-show", include_config=False)
+        self.assertEqual([d["name"] for d in status["degraded"]], ["second"])
+
+        backend.stop = type(backend).stop.__get__(backend)  # the sidecar dies now
+        second = await self._reload()  # file unchanged
+        self.assertEqual(second["exit_code"], 0, second)
+        self.assertEqual(second["changes"]["connectors"]["removed"], ["second"])
+        self.assertEqual([e.name for e in self.service._entries], ["script"])
+        self.assertFalse((self.runtime / "state.second.json").exists())
+
+    async def test_a_room_that_fails_to_start_after_its_agent_changed_is_reported(self):
+        await self._boot()
+        sm = self.service._session_managers["script"]
+        self._rewrite(self._text(agents={"default": {
+            "type": "claude", "working_directory": str(self.tmp), "timeout": 99}}))
+
+        async def _start_fails(*a, **kw):
+            raise RuntimeError("provisioning failed")
+
+        with patch.object(sm._lifecycle, "start_watcher_in_room", side_effect=_start_fails):
+            result = await self._reload()
+
+        self.assertEqual(result["exit_code"], 2, result)
+        self.assertIn("provisioning failed", result["degraded"][0]["error"])
+        self.assertEqual(self.service._entries[0].degraded, "", "the connector runs on")
+        self.assertEqual((await self._rows())["script:script"]["state"], "failed")
+
     async def test_a_kept_lifecycle_learns_which_agents_are_unavailable(self):
         await self._boot()
         sm = self.service._session_managers["script"]
@@ -397,6 +495,25 @@ class TestConnectorChanges(_ReloadCase):
         self.assertEqual(rows["second:script"]["state"], "active")
         self.assertEqual([e.name for e in self.service._entries], ["script", "second"])
         self.assertEqual(set(self.service._session_managers), {"script", "second"})
+
+    async def test_a_new_connectors_own_start_errors_are_reported_not_swallowed(self):
+        await self._boot()
+        self._rewrite(self._two())
+        from gateway.core.session_manager import SessionManager
+        real_sync = SessionManager.sync_only
+
+        async def _sync(self_sm, *a, **kw):
+            errors = await real_sync(self_sm, *a, **kw)
+            if self_sm._connector_name == "second":
+                errors = errors + ["Connector 'second': room 'script' failed to start: nope"]
+            return errors
+
+        with patch.object(SessionManager, "sync_only", _sync):
+            result = await self._reload()
+
+        self.assertEqual(result["exit_code"], 2, result)
+        self.assertIn("nope", result["degraded"][0]["error"])
+        self.assertEqual(self.service._entries[1].degraded, "", "the connector itself is up")
 
     async def test_a_removed_connector_expires_its_records_and_deletes_its_state_file(self):
         await self._boot(self._two())

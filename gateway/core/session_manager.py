@@ -641,7 +641,7 @@ class SessionManager:
         if self._sweep is not None:
             self._sweep.start()
 
-    async def reconcile_live(self) -> tuple[list[str], dict[str, str]]:
+    async def reconcile_live(self) -> tuple[list[str], list[str]]:
         """Reconcile a RUNNING fleet against the rules just installed (#144).
 
         Boot's reconciliation plus what a live fleet adds: a re-materialized
@@ -652,30 +652,28 @@ class SessionManager:
         through the verb barrier like every other reclamation, and a wake
         racing a restart is serialized by the watcher lock. Returns the rooms
         it restarted — so a caller restarting processors for another reason
-        (an agent change) does not restart them twice — and, by room, the
-        restarts that FAILED: the old processor is already stopped by then, so
-        the room reads as failed in `list` until `resume` or its next message,
-        and the caller must not report a clean apply over it.
+        (an agent change) does not restart them twice — and the rooms that
+        did NOT come up, one message each: a re-materialized record whose
+        processor would not restart (already stopped by then), and an eager
+        room a new rule names that would not start. Either reads as failed in
+        `list` until `resume` or its next message, and the caller must not
+        report a clean apply over it.
         """
         rewritten = await self._reconcile_records()
         restarted: list[str] = []
-        failed: dict[str, str] = {}
+        failures: list[str] = []
         for room_id in rewritten:
             try:
                 if await self._lifecycle.restart_resident(room_id):
                     restarted.append(room_id)
             except Exception as e:
-                logger.error(
-                    "Reconciliation (%s): the record for room %s was re-materialized "
-                    "but its processor could not be restarted — it stays down until "
-                    "its next message or 'resume': %s", self._connector_name, room_id, e,
-                )
-                failed[room_id] = str(e)
-        errors: list[str] = []
-        await self._eager_start_rule_rooms(errors)
-        for msg in errors:
-            logger.error("Reconciliation (%s): %s", self._connector_name, msg)
-        return restarted, failed
+                failures.append(
+                    f"Connector '{self._connector_name}': the re-materialized watcher for "
+                    f"room {room_id} could not be restarted: {e}")
+        eager: list[str] = []
+        await self._eager_start_rule_rooms(eager)
+        failures.extend(eager)
+        return restarted, failures
 
     async def stop_watchers_on_agents(self, agents: set[str]) -> list[str]:
         """Drain and stop every resident processor bound to one of `agents` (#144).
@@ -726,11 +724,16 @@ class SessionManager:
         """
         errors: list[str] = []
         rooms = set(rooms)
+        blocked = self._lifecycle.blocked_agents
         for record in self.records():
             if ((record.agent not in agents and record.room_id not in rooms)
                     or record.room_id in exclude
                     or not (record.rule_name or record.config)
                     or record.paused or record.dropped_at or not record.room_id):
+                continue
+            if record.agent in blocked:
+                # Would be refused by `_ensure_agent_available`; the agent's own
+                # degraded finding already says why every room on it is down.
                 continue
             try:
                 await self._lifecycle.start_from_record(record.room_id)

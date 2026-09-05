@@ -1355,6 +1355,17 @@ class TestCLIConfigReload(_ConfigCLIBase):
         self.assertIn("not running", stderr)
         self.assertIn("agent-chat-gateway start", stderr)
 
+    def test_offline_dry_run_keeps_the_validation_warnings(self):
+        self._write_config(rules=(  # w2 is shadowed by w1 — a warning, not an error
+            "  - name: w2\n    connector: rc\n    agent: default\n"
+            "    rooms:\n      include: [general]\n"))
+        stdout, stderr, code = self._run_with(
+            ["config", "reload", "--config", self.cfg_path, "--dry-run", "--json"], running=False)
+        self.assertEqual(code, 0, stderr)
+        doc = json.loads(stdout)
+        levels = [f["level"] for f in doc["validation"]["findings"]]
+        self.assertIn("warning", levels, doc["validation"])
+
     def test_offline_execute_in_json_is_a_refusal_carrying_the_plan(self):
         stdout, _, code = self._run_with(
             ["config", "reload", "--config", self.cfg_path, "--json"], running=False)

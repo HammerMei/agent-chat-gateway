@@ -1132,6 +1132,10 @@ class GatewayService:
         self._reloading = True
         kept: list[ConnectorEntry] = []
         started: set[str] = set()
+        # What a refusal after the drain has to undo: the rooms drained per kept
+        # connector, started again on their (restarted) backends by the settle.
+        rollback_rooms: dict[str, list[str]] = {}
+        rollback_agents: set[str] = set()
         try:
             # 1–2. Pause the scheduler, still the kept managers. An entry that
             #      already exists under an ADDED name is one a failed apply left
@@ -1144,12 +1148,16 @@ class GatewayService:
             for e in kept:
                 await e.session_manager.quiesce(RELOAD_IN_PROGRESS)
 
-            # 3. Stop pass. The going connectors first — and a teardown that
-            #    fails refuses the rest of the apply: a manager that raised on
-            #    the way down may still hold transport tasks on its account,
-            #    and starting a replacement beside it would be two instances on
-            #    one account and one state file. The except path keeps the old
-            #    entry, degraded, for the next reload to retry.
+            # 3. Stop pass. Every step that can REFUSE comes before the first
+            #    step that cannot be undone (the orphan sweep, the rebuild), and
+            #    the one reversible step between them — draining processors —
+            #    is rolled back if the refusal comes after it. The going
+            #    connectors first: a teardown that fails refuses the rest of
+            #    the apply, because a manager that raised on the way down may
+            #    still hold transport tasks on its account, and starting a
+            #    replacement beside it would be two instances on one account
+            #    and one state file. Nothing has been touched yet; the except
+            #    path keeps the old entry, degraded, for the next reload.
             going = [e for e in self._entries if e.name in replacing]
             results = await asyncio.gather(
                 *[e.session_manager.shutdown() for e in going], return_exceptions=True)
@@ -1175,16 +1183,27 @@ class GatewayService:
                 for e in kept:
                     stopped_rooms[e.name] = await e.session_manager.stop_watchers_on_agents(
                         stopping_agents)
-            self._install_entries(kept)
-            self._reclaim_orphaned_state_files({c.name for c in candidate.connectors})
             not_stopped = await self._runtime_manager.stop_some(stopping_agents)
             if not_stopped:
                 # Same rule as a connector's teardown: a backend that would not
                 # stop may still own its sidecar, and a replacement started
-                # beside it would leave the old one untracked forever.
+                # beside it would leave the old one untracked forever. The
+                # backends that DID stop start again here; the drained rooms
+                # are started by the settle, once the kept managers re-arm.
+                rollback_agents, rollback_rooms = stopping_agents, stopped_rooms
+                stopped_ok = stopping_agents - set(not_stopped)
+                if stopped_ok:
+                    notifier = (self._notifier
+                                or ConnectorPermissionNotifier(self._maps.connector_view))
+                    errors = await self._runtime_manager.start_some(
+                        stopped_ok, self._registry, notifier, self._maps)
+                    self._note_agent_errors(errors)
                 names = ", ".join(f"'{n}'" for n in sorted(not_stopped))
                 raise RuntimeError(
                     f"agent backend(s) {names} did not stop cleanly — nothing was replaced")
+            # From here on nothing refuses: a failure degrades its section.
+            self._install_entries(kept)
+            self._reclaim_orphaned_state_files({c.name for c in candidate.connectors})
 
             # 4. Rebuild.
             for name in removed_agents:
@@ -1237,15 +1256,7 @@ class GatewayService:
                     try:
                         rooms, failures = await e.session_manager.reconcile_live()
                         restarted_rooms[e.name] = set(rooms)
-                        for room_id, err in failures.items():
-                            # The connector runs on; ONE room does not. `list`
-                            # shows it failed and `resume` brings it back — but
-                            # the command must not exit 0 over it.
-                            plan.degraded.append(Degraded(
-                                "connector", e.name,
-                                f"the re-materialized watcher for room {room_id} could not be "
-                                f"restarted ({err}); it shows as failed in 'list' — 'resume' "
-                                f"it, or send a message in the room"))
+                        self._report_room_failures(plan, e.name, failures)
                     except Exception as exc:
                         # On the entry, not only in the response: `status` must
                         # show it, and the next reload must retry it (as a whole
@@ -1264,10 +1275,11 @@ class GatewayService:
             for e in kept:
                 if e.degraded:
                     continue
-                for msg in await e.session_manager.start_watchers_on_agents(
+                self._report_room_failures(
+                    plan, e.name,
+                    await e.session_manager.start_watchers_on_agents(
                         changed_agents, rooms=stopped_rooms.get(e.name, []),
-                        exclude=restarted_rooms.get(e.name, set())):
-                    logger.error("config reload: %s", msg)
+                        exclude=restarted_rooms.get(e.name, set())))
             self._job_scheduler.completed_job_ttl_days = candidate.scheduler.completed_job_ttl_days
             self._start_scheduler()
             self._config = candidate
@@ -1283,14 +1295,37 @@ class GatewayService:
             # re-diffs everything and retries what did not land. The error
             # itself goes back to the operator.
             logger.exception("config reload: apply failed part-way — re-arming what is running")
-            self._settle_after_failed_apply(candidate, kept, started, new_connectors, plan, exc)
+            await self._settle_after_failed_apply(
+                candidate, kept, started, new_connectors, plan, exc,
+                rollback_agents=rollback_agents, rollback_rooms=rollback_rooms)
             raise
         finally:
             self._reloading = False
 
-    def _settle_after_failed_apply(
+    @staticmethod
+    def _report_room_failures(plan: ReloadPlan, connector: str, failures: list[str]) -> None:
+        """One room did not come back; the connector runs on.
+
+        Every per-watcher failure on the apply path — a re-materialized
+        processor that would not restart, a room of a changed agent, an eager
+        room a new rule names, a new connector's own start errors — lands here
+        and nowhere else: as a degraded finding on the plan (exit 2) that
+        names the remedy, WITHOUT marking the connector degraded (its other
+        rooms are answering, and a degraded entry refuses every verb). `list`
+        shows the room failed; `resume`, or the room's next message, brings
+        it back.
+        """
+        for msg in failures:
+            logger.error("config reload: %s", msg)
+            plan.degraded.append(Degraded(
+                "connector", connector,
+                f"{msg} — the connector runs on; the room shows as failed in 'list': "
+                f"'resume' it, or send a message in the room"))
+
+    async def _settle_after_failed_apply(
         self, candidate: GatewayConfig, kept: "list[ConnectorEntry]", started: set[str],
-        new_connectors: dict[str, Connector], plan: ReloadPlan, exc: BaseException,
+        new_connectors: dict[str, Connector], plan: ReloadPlan, exc: BaseException, *,
+        rollback_agents: set[str], rollback_rooms: dict[str, list[str]],
     ) -> None:
         """Leave a consistent fleet behind a failed apply (see the caller).
 
@@ -1301,6 +1336,9 @@ class GatewayService:
         and the next reload replaces it. The active config is NOT advanced:
         kept managers may hold half-applied rules or a half-swapped core
         config, and only a diff against the previous config finds that again.
+        Rooms the stop pass drained before a refusal (`rollback_rooms`) are
+        started again once their managers re-arm — their backends were
+        restarted by the refusing step.
         """
         by_name = {e.name: e for e in self._entries}
         untouched = {e.name for e in kept} | started
@@ -1322,6 +1360,17 @@ class GatewayService:
                 e.session_manager.rearm()
             except Exception:
                 logger.exception("config reload: could not re-arm connector '%s'", e.name)
+        for e in kept:
+            rooms = rollback_rooms.get(e.name)
+            if not rooms:
+                continue
+            try:
+                for msg in await e.session_manager.start_watchers_on_agents(
+                        rollback_agents, rooms=rooms):
+                    logger.error("config reload (rollback): %s", msg)
+            except Exception:
+                logger.exception("config reload (rollback): could not restart the drained "
+                                 "rooms of connector '%s'", e.name)
         self._start_scheduler()
 
     async def _start_entries(self, entries: "list[ConnectorEntry]", plan: ReloadPlan) -> set[str]:
@@ -1366,8 +1415,8 @@ class GatewayService:
             if isinstance(result, BaseException):
                 await self._degrade(e, f"failed to start: {result}", plan)
                 continue
-            for msg in result:
-                logger.error("config reload: %s", msg)
+            # The connector is up; `sync_only` returns the rooms that are not.
+            self._report_room_failures(plan, e.name, result)
             started.add(e.name)
         return started
 

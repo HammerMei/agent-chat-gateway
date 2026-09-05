@@ -683,7 +683,7 @@ def _run_config_reload(args) -> None:
       error, never a silent fall-back to the offline plan: a daemon in that
       state is the thing to fix first.
     """
-    from .config_validate import validate_config
+    from .config_validate import finding_to_dict, validate_config
     from .daemon import is_running
     from .reload_plan import ReloadPlan, boot_plan
 
@@ -705,7 +705,6 @@ def _run_config_reload(args) -> None:
     # Offline: validate, then the next start's plan from the state files.
     result = validate_config(args.config)
     if not result.ok or result.config is None:
-        from .config_validate import finding_to_dict
         plan = ReloadPlan.refused(
             f"{args.config}: {len(result.errors)} error(s) — nothing changed",
             dry_run=bool(args.dry_run),
@@ -718,6 +717,7 @@ def _run_config_reload(args) -> None:
     except Exception as exc:
         print(f"Error: could not read the persisted state: {exc}", file=sys.stderr)
         sys.exit(1)
+    plan.findings = [finding_to_dict(f) for f in result.findings if f.severity != "lint"]
     if not args.dry_run:
         # The plan is still worth seeing — it is what `start` will do.
         plan.dry_run = False

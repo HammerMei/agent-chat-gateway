@@ -203,6 +203,13 @@ class TestDigest(unittest.TestCase):
         self.assertEqual(dict(flatten_config(cfg))["connectors.rc.raw.server.build_date"],
                          "2026-09-05")
 
+    def test_a_date_and_its_quoted_spelling_digest_differently_as_they_diff_differently(self):
+        import datetime
+        as_date = _config(connectors=[_connector(build_date=datetime.date(2026, 9, 5))])
+        as_text = _config(connectors=[_connector(build_date="2026-09-05")])
+        self.assertTrue(diff_configs(as_date, as_text), "a different raw dict restarts the connector")
+        self.assertNotEqual(config_digest(as_date), config_digest(as_text))
+
     def test_a_changed_value_changes_the_digest(self):
         self.assertNotEqual(config_digest(_config(connectors=[_connector(token="old")])),
                             config_digest(_config(connectors=[_connector(token="new")])))

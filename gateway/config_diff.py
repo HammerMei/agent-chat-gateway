@@ -197,8 +197,14 @@ def canonical(value: Any) -> Any:
         return value.canonical()
     if isinstance(value, Enum):
         return value.value
-    if isinstance(value, (Path, datetime.date, datetime.time)):
+    if isinstance(value, Path):
         return str(value)
+    if isinstance(value, (datetime.date, datetime.time)):
+        # Tagged, not a bare string: `build_date: 2026-09-05` and
+        # `build_date: "2026-09-05"` are different `raw` dicts to the diff
+        # (which restarts the connector), so they must be different to the
+        # digest too, or `config show` calls them in sync until the reload.
+        return {"$type": type(value).__name__, "$value": value.isoformat()}
     if is_dataclass(value) and not isinstance(value, type):
         return {f.name: canonical(getattr(value, f.name)) for f in fields(value)}
     if isinstance(value, dict):
@@ -208,7 +214,7 @@ def canonical(value: Any) -> Any:
         return sorted(items, key=repr) if isinstance(value, (set, frozenset)) else items
     if value is None or isinstance(value, (bool, int, float, str)):
         return value
-    return str(value)
+    return {"$type": type(value).__name__, "$value": str(value)}
 
 
 def _identity_keyed(config: GatewayConfig) -> dict:
@@ -277,6 +283,9 @@ def flatten_config(config: GatewayConfig) -> list[tuple[str, Any]]:
 
     def walk(prefix: str, value: Any) -> None:
         if isinstance(value, dict):
+            if set(value) == {"$type", "$value"}:
+                out.append((prefix, value["$value"]))  # a tagged scalar reads as its value
+                return
             if not value:
                 out.append((prefix, {}))
             for k in sorted(value):

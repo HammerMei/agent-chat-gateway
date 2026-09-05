@@ -174,6 +174,12 @@ class WatcherLifecycle:
         next wake's replay could never recover."""
         return self._disarmed and self._disarm_reason != _SHUTTING_DOWN
 
+    @property
+    def blocked_agents(self) -> set[str]:
+        """The agents `_ensure_agent_available` refuses — unavailable since boot,
+        or since the last reload rewrote the set."""
+        return set(self._blocked_agents)
+
     def set_blocked_agents(self, names: set[str]) -> None:
         """Replace the unavailable-agent set after a reload changed it (#144).
 
