@@ -1,8 +1,8 @@
 # Finding triage — AgentCoop's constants
 
-The *method* is not here. It lives in the `finding-triage` skill, which is the same
-for every project. This file holds only what is specific to AgentCoop: the discount
-ladder, the anchors to score against, and which reviewer to read.
+The *method* is not here. It lives in the `finding-triage` skill and is the same for
+every project. This file holds only what is AgentCoop's: the discount ladder, the
+decision bands, the anchors to score against, and which reviewer to read.
 
 ## Reviewer
 
@@ -10,71 +10,105 @@ ladder, the anchors to score against, and which reviewer to read.
 comment. See `CLAUDE.md` § *Code Review with Codex* for how to confirm a review
 actually arrived.
 
-## E — the expectation discount
+## `discount` — how much the operator has already priced in
 
-E is how much the operator has already priced in. It is capped at 0.5, i.e. it can
-divide the harm by at most ~3; it is a nudge at the boundary, never a verdict.
+A multiplier on the harm, never below 0.3: it nudges a borderline call, it never
+decides one.
 
-| operation | E | divides harm by | grounded in |
-|---|---|---|---|
-| message handling, `status`, `list`, `config show` | 0 | 1 | the promised path |
-| `config reload`, `config migrate-env`, TUI save | 0.25 | ~1.8 | §14.2 — a write carries its own risk; operators run it off-hours |
-| `coop upgrade`, data migration, a forked or unsupported setup | 0.5 | ~3.2 | §14.1 — upgrades are best effort, back up first |
+| operation | `discount` | grounded in |
+|---|---|---|
+| message handling, `status`, `list`, `config show` | **1.0** | the promised path |
+| `config reload`, `config migrate-env`, TUI save | **0.56** | §14.2 — a write carries its own risk; operators run it off-hours |
+| `coop upgrade`, data migration, a forked or unsupported setup | **0.32** | §14.1 — upgrades are best effort, back up first |
 
 Section numbers are `docs/requirements.md` § *Operational Commitments*. **Cite the
-clause when scoring E.** If no clause covers the case, E is 0 — absence of a promise
+clause.** If no clause covers the case the discount is 1.0 — the absence of a promise
 is not a discount.
 
-## P — the user base
+## Decision bands
 
-AgentCoop is self-hosted and administered by a small number of operators
-(`requirements.md` §14.5). P is occurrences per year **across all of them**, so the
-same defect is worth far less here than in software with thousands of installs. The
-bar for fixing is correspondingly higher, and that is documented rather than lazy.
+| `payback_years` | verdict |
+|---|---|
+| under 1 | **FIX** |
+| 1 to 5 | **FILE**, with a decay date |
+| over 5, or `net_annual_saving` ≤ 0 | **DROP**, with a written reason |
 
-For a security finding, P is set by **reachability**, not by likelihood. See
-`docs/adr/0001-the-agent-is-the-trust-boundary.md` for what counts: a message reaching
-the wrong session of the *same* agent is a correctness defect; one reaching a
-*different* agent is a security defect.
+Five years is deliberately short. AgentCoop is young, and a fix that takes longer than
+that to repay is being justified by a future the project has not earned yet.
+
+## `hits_per_year` — the user base
+
+AgentCoop is self-hosted and run by a small number of operators (`requirements.md`
+§14.5), and `hits_per_year` counts across all of them. The same defect is worth far
+less here than in software with thousands of installs, so the bar for fixing is higher
+— documented, rather than lazy.
+
+For a security finding, use **reachability** rather than likelihood. What counts as a
+security finding is settled by `docs/adr/0001-the-agent-is-the-trust-boundary.md`: a
+message reaching the wrong session of the *same* agent is a correctness defect; one
+reaching a *different* agent is a security defect.
+
+## Gate examples, from this repository
+
+- **`cheap`** — *removed-agent processors are not drained before the backend stops.*
+  The fix is `changed_agents | removed_agents`: one expression, no new concept. Fixed
+  without scoring.
+- **`cannot-occur` / unreachable** — a review claimed an apply could fail because
+  "the first `replace_rules()` fails". Traced: `replace_rules()` is a list assignment
+  in both layers (`session_manager.py`, `watcher_manager.py`) and cannot raise. The
+  cited trigger does not exist. *Trace and record the chain, as here — never assume.*
+- **`silent`** — *a digest collision reports an unapplied config as in sync.* No error,
+  no log, `config show` looks right. It may still be dropped, but not quietly.
 
 ## Anchors — score by comparison, not in the abstract
 
-Three cases, each reaching its verdict by a different route. Ask "is this worse or
-lighter than MEDIUM?" rather than "what is R?".
+Three cases reaching three verdicts by three different routes. Ask "is this worse or
+lighter than the FILE anchor?" rather than "what is the rate?".
 
-### LARGE → FIX — driven by a high R and by silence
+### FIX — driven by a large `hours_per_hit` and by silence
 
 *A state file that cannot be read, with the daemon booting anyway* (the behaviour
-before #143). A removed connector's state file is never opened again, so the daemon
+before #143): a removed connector's state file is never opened again, so the daemon
 starts successfully while silently abandoning every session in it.
 
-`R 1` (~10h: notice it, work out which rooms lost their sessions, reset each)
-`P 0.5` (~3/yr, on connector rename or removal with state present — and silent, so it
-accumulates) · `E 0` (boot path) · `C 1` (~10h: version marker plus refuse-to-boot)
-→ ~30 h/yr against 10 h to fix → **pays back in ~4 months.**
+`hours_per_hit 10` (notice it, work out which rooms lost sessions, reset each) ·
+`hits_per_year 3` (connector rename or removal with state present — and silent, so it
+accumulates) · `discount 1.0` (boot path) · `fix_hours 10` · `tax 0`
+→ 30 h/year, **payback 0.3 years.**
 
-### MEDIUM → FILE — driven by a low P, and deliberately a frightening one
+### FILE — a race, decided by correlation rather than by the window
 
-*Two agents answering the same DM* (PR #149). A rule-only reload skips the identity
-barrier, so two connectors sharing a bot account both acquire the DM claim.
+*Shutdown racing an in-flight reload*: a SIGTERM during the apply can tear a state
+write. The independent estimate is negligible — a five-second window against a handful
+of stops a year is once in millennia. But the events are **correlated**: an operator
+who thinks a reload has hung presses Ctrl-C, and a deploy script may reload then
+restart. The correlated path is what sets the rate.
 
-`R 0` (~1h: notice, fix the rules, reload) · `P 0` (~1/yr: needs a shared account *and*
-a rule-only reload that changes DM claims) · `E 0.25` · `C 0.5` (~3h, a 28-line method)
-→ ~0.6 h/yr against 3 h to fix → **pays back in ~6 years.**
+`hours_per_hit 3` · `hits_per_year 1` (the correlated path) · `discount 0.56` ·
+`fix_hours 3` · `tax 0.1`
+→ 1.7 h/year, net 1.6, **payback 1.9 years.**
 
-It sounds severe — two agents inside one private conversation — and still does not pay
-back. Frequency decides, not the category. Per ADR 0001 this is not a confidentiality
-event, because both connectors resolve to the same agent; it would be one if they
-resolved to different agents.
+### DROP — killed by the economics, not by a gate
 
-### SMALL → DROP — killed by a gate, never scored
+*A canonical digest collision between an integer key and a string key that spells its
+own type tag.* YAML permits both, so it is expressible and does **not** fail
+`cannot-occur`; it is scored, and the scoring kills it. It was the last link of a
+chain that ran for six review rounds, and typed-canonicalisation is maintained forever.
 
-*A canonical digest collision between the integer key `1` and the string key `"int:1"`*
-(PR #149). No configuration that exists does this, so it fails gate B and is dropped
-with a reason. It was the last link of a chain that ran for six review rounds.
+`hours_per_hit 0.1` (`config show` shows a stale digest; reload still restarts the
+connector) · `hits_per_year 0.01` · `discount 1.0` · `fix_hours 3` · `tax 0.5`
+→ 0.001 h/year against a 0.5 h/year tax → **`net_annual_saving` is negative. No horizon
+repays it.**
 
 ## What the anchors teach
 
-- **LARGE** — silence lets P accumulate; with a high R it genuinely pays back.
-- **MEDIUM** — frightening is not the same as worth fixing.
-- **SMALL** — most corner cases should die at a gate, before any arithmetic.
+- **FIX** — silence lets the rate accumulate; with a large per-hit cost it genuinely repays.
+- **FILE** — for a race, ask what correlates the two events; that, not the window, sets the rate.
+- **DROP** — a fix whose ongoing tax exceeds the harm is never worth doing, however real the defect.
+
+## A note on using these in a blind test
+
+These anchors name real findings and state their verdicts. Anyone — or any agent — who
+reads this file before triaging those same findings has been told the answer. That is
+the price of concrete anchors and it is worth paying; the fix is to choose *different*
+findings when measuring agreement, not to blur the anchors.
