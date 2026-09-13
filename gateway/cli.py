@@ -824,14 +824,21 @@ def _validate_or_exit(config_path: str, *, stops_a_running_gateway: bool = False
         try:
             migration = migrate_env_to_config(config_path)
         except Exception as exc:
-            # `.env` and config.yaml are left untouched by a migration that
-            # raises (unresolvable reference, unreadable file) — say so.
-            print(f"[ERROR] {config_path}: .env migration failed, nothing changed: "
-                  f"{type(exc).__name__}: {exc}", file=sys.stderr)
+            # A raise before the save leaves both files untouched; a raise after
+            # it (the `.env` move, the backup chmod) leaves config.yaml already
+            # rewritten. This handler cannot tell which, so it names where to look.
+            print(f"[ERROR] {config_path}: .env migration failed: {type(exc).__name__}: {exc}\n"
+                  f"  [ERROR] config.yaml may already have been rewritten and .env moved — "
+                  f"check {Path(config_path).parent / '.config-backups'} before retrying.",
+                  file=sys.stderr)
             sys.exit(1)
         if migration.migrated:
             print(f"Migrated {migration.ref_count} secret reference(s) from .env into "
                   f"{config_path}; .env moved to {migration.env_backup_path}")
+            # `start_daemon()` forks twice. An unflushed line in a block-buffered
+            # stdout (a pipe, a file) is inherited by every process and printed
+            # by each one that flushes on exit — three copies of one notice.
+            sys.stdout.flush()
     elif stops_a_running_gateway and has_pending_migration(config_path):
         # Every command named below is one the operator is meant to paste. A
         # bare `coop config migrate-env` targets DEFAULT_CONFIG, so when this

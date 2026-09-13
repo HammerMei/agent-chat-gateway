@@ -2273,7 +2273,9 @@ class TestPreflightCoversEveryBootPrecondition(_PreflightBase):
         self.assertEqual(r["code"], 1)
         self.assertFalse(r["started"])
         self.assertIn("[ERROR]", r["err"])
-        self.assertIn("nothing changed", r["err"])
+        self.assertIn(".config-backups", r["err"], "the refusal says where to look, and does "
+                      "not claim nothing changed — a raise after the save has rewritten the file")
+        self.assertNotIn("nothing changed", r["err"])
         self.assertNotIn("Traceback", r["err"])
         self.assertEqual(Path(cfg).read_text(), before)
         self.assertTrue((self.tmp / ".env").exists())
