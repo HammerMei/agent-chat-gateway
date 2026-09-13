@@ -15,6 +15,12 @@ actually arrived.
 A multiplier on the harm, never below 0.3: it nudges a borderline call, it never
 decides one.
 
+**These three numbers are not derived from anything.** The requirements clauses each row
+cites establish that an operation is best effort; they do not say whether that is worth
+0.56 or 0.32. The ladder is a starting guess, to be calibrated once the triage log has
+settled entries. Treat it accordingly: **a verdict that flips on `discount` alone is a
+disagreement**, and belongs in the skill's Step 4 rather than in a conclusion.
+
 | operation | `discount` | grounded in |
 |---|---|---|
 | message handling, `status`, `list`, `config show` | **1.0** | the promised path |
