@@ -49,6 +49,14 @@ AgentCoop is self-hosted and run by a small number of operators (`requirements.m
 less here than in software with thousands of installs, so the bar for fixing is higher
 — documented, rather than lazy.
 
+**The `.env` migration path has a population near zero.** v0 → v1 is a reinstall, not an
+in-place migration (`docs/migration-v1.md`), and a v1 install never has a `.env` to
+migrate — so `migrate_env_to_config()`, `has_pending_migration()` and the preflight's
+handling of them can be reached only by an install that predates the rename. A finding
+on that path is **declined unless it is `silent` and one line**; do not spend a review
+round hardening it. The logic itself is a candidate for removal once the Phase 1
+onboarding rework lands.
+
 For a security finding, use **reachability** rather than likelihood. What counts as a
 security finding is settled by `docs/adr/0001-the-agent-is-the-trust-boundary.md`: a
 message reaching the wrong session of the *same* agent is a correctness defect; one
