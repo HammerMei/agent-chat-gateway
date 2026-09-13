@@ -13,12 +13,15 @@ redaction path than by permanently maintaining two files as the norm.
 
 Decision: enforce a real migration rather than supporting both forms
 indefinitely (a nag people can ignore isn't enforcement). This module holds
-the actual migration LOGIC as one function, callable from two TRIGGERS:
-`gateway/daemon.py`'s `start_daemon()` (automatic, on every server start —
-becomes a permanent no-op the moment `.env` is gone) and a standalone CLI
-command (`coop config migrate-env`) for a manual/dry-run/
-Docker-entrypoint invocation. Same function either way — no logic
-duplicated between the two call sites.
+the actual migration LOGIC as one function, callable from three TRIGGERS:
+`gateway/cli.py`'s start preflight (`_validate_or_exit`, before the fork, so
+the MIGRATED document is what gets validated — see its docstring for why
+skipping validation instead reopened the hole), `gateway/daemon.py`'s
+`start_daemon()` (automatic, on every server start — a permanent no-op the
+moment `.env` is gone, which after the preflight it always is), and a
+standalone CLI command (`coop config migrate-env`) for a manual/dry-run/
+Docker-entrypoint invocation. Same function every way — no logic duplicated
+between the call sites.
 
 Symlink safety (Docker bind-mount deployments): `EditableConfig.save()`
 writes via `os.replace()`, which replaces a destination that is itself a
@@ -80,6 +83,42 @@ def _count_env_refs(obj: object) -> int:
     return 0
 
 
+def has_pending_migration(config_path: str | Path) -> bool:
+    """Whether a `.env` still sits beside `config_path` — i.e. `migrate_env_to_config`
+    would do work rather than no-op.
+
+    The one predicate both the CLI preflight and this module's own migration
+    answer with, so the two can never diverge: it resolves `config_path` first
+    and looks beside the RESOLVED path, exactly as the migration does (a
+    symlinked `config.yaml` otherwise puts the CLI's answer and the daemon's in
+    different directories).
+
+    Never raises. A missing `config_path` is "nothing pending" — reporting that
+    file's absence belongs to whoever tries to read it, not to this question.
+    """
+    try:
+        resolved = Path(config_path).resolve()
+        # The config itself must exist. Without this, a missing config.yaml whose
+        # DIRECTORY happens to hold a `.env` reported a pending migration: `start`
+        # skipped validation to fail after the fork, and `restart` recommended
+        # `coop config migrate-env`, which cannot succeed on a file that is not
+        # there. Nothing is pending when there is nothing to migrate into.
+        return resolved.exists() and (resolved.parent / ".env").exists()
+    except (OSError, RuntimeError):
+        # Both `resolve()` and the two `exists()` calls are inside the guard,
+        # because all three touch the filesystem and the docstring above promises
+        # this never raises. `resolve()`: on Python 3.12 a cyclic symlink makes it
+        # raise `RuntimeError("Symlink loop from ...")`, and 3.12 is a supported
+        # runtime (`requires-python = ">=3.12"`, and CI runs it); 3.13 returns the
+        # unresolved path instead of raising at all. `exists()`: it swallows only
+        # the "this cannot be a file" errors (ENOENT, ENOTDIR, ELOOP...), and a
+        # directory the caller cannot search is not one of them — it raises
+        # `PermissionError` on both supported runtimes. A caller asking "is a
+        # migration pending" cannot answer an unreadable path, and False is that
+        # answer: whoever opens the file reports why it could not be read.
+        return False
+
+
 def migrate_env_to_config(config_path: str | Path) -> MigrationResult:
     """If a `.env` file sits next to `config_path`, resolve every `$VAR`/
     `${VAR}` reference in the raw config document to its literal value,
@@ -128,7 +167,10 @@ def migrate_env_to_config(config_path: str | Path) -> MigrationResult:
         raise FileNotFoundError(f"Config file not found: {config_path}")
 
     env_path = config_path.parent / ".env"
-    if not env_path.exists():
+    # Same question as `has_pending_migration()`, asked on the already-resolved
+    # path — the predicate is what the CLI preflight calls, so keep the two
+    # reading the same location.
+    if not has_pending_migration(config_path):
         return MigrationResult(migrated=False)
 
     cfg = EditableConfig.load(config_path)
