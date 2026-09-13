@@ -815,14 +815,21 @@ def _validate_or_exit(config_path: str, *, stops_a_running_gateway: bool = False
     if has_pending_migration(config_path):
         if not stops_a_running_gateway:
             return
+        # Every command named below is one the operator is meant to paste. A
+        # bare `coop config migrate-env` targets DEFAULT_CONFIG, so when this
+        # refusal came from an explicit `--config`, the paste would migrate and
+        # start a DIFFERENT file and leave this one refusing exactly as before.
+        # Empty for the default path, which needs no flag and reads better without.
+        sel = "" if config_path == DEFAULT_CONFIG else f" --config {config_path}"
         print(
             f"[ERROR] {config_path}: a .env file still sits beside it, so its "
             f"secrets have not been folded in yet — refusing to restart, because "
             f"stopping the gateway before that migration is what would leave it "
             f"down.\n"
-            f"  [ERROR] Complete the migration first: 'coop config migrate-env', "
-            f"then 'coop restart'. (A 'coop stop' followed by 'coop start' does "
-            f"it too — the daemon migrates on its own at startup.)\n"
+            f"  [ERROR] Complete the migration first: 'coop config migrate-env"
+            f"{sel}', then 'coop restart{sel}'. (A 'coop stop' followed by "
+            f"'coop start{sel}' does it too — the daemon migrates on its own at "
+            f"startup.)\n"
             f"  [ERROR] If that .env is a leftover you no longer need, delete it.",
             file=sys.stderr,
         )

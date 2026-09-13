@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import io
 import json
+import os
 import shutil
 import socket
 import sys
@@ -2238,6 +2239,49 @@ class TestPreflightCoversEveryBootPrecondition(_PreflightBase):
                 self.assertEqual(r["code"], 1)
                 self.assertFalse(r["started"] or r["stopped"])
                 self.assertNotIn("Traceback", r["err"])
+
+    def test_an_unsearchable_config_directory_is_a_controlled_error(self):
+        """The precondition round 6 found: the symlink-loop guard wrapped
+        `resolve()` only, leaving the predicate's two `exists()` calls outside
+        it. `Path.exists()` swallows ENOENT/ENOTDIR/ELOOP but not EACCES, so an
+        unsearchable directory reached the operator as a traceback. Skipped as
+        root, for whom every directory is searchable."""
+        if os.geteuid() == 0:
+            self.skipTest("root can search any directory")
+        locked = self.tmp / "locked"
+        locked.mkdir()
+        cfg = str(locked / "config.yaml")
+        locked.chmod(0o000)
+        self.addCleanup(locked.chmod, 0o755)
+        for verb in ("start", "restart"):
+            with self.subTest(verb=verb):
+                r = self._case(verb, cfg)
+                self.assertEqual(r["code"], 1)
+                self.assertFalse(r["started"] or r["stopped"])
+                self.assertNotIn("Traceback", r["err"])
+
+    def test_the_refusal_names_commands_that_target_the_config_it_refused(self):
+        """Every command in the refusal is one the operator is meant to paste.
+        A bare `coop config migrate-env` targets DEFAULT_CONFIG, so against an
+        explicit `--config` the paste would migrate a different file and leave
+        this one refusing exactly as before."""
+        (self.tmp / ".env").write_text("RC_URL=https://chat.example.com\n")
+        cfg = self._write(self._ENV_BACKED)
+        r = self._case("restart", cfg, running=(True, 4242))
+        self.assertEqual(r["code"], 1)
+        for cmd in ("coop config migrate-env", "coop restart", "coop start"):
+            with self.subTest(cmd=cmd):
+                self.assertIn(f"{cmd} --config {cfg}", r["err"])
+
+    def test_the_refusal_omits_the_flag_for_the_default_config(self):
+        """The flag is noise when it names the path the command already uses."""
+        (self.tmp / ".env").write_text("RC_URL=https://chat.example.com\n")
+        cfg = self._write(self._ENV_BACKED)
+        with patch("gateway.cli.DEFAULT_CONFIG", cfg):
+            r = self._case("restart", cfg, running=(True, 4242))
+        self.assertEqual(r["code"], 1)
+        self.assertIn("'coop config migrate-env'", r["err"])
+        self.assertNotIn("--config", r["err"])
 
     def test_a_validation_error_refuses_and_a_warning_does_not(self):
         bad = self._case("start", self._bad_config())

@@ -95,18 +95,25 @@ def has_pending_migration(config_path: str | Path) -> bool:
     """
     try:
         resolved = Path(config_path).resolve()
+        # The config itself must exist. Without this, a missing config.yaml whose
+        # DIRECTORY happens to hold a `.env` reported a pending migration: `start`
+        # skipped validation to fail after the fork, and `restart` recommended
+        # `coop config migrate-env`, which cannot succeed on a file that is not
+        # there. Nothing is pending when there is nothing to migrate into.
+        return resolved.exists() and (resolved.parent / ".env").exists()
     except (OSError, RuntimeError):
-        # RuntimeError, not only OSError: on Python 3.12 a cyclic symlink makes
-        # `Path.resolve()` raise `RuntimeError("Symlink loop from ...")`, and
-        # 3.12 is a supported runtime (`requires-python = ">=3.12"`, and CI runs
-        # it). 3.13 returns the unresolved path instead of raising at all.
+        # Both `resolve()` and the two `exists()` calls are inside the guard,
+        # because all three touch the filesystem and the docstring above promises
+        # this never raises. `resolve()`: on Python 3.12 a cyclic symlink makes it
+        # raise `RuntimeError("Symlink loop from ...")`, and 3.12 is a supported
+        # runtime (`requires-python = ">=3.12"`, and CI runs it); 3.13 returns the
+        # unresolved path instead of raising at all. `exists()`: it swallows only
+        # the "this cannot be a file" errors (ENOENT, ENOTDIR, ELOOP...), and a
+        # directory the caller cannot search is not one of them — it raises
+        # `PermissionError` on both supported runtimes. A caller asking "is a
+        # migration pending" cannot answer an unreadable path, and False is that
+        # answer: whoever opens the file reports why it could not be read.
         return False
-    # The config itself must exist. Without this, a missing config.yaml whose
-    # DIRECTORY happens to hold a `.env` reported a pending migration: `start`
-    # skipped validation to fail after the fork, and `restart` recommended
-    # `coop config migrate-env`, which cannot succeed on a file that is not
-    # there. Nothing is pending when there is nothing to migrate into.
-    return resolved.exists() and (resolved.parent / ".env").exists()
 
 
 def migrate_env_to_config(config_path: str | Path) -> MigrationResult:
