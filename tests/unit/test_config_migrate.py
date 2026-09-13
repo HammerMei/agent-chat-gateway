@@ -254,8 +254,6 @@ class TestMigrateEnvToConfig(unittest.TestCase):
         self.assertEqual(result.env_backup_path.read_text(), "RC_PASSWORD=hunter2\n")
 
 
-if __name__ == "__main__":
-    unittest.main()
 
 
 class TestHasPendingMigration(unittest.TestCase):
@@ -346,3 +344,7 @@ class TestHasPendingMigration(unittest.TestCase):
             with self.subTest(exc=type(exc).__name__):
                 with patch.object(Path, "resolve", side_effect=exc):
                     self.assertFalse(has_pending_migration(self.tmp / "config.yaml"))
+
+
+if __name__ == "__main__":
+    unittest.main()

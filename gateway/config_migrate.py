@@ -13,12 +13,15 @@ redaction path than by permanently maintaining two files as the norm.
 
 Decision: enforce a real migration rather than supporting both forms
 indefinitely (a nag people can ignore isn't enforcement). This module holds
-the actual migration LOGIC as one function, callable from two TRIGGERS:
-`gateway/daemon.py`'s `start_daemon()` (automatic, on every server start —
-becomes a permanent no-op the moment `.env` is gone) and a standalone CLI
-command (`coop config migrate-env`) for a manual/dry-run/
-Docker-entrypoint invocation. Same function either way — no logic
-duplicated between the two call sites.
+the actual migration LOGIC as one function, callable from three TRIGGERS:
+`gateway/cli.py`'s start preflight (`_validate_or_exit`, before the fork, so
+the MIGRATED document is what gets validated — see its docstring for why
+skipping validation instead reopened the hole), `gateway/daemon.py`'s
+`start_daemon()` (automatic, on every server start — a permanent no-op the
+moment `.env` is gone, which after the preflight it always is), and a
+standalone CLI command (`coop config migrate-env`) for a manual/dry-run/
+Docker-entrypoint invocation. Same function every way — no logic duplicated
+between the call sites.
 
 Symlink safety (Docker bind-mount deployments): `EditableConfig.save()`
 writes via `os.replace()`, which replaces a destination that is itself a

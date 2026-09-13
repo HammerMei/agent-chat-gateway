@@ -4,6 +4,7 @@ import argparse
 import asyncio
 import json
 import os
+import shlex
 import sys
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -791,36 +792,53 @@ def _validate_or_exit(config_path: str, *, stops_a_running_gateway: bool = False
     the errors land on the terminal rather than in the log the daemon redirects
     into.
 
-    **A pending `.env` migration is deferred for `start`, refused for `restart`.**
-    `validate_config()` reads the raw document, where an unmigrated `${RC_URL}`
-    is still a literal string that fails the URL check — so validating here would
-    reject every config the daemon is about to migrate, and
-    `migrate_env_to_config()` (which runs inside the daemon, after the fork)
-    could never run.
+    **A pending `.env` migration is performed here for `start`, refused for
+    `restart`.** `validate_config()` reads the raw document, where an unmigrated
+    `${RC_URL}` is still a literal string that fails the URL check — so validating
+    the unmigrated file would reject every config the daemon is about to migrate.
 
-    For `start` the answer is to defer: nothing is running to damage, so the
-    worst case is one boot validated the way it was before this change —
-    `from_file()` alone — and the daemon's own fail-closed migration handles the
-    rest. The migration then moves `.env` away, so every later start validates
-    in full.
+    For `start` the answer is to migrate first, right here, and validate the
+    result. Skipping validation and leaving the migration to the daemon was
+    tried, and it reopened the hole this preflight closes: the migration's save
+    keeps errors the file already had, and `from_file()` accepts what
+    `validate_config()` refuses, so any config with a `.env` beside it booted
+    unvalidated. Nothing is running to damage, so migrating pre-fork is safe; the
+    daemon's own migration remains and is a no-op once `.env` is gone. A
+    migration that raises leaves both files untouched and refuses with the reason.
 
-    For `restart` deferring is not safe, because `stop_daemon()` runs next. A
-    config that cannot load would take a healthy gateway down and leave it down,
-    which is the outage the validate-before-stop order exists to prevent. So
-    `restart` refuses instead, and names the way through.
+    For `restart` migrating is not the question — `stop_daemon()` runs next, and
+    a config that cannot load would take a healthy gateway down and leave it
+    down, which is the outage the validate-before-stop order exists to prevent.
+    So `restart` refuses instead, and names the way through.
     """
-    from .config_migrate import has_pending_migration
+    from .config_migrate import has_pending_migration, migrate_env_to_config
     from .config_validate import validate_config
 
-    if has_pending_migration(config_path):
-        if not stops_a_running_gateway:
-            return
+    if has_pending_migration(config_path) and not stops_a_running_gateway:
+        # Nothing is running to protect, so do here what the daemon would have
+        # done after the fork — and then validate the RESULT. Deferring to the
+        # daemon deferred validation with it: the migration's save keeps errors
+        # the file already had, and the loader accepts what the validator refuses,
+        # so an env-backed config skipped the very gate this preflight is. The
+        # daemon's own migration stays, and is a no-op once `.env` is gone.
+        try:
+            migration = migrate_env_to_config(config_path)
+        except Exception as exc:
+            # `.env` and config.yaml are left untouched by a migration that
+            # raises (unresolvable reference, unreadable file) — say so.
+            print(f"[ERROR] {config_path}: .env migration failed, nothing changed: "
+                  f"{type(exc).__name__}: {exc}", file=sys.stderr)
+            sys.exit(1)
+        if migration.migrated:
+            print(f"Migrated {migration.ref_count} secret reference(s) from .env into "
+                  f"{config_path}; .env moved to {migration.env_backup_path}")
+    elif stops_a_running_gateway and has_pending_migration(config_path):
         # Every command named below is one the operator is meant to paste. A
         # bare `coop config migrate-env` targets DEFAULT_CONFIG, so when this
         # refusal came from an explicit `--config`, the paste would migrate and
         # start a DIFFERENT file and leave this one refusing exactly as before.
         # Empty for the default path, which needs no flag and reads better without.
-        sel = "" if config_path == DEFAULT_CONFIG else f" --config {config_path}"
+        sel = "" if config_path == DEFAULT_CONFIG else f" --config {shlex.quote(config_path)}"
         print(
             f"[ERROR] {config_path}: a .env file still sits beside it, so its "
             f"secrets have not been folded in yet — refusing to restart, because "
@@ -828,8 +846,7 @@ def _validate_or_exit(config_path: str, *, stops_a_running_gateway: bool = False
             f"down.\n"
             f"  [ERROR] Complete the migration first: 'coop config migrate-env"
             f"{sel}', then 'coop restart{sel}'. (A 'coop stop' followed by "
-            f"'coop start{sel}' does it too — the daemon migrates on its own at "
-            f"startup.)\n"
+            f"'coop start{sel}' does it too — start migrates before it forks.)\n"
             f"  [ERROR] If that .env is a leftover you no longer need, delete it.",
             file=sys.stderr,
         )

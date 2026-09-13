@@ -1981,7 +1981,10 @@ class _PreflightBase(unittest.TestCase):
         main = _import_main()
         out, err = io.StringIO(), io.StringIO()
         code = 0
-        with patch.object(sys, "argv", ["coop"] + argv), \
+        # `start` migrates in-process now, and the migration's `load_dotenv`
+        # writes the `.env` values into os.environ. Restore the environment
+        # after every case, or one test's RC_URL leaks into the next file's.
+        with patch.dict(os.environ), patch.object(sys, "argv", ["coop"] + argv), \
                 redirect_stdout(out), redirect_stderr(err):
             try:
                 main()
@@ -2216,20 +2219,77 @@ class TestPreflightCoversEveryBootPrecondition(_PreflightBase):
         this row asserted that `restart` refuses, full stop, and so wrote the
         bug in as the specification. Refusal is only correct when there is a
         running gateway to protect."""
-        (self.tmp / ".env").write_text("RC_URL=https://chat.example.com\n")
-        cfg = self._write(self._ENV_BACKED)
+        # One fixture per case: `start` now MIGRATES, which consumes the `.env`,
+        # so a shared fixture would leave the later cases nothing to refuse.
+        def fresh():
+            (self.tmp / ".env").write_text("RC_URL=https://chat.example.com\n")
+            return self._write(self._ENV_BACKED)
 
-        r = self._case("start", cfg)
-        self.assertTrue(r["started"], "start defers to the daemon's own migration")
+        r = self._case("start", fresh())
+        self.assertTrue(r["started"], "start migrates, validates the result, proceeds")
+        self.assertFalse((self.tmp / ".env").exists(), "the migration ran here, pre-fork")
 
-        r = self._case("restart", cfg)
+        r = self._case("restart", fresh())
         self.assertTrue(r["started"], "nothing to protect — restart is a start")
         self.assertTrue(r["stopped"], "stop_daemon() still runs; with nothing up it no-ops")
 
-        r = self._case("restart", cfg, running=(True, 4242))
+        r = self._case("restart", fresh(), running=(True, 4242))
         self.assertEqual(r["code"], 1)
         self.assertFalse(r["stopped"], "a healthy gateway must not be stopped")
         self.assertIn("migrate-env", r["err"])
+        self.assertTrue((self.tmp / ".env").exists(), "refusal touches nothing")
+
+    def test_an_env_backed_config_is_validated_after_its_migration_not_skipped(self):
+        """The round-6 finding, and the one that mattered: `start` used to skip
+        validation whenever a `.env` sat beside the config, on the theory that
+        the daemon would migrate. It did — and `EditableConfig.save()` keeps
+        errors the file already had, and `from_file()` accepts an empty password
+        that `validate_config()` rejects. So every env-backed config booted past
+        the gate this increment exists to add. Now: migrate, THEN validate."""
+        (self.tmp / ".env").write_text("")          # nothing to resolve; still "pending"
+        cfg = self._write(self._ENV_BACKED.replace('"${RC_URL}"', "https://chat.example.com")
+                                          .replace("password: pw", 'password: ""'))
+        for verb in ("start", "restart"):
+            with self.subTest(verb=verb):
+                (self.tmp / ".env").write_text("")
+                r = self._case(verb, cfg)
+                self.assertEqual(r["code"], 1)
+                self.assertFalse(r["started"] or r["stopped"])
+                self.assertIn("password is empty", r["err"])
+                # The migration itself succeeded and is deliberately kept: it is
+                # what the daemon would have done, and the next start validates
+                # the same file the same way.
+                self.assertFalse((self.tmp / ".env").exists())
+
+    def test_a_migration_that_cannot_resolve_refuses_and_changes_nothing(self):
+        """`migrate_env_to_config()` raises on an unresolvable reference and
+        leaves both files untouched; the preflight must say exactly that."""
+        (self.tmp / ".env").write_text("")
+        # A name no test and no shell defines — RC_URL itself may already sit in
+        # os.environ from an earlier case, and that would resolve it.
+        cfg = self._write(self._ENV_BACKED.replace("${RC_URL}", "${COOP_TEST_REF_NOBODY_SETS}"))
+        before = Path(cfg).read_text()
+        r = self._case("start", cfg)
+        self.assertEqual(r["code"], 1)
+        self.assertFalse(r["started"])
+        self.assertIn("[ERROR]", r["err"])
+        self.assertIn("nothing changed", r["err"])
+        self.assertNotIn("Traceback", r["err"])
+        self.assertEqual(Path(cfg).read_text(), before)
+        self.assertTrue((self.tmp / ".env").exists())
+
+    def test_the_refusal_shell_quotes_a_path_the_shell_would_split(self):
+        """The commands are meant to be pasted; a path with a space must survive
+        the paste as one argument."""
+        d = self.tmp / "my dir"
+        d.mkdir()
+        (d / ".env").write_text("RC_URL=https://chat.example.com\n")
+        cfg = d / "config.yaml"
+        cfg.write_text(self._ENV_BACKED)
+        r = self._case("restart", str(cfg), running=(True, 4242))
+        self.assertEqual(r["code"], 1)
+        self.assertIn(f"--config '{cfg}'", r["err"])
+        self.assertNotIn(f"--config {cfg}", r["err"])
 
     def test_malformed_yaml_is_a_controlled_error_for_both_verbs(self):
         cfg = self._write("connectors: [unclosed\nagents: {\n")
