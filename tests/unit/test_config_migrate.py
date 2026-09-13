@@ -12,10 +12,9 @@ import tempfile
 import textwrap
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import yaml
-
-from unittest.mock import patch
 
 from gateway.config_migrate import has_pending_migration, migrate_env_to_config
 
