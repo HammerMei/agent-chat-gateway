@@ -29,10 +29,11 @@ rm -f ~/.local/bin/agent-chat-gateway ~/.local/bin/acg-provision
 # If you cloned the repo yourself and ran install.sh from it, the clone is
 # wherever you put it (install_meta.json's repo_path) — remove or keep as you like.
 
-# 3. OpenCode only: the role-enforcement plugin the v0 wizard copied to
-#    ~/.opencode/plugins/ reads the OLD ACG_ROLE variable. With it in place,
-#    v1's owner sessions would get no approval prompts for write tools — silently.
-#    Remove it; the v1 wizard installs the new copy.
+# 3. OpenCode only: remove the plugin copy the old wizard put in ~/.opencode/.
+#    The gateway now hands its plugin to the sidecar directly and never touches
+#    this directory, so the old copy would load alongside it (from v0 it reads
+#    ACG_ROLE and does nothing; from 1.0.0 it is a duplicate hook). The gateway
+#    logs a warning at every start while it is there.
 rm -f ~/.opencode/plugins/role-enforcement.ts
 
 # 4. Install AgentCoop and run its setup wizard

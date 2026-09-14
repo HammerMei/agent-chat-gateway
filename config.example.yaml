@@ -237,7 +237,7 @@ agents:
   #   type: opencode
   #   command: opencode
   #   new_session_args: []
-  #   working_directory: /path/to/project  # cwd for `opencode serve` — must contain .opencode/opencode.json
+  #   working_directory: /path/to/project  # cwd for `opencode serve`; its own .opencode/ config is read from here
   #   session_prefix: agent-chat
   #   context_inject_files:
   #     - contexts/rc-gateway-context.md

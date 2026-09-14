@@ -18,13 +18,6 @@ CONFIG_FILE = RUNTIME_DIR / "config.yaml"
 ENV_FILE = RUNTIME_DIR / ".env"
 META_FILE = RUNTIME_DIR / "install_meta.json"
 
-# Source path for the opencode role-enforcement plugin (relative to this file).
-_PLUGIN_SRC = Path(__file__).parent / "agents" / "opencode" / "hooks" / "role-enforcement.ts"
-
-# Global opencode config dir — plugin is installed here so it applies to ALL
-# opencode sessions, not just a single project directory.
-_GLOBAL_OPENCODE_DIR = Path.home() / ".opencode"
-
 console = Console()
 
 # Version read from pyproject.toml at module load time (best-effort).
@@ -122,9 +115,11 @@ def generate_config_yaml(
         },
     }
     # Required for every backend — GatewayConfig.from_file rejects an agent
-    # with no working_directory regardless of type. opencode additionally
-    # needs this to find .opencode/opencode.json and the role-enforcement
-    # plugin; claude just needs a cwd to run in and create files under.
+    # with no working_directory regardless of type. opencode runs `opencode
+    # serve` there and picks up that project's own .opencode/ config; claude
+    # just needs a cwd to run in and create files under. (The role-enforcement
+    # plugin is not tied to it — OpenCodeBackend hands it to the sidecar
+    # through OPENCODE_CONFIG_CONTENT at every start.)
     if working_directory:
         agent["working_directory"] = working_directory
 
@@ -180,81 +175,6 @@ def write_install_meta(
     }
     meta_file.parent.mkdir(parents=True, exist_ok=True)
     meta_file.write_text(json.dumps(meta, indent=2))
-
-
-def install_opencode_plugin(
-    repo_path: Path | None = None,
-    global_opencode_dir: Path | None = None,
-) -> Path:
-    """Install the AgentCoop role-enforcement plugin into the global opencode config dir.
-
-    The plugin is installed at the **global** level (``~/.opencode/``) rather
-    than inside a specific project directory.  This means it is available for
-    every opencode session regardless of working directory, while remaining
-    completely inert when ``COOP_ROLE`` is not set (i.e. normal CLI / web-UI use).
-
-    Installation layout::
-
-        ~/.opencode/plugins/role-enforcement.ts   ← plugin file (absolute path)
-        ~/.opencode/opencode.json                 ← registers the plugin
-
-    The plugin entry in ``opencode.json`` uses the **absolute path** to the
-    installed file so that opencode resolves it correctly regardless of the
-    current working directory.
-
-    Args:
-        repo_path: Path to the AgentCoop repo root.  Used as a fallback when the plugin
-            source cannot be found next to this module file (editable install vs
-            installed wheel).  Pass ``None`` to rely solely on the module-relative
-            path.
-        global_opencode_dir: Override the global opencode directory (default:
-            ``~/.opencode``).  Exposed for testing.
-
-    Returns:
-        The absolute path of the installed plugin file.
-
-    Raises:
-        FileNotFoundError: If the plugin source file cannot be located.
-    """
-    # Locate plugin source.
-    plugin_src = _PLUGIN_SRC
-    if not plugin_src.exists() and repo_path is not None:
-        plugin_src = (
-            repo_path / "gateway" / "agents" / "opencode" / "hooks" / "role-enforcement.ts"
-        )
-    if not plugin_src.exists():
-        raise FileNotFoundError(
-            f"opencode plugin source not found: {plugin_src}. "
-            "Make sure you are running from the AgentCoop repository."
-        )
-
-    # Install into global opencode dir.
-    target_dir = (global_opencode_dir or _GLOBAL_OPENCODE_DIR) / "plugins"
-    target_dir.mkdir(parents=True, exist_ok=True)
-    dest = target_dir / "role-enforcement.ts"
-    shutil.copy2(plugin_src, dest)
-
-    # Use absolute path in opencode.json so path resolution is unambiguous
-    # regardless of cwd when opencode runs.
-    plugin_entry = str(dest)
-
-    # Patch (or create) ~/.opencode/opencode.json to register the plugin.
-    config_file = target_dir.parent / "opencode.json"
-    if config_file.exists():
-        try:
-            oc_config: dict = json.loads(config_file.read_text())
-        except json.JSONDecodeError:
-            oc_config = {}
-    else:
-        oc_config = {}
-
-    plugins: list[str] = oc_config.get("plugin", [])
-    if plugin_entry not in plugins:
-        plugins.append(plugin_entry)
-    oc_config["plugin"] = plugins
-    config_file.write_text(json.dumps(oc_config, indent=2) + "\n")
-
-    return dest
 
 
 # ---------------------------------------------------------------------------
@@ -352,8 +272,7 @@ def _step_opencode_working_dir() -> Path:
     """Ask for the opencode working directory and ensure it exists."""
     console.print("\n[bold cyan]Step 3b:[/bold cyan] opencode working directory")
     console.print(
-        "  opencode runs inside a project directory where it reads its config\n"
-        "  and the AgentCoop role-enforcement plugin will be installed.\n"
+        "  opencode runs inside a project directory where it reads its config.\n"
         "  Use the directory that contains (or will contain) your project code."
     )
     while True:
@@ -470,10 +389,10 @@ def run_onboard(repo_path: Path | None = None) -> None:
     credentials = _step_rocketchat_credentials()
 
     # Every agent needs a working_directory (GatewayConfig.from_file requires
-    # it regardless of backend). opencode additionally needs it to find
-    # .opencode/opencode.json and the role-enforcement plugin, so it gets an
-    # explicit interactive step; claude just needs a cwd to run in, so it
-    # defaults quietly to ~/.agentcoop/work (created if missing).
+    # it regardless of backend). opencode runs its server there and reads that
+    # project's own .opencode/ config, so it gets an explicit interactive
+    # step; claude just needs a cwd to run in, so it defaults quietly to
+    # ~/.agentcoop/work (created if missing).
     if agent_type == "opencode":
         working_dir = _step_opencode_working_dir()
     else:
@@ -514,16 +433,6 @@ def run_onboard(repo_path: Path | None = None) -> None:
     method = "git" if repo_path and repo_path.exists() else "unknown"
     write_install_meta(META_FILE, method=method, repo_path=repo_path, version=PROJECT_VERSION)
     console.print(f"  [green]✓[/green] Wrote {META_FILE}")
-
-    # Install opencode plugin into the global opencode config dir.
-    if agent_type == "opencode":
-        try:
-            dest = install_opencode_plugin(repo_path=repo_path)
-            console.print(
-                f"  [green]✓[/green] Installed opencode plugin (global) → {dest}"
-            )
-        except FileNotFoundError as exc:
-            console.print(f"  [yellow]⚠[/yellow] Plugin install skipped: {exc}")
 
     console.print(
         Panel(
