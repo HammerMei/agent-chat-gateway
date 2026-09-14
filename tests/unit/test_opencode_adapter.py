@@ -3263,6 +3263,29 @@ class TestPluginAccepted(unittest.IsolatedAsyncioTestCase):
                     ]),
                 )
 
+    async def test_config_probe_uses_the_startup_probe_timeout_not_the_agent_timeout(self):
+        """GET /config is a startup probe. Binding it to the agent-turn timeout
+        (360s by default) would let a sidecar that stalls on /config hold start()
+        — and every send() waiting on the self-heal restart — for minutes."""
+        from gateway.agents.opencode.adapter import _CONFIG_PROBE_TIMEOUT
+
+        b = _make_backend()
+        b.timeout = 360
+        p_exec, p_port, p_cls, get = self._start_with(b, make_opencode_sidecar_http())
+        with p_exec, p_port, p_cls as mock_cls:
+            mock_client = AsyncMock()
+            mock_cls.return_value.__aenter__.return_value = mock_client
+            mock_client.get = get
+            await b.start()
+
+        probe_timeouts = [
+            c.kwargs.get("timeout")
+            for c in mock_cls.call_args_list
+            if "base_url" not in c.kwargs  # the persistent client, built after the probe
+        ]
+        self.assertIn(_CONFIG_PROBE_TIMEOUT, probe_timeouts)
+        self.assertNotIn(360, probe_timeouts)
+
     async def test_start_refuses_before_spawning_when_shipped_file_is_missing(self):
         b = _make_backend()
         with (

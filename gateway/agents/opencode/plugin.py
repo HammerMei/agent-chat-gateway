@@ -22,6 +22,12 @@ sessions are untouched. Verified against opencode 1.18.13 (#157):
   proves opencode *accepted* the injected entry, not that the file loaded — a
   spec pointing at a missing file is listed just the same. The adapter checks
   :data:`PLUGIN_SOURCE` exists separately, before spawning.
+
+The entry is injected unconditionally. That is not gated on the permission
+broker: with ``permissions.enabled: false`` (the default) the sidecar still runs
+as ``COOP_ROLE=owner`` and the plugin marks owner write tools ``ask`` with no
+broker to answer — pre-existing behaviour shared with the bash ``"*": "ask"``
+defaults, tracked as #165.
 """
 
 from __future__ import annotations

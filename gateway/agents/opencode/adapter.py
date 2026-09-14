@@ -128,6 +128,11 @@ _INIT_PROMPT = (
 
 _HEALTH_CHECK_PATH = "/session"
 _STARTUP_TIMEOUT = 30  # seconds
+# One GET /config after the health check. A startup probe, not an agent turn:
+# ``timeout`` (360s by default) would let a sidecar that answers /global/health
+# but stalls on /config hold start() — and every send() waiting on the self-heal
+# restart behind _restart_lock — for minutes.
+_CONFIG_PROBE_TIMEOUT = 10.0  # seconds
 # Circuit-breaker threshold: after this many consecutive failed auto-restarts,
 # _ensure_live_runtime() fast-fails instead of blocking callers for ~30s each.
 _MAX_RESTART_FAILURES = 3
@@ -776,9 +781,13 @@ class OpenCodeBackend(AgentBackend):
         OpenCode installation, and ``docs/migration-v1.md`` says what to remove.
         An entry whose file is gone is opencode's stale ``opencode.json`` line,
         which it ignores; so do we.
+
+        The plugin is injected whether or not a permission broker runs; with
+        ``permissions.enabled: false`` it still marks owner write tools ``ask``
+        and nothing answers (#165, pre-existing — the bash defaults do the same).
         """
         params = {"directory": self._sidecar_cwd} if self._sidecar_cwd else None
-        async with httpx.AsyncClient(timeout=self.timeout) as client:
+        async with httpx.AsyncClient(timeout=_CONFIG_PROBE_TIMEOUT) as client:
             resp = await client.get(f"{base_url}/config", params=params)
         if resp.status_code != 200:
             raise RuntimeError(
