@@ -11,7 +11,6 @@ import yaml
 from gateway.onboard import (
     detect_agent_backends,
     generate_config_yaml,
-    install_opencode_plugin,
     load_install_meta,
     write_install_meta,
 )
@@ -332,147 +331,6 @@ class TestGenerateConfigYamlOpencode:
 
 
 # ---------------------------------------------------------------------------
-# install_opencode_plugin
-# ---------------------------------------------------------------------------
-
-class TestInstallOpencodePlugin:
-    """Tests for install_opencode_plugin — installs to global ~/.opencode/."""
-
-    def _make_fake_plugin(self, tmp_path: Path) -> Path:
-        """Create a fake role-enforcement.ts to act as plugin source."""
-        src = tmp_path / "role-enforcement.ts"
-        src.write_text("// fake plugin\nexport default function() {}")
-        return src
-
-    def _global_dir(self, tmp_path: Path) -> Path:
-        """Return a tmp directory to use as the fake global opencode dir."""
-        d = tmp_path / "global-opencode"
-        d.mkdir()
-        return d
-
-    def test_installs_plugin_to_global_dir(self, tmp_path: Path):
-        """Plugin file is copied to global_opencode_dir/plugins/."""
-        global_dir = self._global_dir(tmp_path)
-        plugin_src = self._make_fake_plugin(tmp_path)
-
-        with patch("gateway.onboard._PLUGIN_SRC", plugin_src):
-            dest = install_opencode_plugin(global_opencode_dir=global_dir)
-
-        assert dest == global_dir / "plugins" / "role-enforcement.ts"
-        assert dest.exists()
-        assert dest.read_text() == plugin_src.read_text()
-
-    def test_returns_absolute_dest_path(self, tmp_path: Path):
-        """install_opencode_plugin returns the absolute path of the installed file."""
-        global_dir = self._global_dir(tmp_path)
-        plugin_src = self._make_fake_plugin(tmp_path)
-
-        with patch("gateway.onboard._PLUGIN_SRC", plugin_src):
-            dest = install_opencode_plugin(global_opencode_dir=global_dir)
-
-        assert dest.is_absolute()
-
-    def test_creates_opencode_json_if_missing(self, tmp_path: Path):
-        """Creates global opencode.json with absolute plugin path when it does not exist."""
-        global_dir = self._global_dir(tmp_path)
-        plugin_src = self._make_fake_plugin(tmp_path)
-
-        with patch("gateway.onboard._PLUGIN_SRC", plugin_src):
-            dest = install_opencode_plugin(global_opencode_dir=global_dir)
-
-        config_file = global_dir / "opencode.json"
-        assert config_file.exists()
-        config = json.loads(config_file.read_text())
-        assert str(dest) in config["plugin"]
-
-    def test_plugin_entry_is_absolute_path(self, tmp_path: Path):
-        """Plugin entry in opencode.json is an absolute path, not relative."""
-        global_dir = self._global_dir(tmp_path)
-        plugin_src = self._make_fake_plugin(tmp_path)
-
-        with patch("gateway.onboard._PLUGIN_SRC", plugin_src):
-            install_opencode_plugin(global_opencode_dir=global_dir)
-
-        config = json.loads((global_dir / "opencode.json").read_text())
-        for entry in config["plugin"]:
-            if "role-enforcement" in entry:
-                assert Path(entry).is_absolute(), "Plugin entry must be an absolute path"
-
-    def test_patches_existing_opencode_json(self, tmp_path: Path):
-        """Adds plugin entry to an existing opencode.json without clobbering other keys."""
-        global_dir = self._global_dir(tmp_path)
-        existing = {"default_agent": "build", "plugin": ["some-other-plugin.ts"]}
-        (global_dir / "opencode.json").write_text(json.dumps(existing))
-
-        plugin_src = self._make_fake_plugin(tmp_path)
-        with patch("gateway.onboard._PLUGIN_SRC", plugin_src):
-            dest = install_opencode_plugin(global_opencode_dir=global_dir)
-
-        config = json.loads((global_dir / "opencode.json").read_text())
-        assert config["default_agent"] == "build"        # existing key preserved
-        assert "some-other-plugin.ts" in config["plugin"]
-        assert str(dest) in config["plugin"]
-
-    def test_idempotent_plugin_registration(self, tmp_path: Path):
-        """Running install twice does not duplicate the plugin entry."""
-        global_dir = self._global_dir(tmp_path)
-        plugin_src = self._make_fake_plugin(tmp_path)
-
-        with patch("gateway.onboard._PLUGIN_SRC", plugin_src):
-            dest = install_opencode_plugin(global_opencode_dir=global_dir)
-            install_opencode_plugin(global_opencode_dir=global_dir)
-
-        config = json.loads((global_dir / "opencode.json").read_text())
-        assert config["plugin"].count(str(dest)) == 1
-
-    def test_raises_if_plugin_source_missing(self, tmp_path: Path):
-        """FileNotFoundError raised when neither module-relative nor repo_path source exists."""
-        global_dir = self._global_dir(tmp_path)
-        nonexistent = tmp_path / "no-such-file.ts"
-
-        with patch("gateway.onboard._PLUGIN_SRC", nonexistent):
-            with pytest.raises(FileNotFoundError, match="opencode plugin source not found"):
-                install_opencode_plugin(repo_path=None, global_opencode_dir=global_dir)
-
-    def test_repo_path_fallback(self, tmp_path: Path):
-        """Falls back to repo_path when module-relative source is missing."""
-        global_dir = self._global_dir(tmp_path)
-
-        repo = tmp_path / "acg-repo"
-        hook_dir = repo / "gateway" / "agents" / "opencode" / "hooks"
-        hook_dir.mkdir(parents=True)
-        (hook_dir / "role-enforcement.ts").write_text("// from repo fallback")
-
-        nonexistent = tmp_path / "no-such-file.ts"
-        with patch("gateway.onboard._PLUGIN_SRC", nonexistent):
-            dest = install_opencode_plugin(repo_path=repo, global_opencode_dir=global_dir)
-
-        assert dest.read_text() == "// from repo fallback"
-
-    def test_handles_malformed_existing_opencode_json(self, tmp_path: Path):
-        """Treats malformed opencode.json as empty dict and overwrites cleanly."""
-        global_dir = self._global_dir(tmp_path)
-        (global_dir / "opencode.json").write_text("this is { not json")
-
-        plugin_src = self._make_fake_plugin(tmp_path)
-        with patch("gateway.onboard._PLUGIN_SRC", plugin_src):
-            dest = install_opencode_plugin(global_opencode_dir=global_dir)  # must not raise
-
-        config = json.loads((global_dir / "opencode.json").read_text())
-        assert str(dest) in config["plugin"]
-
-    def test_creates_parent_dirs(self, tmp_path: Path):
-        """Creates plugins/ subdir if it does not exist."""
-        global_dir = tmp_path / "new-opencode-dir"  # does not exist yet
-        plugin_src = self._make_fake_plugin(tmp_path)
-
-        with patch("gateway.onboard._PLUGIN_SRC", plugin_src):
-            dest = install_opencode_plugin(global_opencode_dir=global_dir)
-
-        assert dest.exists()
-
-
-# ---------------------------------------------------------------------------
 # write_install_meta / load_install_meta
 # ---------------------------------------------------------------------------
 
@@ -773,8 +631,10 @@ class TestRunOnboard:
         new_config = yaml.safe_load(config_file.read_text())
         assert "connectors" in new_config
 
-    def test_run_onboard_opencode_installs_plugin(self, tmp_path: Path):
-        """run_onboard with opencode installs plugin globally, sets working_directory in config."""
+    def test_run_onboard_opencode_writes_config_and_installs_nothing(self, tmp_path: Path):
+        """run_onboard with opencode records the working_directory and agent
+        type; the role-enforcement plugin is not the wizard's job (#157) —
+        OpenCodeBackend.prepare() places it at every start."""
         from gateway.onboard import run_onboard
 
         config_file = tmp_path / "config.yaml"
@@ -782,10 +642,8 @@ class TestRunOnboard:
         meta_file = tmp_path / "install_meta.json"
         opencode_project = tmp_path / "my-project"
         opencode_project.mkdir()
-        global_opencode_dir = tmp_path / "global-opencode"
-
-        fake_plugin = tmp_path / "role-enforcement.ts"
-        fake_plugin.write_text("// fake plugin")
+        fake_home = tmp_path / "home"
+        fake_home.mkdir()
 
         def _proc_mock(cmd, **kwargs):
             m = MagicMock()
@@ -815,23 +673,15 @@ class TestRunOnboard:
             patch("gateway.onboard.ENV_FILE", env_file),
             patch("gateway.onboard.META_FILE", meta_file),
             patch("gateway.onboard.RUNTIME_DIR", tmp_path),
-            patch("gateway.onboard._PLUGIN_SRC", fake_plugin),
-            patch("gateway.onboard._GLOBAL_OPENCODE_DIR", global_opencode_dir),
+            patch.dict("os.environ", {"HOME": str(fake_home), "XDG_CONFIG_HOME": str(fake_home / ".config")}),
         ):
             run_onboard(repo_path=tmp_path)
 
-        # Plugin installed in GLOBAL dir, not in project dir
-        global_plugin = global_opencode_dir / "plugins" / "role-enforcement.ts"
-        assert global_plugin.exists(), "Plugin should be in global ~/.opencode/plugins/"
-        assert not (opencode_project / ".opencode" / "plugins").exists(), \
-            "Plugin should NOT be installed in project dir"
+        # The wizard writes config only — no plugin anywhere it used to go.
+        assert not (fake_home / ".opencode").exists()
+        assert not (fake_home / ".config" / "opencode").exists()
+        assert not (opencode_project / ".opencode").exists()
 
-        # Global opencode.json uses absolute path
-        oc_json = json.loads((global_opencode_dir / "opencode.json").read_text())
-        assert str(global_plugin) in oc_json["plugin"]
-        assert all(Path(e).is_absolute() for e in oc_json["plugin"] if "role-enforcement" in e)
-
-        # config.yaml has correct working_directory and agent type
         config = yaml.safe_load(config_file.read_text())
         assert config["agents"]["my-agent"]["working_directory"] == str(opencode_project)
         assert config["agents"]["my-agent"]["type"] == "opencode"

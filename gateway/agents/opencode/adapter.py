@@ -57,6 +57,7 @@ from ..errors import (
     AgentUnavailableError,
 )
 from ..response import AgentEvent, AgentResponse, TokenUsage
+from . import plugin as _plugin
 
 if TYPE_CHECKING:
     from ...core.permission import (
@@ -270,7 +271,9 @@ class OpenCodeBackend(AgentBackend):
                 ``ValueError`` if the value is malformed JSON.
             sidecar_cwd: Working directory for the ``opencode serve`` process.
                 ``None`` inherits the gateway's cwd. Set this to the project root
-                so opencode can find ``.opencode/opencode.json`` and plugins.
+                so opencode picks up that project's own ``.opencode/`` config.
+                The role-enforcement plugin is not there — it reaches the
+                sidecar through ``OPENCODE_CONFIG_CONTENT``.
             broker_config: Optional permission policy settings for gateway broker
                 creation.  ``None`` means permissions are disabled for this agent.
         """
@@ -289,6 +292,17 @@ class OpenCodeBackend(AgentBackend):
         if _safe_config is not None:
             _env = {**_env, "OPENCODE_CONFIG_CONTENT": _safe_config}
             logger.info("Injected safe bash permission defaults via OPENCODE_CONFIG_CONTENT")
+        # The role-enforcement plugin rides in the same variable, as a file://
+        # entry pointing at the copy shipped in this package — unconditionally,
+        # unlike the bash defaults above, which yield to a user "*" catch-all.
+        # See gateway/agents/opencode/plugin.py for what this does and does not
+        # guarantee; _start_inner() checks the sidecar accepted it.
+        _env = {
+            **_env,
+            "OPENCODE_CONFIG_CONTENT": _plugin.inject_plugin_entry(
+                _env.get("OPENCODE_CONFIG_CONTENT")
+            ),
+        }
         self._sidecar_env: dict[str, str] = _env
         self._sidecar_cwd: str | None = sidecar_cwd
         self._broker_config = broker_config
@@ -392,12 +406,27 @@ class OpenCodeBackend(AgentBackend):
         because ``asyncio.Lock`` is not re-entrant and ``_ensure_live_runtime``
         already holds ``_restart_lock`` when it calls this method.
 
+        Two checks guard the role-enforcement plugin, and both live here rather
+        than in :meth:`start` so the self-heal restart gets them too: the shipped
+        file must exist before anything is spawned (opencode would list a
+        missing file and then ignore it, silently), and after the health check
+        the sidecar's merged config must list the injected spec
+        (:meth:`_verify_plugin_accepted`). Either failure is a failed start.
+
         Raises:
             RuntimeError: If the process fails to become healthy within
-                ``_STARTUP_TIMEOUT`` seconds.
+                ``_STARTUP_TIMEOUT`` seconds, or its config does not list the
+                role-enforcement plugin.
+            FileNotFoundError: If the shipped plugin file is missing.
         """
         if self._base_url:
             return  # another caller already finished start() — double-check guard
+
+        if not _plugin.PLUGIN_SOURCE.is_file():
+            raise FileNotFoundError(
+                f"opencode role-enforcement plugin is missing from this install: "
+                f"{_plugin.PLUGIN_SOURCE}"
+            )
 
         port = _find_free_port()
         base_url = f"http://127.0.0.1:{port}"
@@ -431,6 +460,7 @@ class OpenCodeBackend(AgentBackend):
 
         try:
             await self._wait_for_health(base_url)
+            await self._verify_plugin_accepted(base_url)
         except BaseException:
             # Health check failed — clean up the partially started sidecar so
             # we don't leak processes or background tasks.  After cleanup the
@@ -456,7 +486,9 @@ class OpenCodeBackend(AgentBackend):
 
         Raises:
             RuntimeError: If the process fails to become healthy within
-                ``_STARTUP_TIMEOUT`` seconds.
+                ``_STARTUP_TIMEOUT`` seconds, or its config does not list the
+                role-enforcement plugin.
+            FileNotFoundError: If the shipped plugin file is missing.
         """
         if self._base_url:
             return  # fast path — already running, no lock needed
@@ -726,6 +758,51 @@ class OpenCodeBackend(AgentBackend):
             f"opencode serve did not become healthy within {_STARTUP_TIMEOUT}s "
             f"(last error type: {exc_type})"
         )
+
+    async def _verify_plugin_accepted(self, base_url: str) -> None:
+        """Fail the start unless the sidecar's merged config lists our plugin spec.
+
+        ``GET /config`` returns the config opencode resolved for this process,
+        including the ``plugin`` array after every source has been merged. Our
+        spec absent from it means opencode dropped or ignored the
+        ``OPENCODE_CONFIG_CONTENT`` entry — the case this check exists for, since
+        opencode itself reports nothing. Presence proves acceptance, not that the
+        module loaded (a missing file is listed the same way); the file's
+        existence is checked before spawning.
+
+        A second ``role-enforcement.ts`` in the array whose file exists — the copy
+        the wizard installed at ``~/.opencode/plugins/`` up to v1.0.0 — is logged
+        as a warning and left alone: the gateway does not edit the user's
+        OpenCode installation, and ``docs/migration-v1.md`` says what to remove.
+        An entry whose file is gone is opencode's stale ``opencode.json`` line,
+        which it ignores; so do we.
+        """
+        params = {"directory": self._sidecar_cwd} if self._sidecar_cwd else None
+        async with httpx.AsyncClient(timeout=self.timeout) as client:
+            resp = await client.get(f"{base_url}/config", params=params)
+        if resp.status_code != 200:
+            raise RuntimeError(
+                f"opencode serve answered GET /config with HTTP {resp.status_code}; "
+                "cannot confirm the role-enforcement plugin is in place"
+            )
+        listed = _plugin.listed_plugin_copies(resp.json())
+        if _plugin.PLUGIN_SPEC not in listed:
+            raise RuntimeError(
+                "opencode serve did not accept the role-enforcement plugin from "
+                f"OPENCODE_CONFIG_CONTENT (expected {_plugin.PLUGIN_SPEC} in its "
+                f"resolved 'plugin' array; found {listed or 'no copy'}). Owner "
+                "sessions would run without approval prompts, so the start is refused."
+            )
+        for other in listed:
+            if other == _plugin.PLUGIN_SPEC:
+                continue
+            other_path = Path(httpx.URL(other).path) if other.startswith("file://") else None
+            if other_path is not None and other_path.exists():
+                logger.warning(
+                    "A second role-enforcement plugin will load alongside the gateway's: "
+                    "%s. Remove it so exactly one copy runs (docs/migration-v1.md).",
+                    other_path,
+                )
 
     # ── AgentBackend interface ─────────────────────────────────────────────────
 

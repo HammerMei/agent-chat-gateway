@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [Unreleased]
+
+### Changed
+- **The OpenCode role-enforcement plugin is handed to the sidecar by the
+  gateway, not copied to disk by the wizard** (#157). Until now the plugin was
+  copied once, by the setup wizard, to `~/.opencode/plugins/` and registered in
+  `~/.opencode/opencode.json`, and nothing maintained it: a gateway upgraded in
+  place kept whatever the wizard had last written (a v0 install's copy reads
+  `ACG_ROLE`, which v1 never sets — so the session ran with no role and full
+  access, silently). The sidecar now receives the plugin as a `file://` entry in
+  `OPENCODE_CONFIG_CONTENT`, pointing at the copy shipped in the package; the
+  plugin is the one the running gateway was written against, by construction,
+  and the user's own `opencode` sessions are untouched. The wizard no longer
+  installs anything into `~/.opencode/`.
+- **`opencode serve` must confirm the plugin before the backend is up** (#157).
+  After the health check the gateway asks the sidecar for its merged config
+  and refuses the start — killing the sidecar, marking the agent unavailable —
+  unless the injected spec is listed; opencode itself does not report a plugin
+  it dropped. A second `role-enforcement.ts` that also loads (the
+  wizard's copy in `~/.opencode/plugins/` up to v1.0.0) is logged as a warning; remove it by
+  hand (`docs/migration-v1.md`).
+
 ## [1.0.0] - 2026-09-10
 
 The first release under the new name. Everything below the *Renamed* section

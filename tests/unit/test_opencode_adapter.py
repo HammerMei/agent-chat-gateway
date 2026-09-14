@@ -3,13 +3,16 @@
 import asyncio
 import json
 import unittest
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
 
 from gateway.agents.errors import AgentExecutionError, AgentRateLimitedError, AgentUnavailableError
 from gateway.agents.opencode import OpenCodeBackend
+from gateway.agents.opencode.plugin import PLUGIN_SPEC
 from gateway.agents.response import AgentEvent, AgentResponse
+from tests.helpers import make_opencode_sidecar_http
 
 
 def _make_backend(**kwargs) -> OpenCodeBackend:
@@ -31,9 +34,6 @@ class TestStart(unittest.IsolatedAsyncioTestCase):
         mock_process.returncode = None
         mock_process.pid = 12345
 
-        mock_health_resp = MagicMock()
-        mock_health_resp.status_code = 200
-
         with (
             patch("asyncio.create_subprocess_exec", return_value=mock_process),
             patch(
@@ -43,7 +43,7 @@ class TestStart(unittest.IsolatedAsyncioTestCase):
         ):
             mock_client = AsyncMock()
             mock_cls.return_value.__aenter__.return_value = mock_client
-            mock_client.get = AsyncMock(return_value=mock_health_resp)
+            mock_client.get = make_opencode_sidecar_http()
             await b.start()
 
         self.assertEqual(b._base_url, "http://127.0.0.1:54321")
@@ -115,9 +115,6 @@ class TestStart(unittest.IsolatedAsyncioTestCase):
         mock_process.returncode = None
         mock_process.pid = 1
 
-        mock_health_resp = MagicMock()
-        mock_health_resp.status_code = 200
-
         captured_cmd = []
 
         async def fake_exec(*cmd, **kwargs):
@@ -131,7 +128,7 @@ class TestStart(unittest.IsolatedAsyncioTestCase):
         ):
             mock_client = AsyncMock()
             mock_cls.return_value.__aenter__.return_value = mock_client
-            mock_client.get = AsyncMock(return_value=mock_health_resp)
+            mock_client.get = make_opencode_sidecar_http()
             await b.start()
 
         self.assertIn("--model", captured_cmd)
@@ -144,9 +141,6 @@ class TestStart(unittest.IsolatedAsyncioTestCase):
         mock_process = MagicMock()
         mock_process.returncode = None
         mock_process.pid = 1
-
-        mock_health_resp = MagicMock()
-        mock_health_resp.status_code = 200
 
         captured_env = {}
 
@@ -161,7 +155,7 @@ class TestStart(unittest.IsolatedAsyncioTestCase):
         ):
             mock_client = AsyncMock()
             mock_cls.return_value.__aenter__.return_value = mock_client
-            mock_client.get = AsyncMock(return_value=mock_health_resp)
+            mock_client.get = make_opencode_sidecar_http()
             await b.start()
 
         self.assertEqual(captured_env.get("COOP_ROLE"), "owner")
@@ -1030,6 +1024,7 @@ class TestEnsureLiveRuntimeAfterFailedRestart(unittest.IsolatedAsyncioTestCase):
             patch("gateway.agents.opencode.adapter._find_free_port", return_value=19999),
             patch("asyncio.create_subprocess_exec") as mock_exec,
             patch.object(b, "_wait_for_health", new_callable=AsyncMock),
+            patch.object(b, "_verify_plugin_accepted", new_callable=AsyncMock),
             patch("httpx.AsyncClient"),
         ):
             mock_proc = MagicMock()
@@ -1284,6 +1279,7 @@ class TestOpenCodeStartLocking(unittest.IsolatedAsyncioTestCase):
             patch("asyncio.create_subprocess_exec", side_effect=fake_create_subprocess),
             patch.object(backend, "_drain_pipe", side_effect=fake_drain_pipe),
             patch.object(backend, "_wait_for_health", side_effect=fake_health),
+            patch.object(backend, "_verify_plugin_accepted", new_callable=AsyncMock),
             patch("httpx.AsyncClient", return_value=MagicMock()),
         ):
             await asyncio.gather(backend.start(), backend.start())
@@ -1358,6 +1354,7 @@ class TestOpenCodeStartInner(unittest.IsolatedAsyncioTestCase):
             patch("asyncio.create_subprocess_exec", return_value=proc),
             patch.object(backend, "_drain_pipe", side_effect=fake_drain),
             patch.object(backend, "_wait_for_health", new_callable=AsyncMock),
+            patch.object(backend, "_verify_plugin_accepted", new_callable=AsyncMock),
             patch("httpx.AsyncClient", return_value=MagicMock()),
         ):
             async with backend._restart_lock:
@@ -3140,3 +3137,139 @@ class TestDurableInstructionsAreReclaimedOnExpiry(unittest.IsolatedAsyncioTestCa
             with self.assertRaises(Exception):
                 await _make_backend().reclaim_durable_instructions("../escape")
 
+
+
+# ── role-enforcement plugin: injected, then confirmed accepted (#157) ─────────
+
+
+class TestPluginInjection(unittest.TestCase):
+    """The plugin reaches the sidecar as a file:// entry in OPENCODE_CONFIG_CONTENT."""
+
+    def test_init_injects_plugin_spec(self):
+        b = _make_backend()
+        config = json.loads(b._sidecar_env["OPENCODE_CONFIG_CONTENT"])
+        self.assertIn(PLUGIN_SPEC, config["plugin"])
+
+    def test_init_injects_even_when_user_set_bash_catchall(self):
+        """_build_safe_opencode_config yields to a user "*" catch-all and returns
+        None; the plugin must not yield with it — it rides the same variable but
+        is not optional."""
+        user_config = json.dumps({"permission": {"bash": {"*": "allow"}}})
+        b = _make_backend(sidecar_env={"OPENCODE_CONFIG_CONTENT": user_config})
+
+        stored = json.loads(b._sidecar_env["OPENCODE_CONFIG_CONTENT"])
+        self.assertEqual(stored["permission"]["bash"]["*"], "allow")  # user's choice kept
+        self.assertIn(PLUGIN_SPEC, stored["plugin"])
+
+    def test_init_keeps_user_plugins_and_safe_bash_defaults_together(self):
+        user_config = json.dumps({"plugin": ["their-plugin"]})
+        b = _make_backend(sidecar_env={"OPENCODE_CONFIG_CONTENT": user_config})
+
+        stored = json.loads(b._sidecar_env["OPENCODE_CONFIG_CONTENT"])
+        self.assertEqual(stored["plugin"], ["their-plugin", PLUGIN_SPEC])
+        self.assertEqual(stored["permission"]["bash"]["*"], "ask")
+
+
+class TestPluginAccepted(unittest.IsolatedAsyncioTestCase):
+    """After the health check, start() asks the sidecar for its merged config
+    and refuses to run unless the injected spec is listed. Lives in
+    _start_inner(), so the self-heal restart is covered by the same code."""
+
+    def _start_with(self, b, http):
+        mock_process = MagicMock()
+        mock_process.returncode = None
+        mock_process.pid = 1
+        return (
+            patch("asyncio.create_subprocess_exec", return_value=mock_process),
+            patch("gateway.agents.opencode.adapter._find_free_port", return_value=54400),
+            patch("httpx.AsyncClient"),
+            http,
+        )
+
+    async def _run_start(self, b, http):
+        p_exec, p_port, p_cls, get = self._start_with(b, http)
+        with p_exec, p_port, p_cls as mock_cls:
+            mock_client = AsyncMock()
+            mock_cls.return_value.__aenter__.return_value = mock_client
+            mock_client.get = get
+            await b.start()
+
+    async def test_start_succeeds_when_config_lists_the_spec(self):
+        b = _make_backend()
+        await self._run_start(b, make_opencode_sidecar_http())
+        self.assertEqual(b._base_url, "http://127.0.0.1:54400")
+        self.assertTrue(b._ever_started)
+
+    async def test_start_refuses_and_cleans_up_when_spec_is_missing(self):
+        b = _make_backend()
+        with patch.object(b, "_cleanup_partial_start", new_callable=AsyncMock) as cleanup:
+            with self.assertRaises(RuntimeError) as ctx:
+                await self._run_start(b, make_opencode_sidecar_http(plugin_specs=[]))
+
+        self.assertIn("role-enforcement", str(ctx.exception))
+        self.assertNotIn("127.0.0.1", str(ctx.exception))
+        cleanup.assert_awaited_once()
+        self.assertIsNone(b._base_url)
+        self.assertFalse(b._ever_started)
+
+    async def test_another_copy_of_the_plugin_is_not_ours(self):
+        """A role-enforcement.ts from elsewhere does not satisfy the check —
+        the comparison is on the exact spec the gateway injected."""
+        b = _make_backend()
+        other = "file:///Users/someone/.opencode/plugins/role-enforcement.ts"
+        with patch.object(b, "_cleanup_partial_start", new_callable=AsyncMock):
+            with self.assertRaises(RuntimeError):
+                await self._run_start(b, make_opencode_sidecar_http(plugin_specs=[other]))
+
+    async def test_start_refuses_when_config_endpoint_fails(self):
+        b = _make_backend()
+        with patch.object(b, "_cleanup_partial_start", new_callable=AsyncMock) as cleanup:
+            with self.assertRaises(RuntimeError) as ctx:
+                await self._run_start(b, make_opencode_sidecar_http(config_status=500))
+        self.assertIn("500", str(ctx.exception))
+        cleanup.assert_awaited_once()
+
+    async def test_warns_about_a_second_existing_copy(self):
+        """The copy the wizard installed at ~/.opencode/plugins/ up to v1.0.0
+        loads alongside ours: say so, but do not touch it."""
+        b = _make_backend()
+        with (
+            patch.object(Path, "exists", return_value=True),
+            self.assertLogs("coop.agents.opencode", level="WARNING") as logs,
+        ):
+            await self._run_start(
+                b,
+                make_opencode_sidecar_http(plugin_specs=[
+                    "file:///Users/someone/.opencode/plugins/role-enforcement.ts",
+                    PLUGIN_SPEC,
+                ]),
+            )
+        self.assertTrue(
+            any("second role-enforcement plugin" in m for m in logs.output), logs.output
+        )
+
+    async def test_no_warning_for_a_listed_copy_whose_file_is_gone(self):
+        """The v1.0.0 wizard also wrote an absolute-path entry into
+        ~/.opencode/opencode.json; after the user removes the file, opencode
+        keeps listing that entry and ignores it. So do we."""
+        b = _make_backend()
+        with patch.object(Path, "exists", return_value=False):
+            with self.assertNoLogs("coop.agents.opencode", level="WARNING"):
+                await self._run_start(
+                    b,
+                    make_opencode_sidecar_http(plugin_specs=[
+                        "file:///Users/someone/.opencode/plugins/role-enforcement.ts",
+                        PLUGIN_SPEC,
+                    ]),
+                )
+
+    async def test_start_refuses_before_spawning_when_shipped_file_is_missing(self):
+        b = _make_backend()
+        with (
+            patch("gateway.agents.opencode.plugin.PLUGIN_SOURCE", Path("/nonexistent/x.ts")),
+            patch("asyncio.create_subprocess_exec") as mock_exec,
+        ):
+            with self.assertRaises(FileNotFoundError):
+                await b.start()
+        mock_exec.assert_not_called()
+        self.assertIsNone(b._process)

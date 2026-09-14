@@ -98,7 +98,7 @@ gateway/
 │
 └── agents/
     ├── claude/         # ClaudeBackend
-    └── opencode/       # OpenCodeBackend + role-enforcement plugin
+    └── opencode/       # OpenCodeBackend + role-enforcement plugin (hooks/), handed to the sidecar via OPENCODE_CONFIG_CONTENT
 ```
 
 Key design principle: **`core/` never imports from `connectors/`**.  All platform knowledge stays

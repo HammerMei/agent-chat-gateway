@@ -674,3 +674,26 @@ def evict_record(lifecycle, name):
 
 
 ENG_ROOM = RoomRef(id="eng-backend", kind=RoomKind.CHANNEL, name="eng-backend")
+
+
+def make_opencode_sidecar_http(plugin_specs=None, config_status=200):
+    """A ``client.get`` side-effect for an OpenCodeBackend start: 200 on the
+    health path, and a ``/config`` body whose ``plugin`` array lists
+    ``plugin_specs`` (default: exactly the gateway's own spec, so a plain start
+    succeeds). Install it as ``mock_client.get`` after patching
+    ``httpx.AsyncClient``; ``start()`` makes both requests through that client.
+    """
+    from gateway.agents.opencode.plugin import PLUGIN_SPEC
+
+    specs = [PLUGIN_SPEC] if plugin_specs is None else list(plugin_specs)
+
+    async def _get(url, params=None, **kw):
+        resp = MagicMock()
+        if str(url).endswith("/config"):
+            resp.status_code = config_status
+            resp.json = MagicMock(return_value={"plugin": specs})
+        else:
+            resp.status_code = 200
+        return resp
+
+    return AsyncMock(side_effect=_get)
