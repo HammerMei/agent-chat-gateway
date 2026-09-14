@@ -761,7 +761,8 @@ If an agent backend or permission broker fails at startup:
 
 - Log the error
 - Mark the agent as unavailable
-- Refuse CLI requests to use that agent
+- Refuse to start watchers on that agent — except that `resume`/`reset` first
+  retry its backend and broker, and proceed if they come up (#158)
 - Continue with other agents
 
 If a connector fails mid-run:
@@ -974,10 +975,10 @@ Check `~/.agentcoop/gateway.log` for errors. Common issues:
    than that from it.
 2. **Read the STATE column.** `paused` means an operator muted it. **`failed`
    means a record exists and nothing is running for it.** The startup errors in
-   the log say why. To recover: `resume` retries the start in place — except
-   when the agent backend or its permission broker failed to start, which is
-   decided once at boot and which `resume` refuses fail-closed. **Restart the
-   daemon for that one.**
+   the log say why. To recover: `resume` retries the start in place. When the
+   agent backend or its permission broker failed to start, `resume` first tries
+   to bring them up and refuses fail-closed only if that fails (#158); `coop
+   status` has the start error to fix.
 3. **No row at all?** Then there is no state to act on. That is *not* proof the
    start never got far: context injection, the attachment workspace and session
    binding all roll their record back, so a watcher can fail well into startup

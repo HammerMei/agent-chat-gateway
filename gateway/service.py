@@ -250,9 +250,11 @@ class AgentRuntimeManager:
                     e,
                 )
 
-        self._unavailable = (
-            (self._unavailable - set(starting)) | failed_backends | failed_broker_agents
-        )
+        # In place, never rebound: `unavailable_agents` hands out this set by
+        # reference and boot's `_start_entries` holds it across awaits (#158
+        # made a start outside `_reload_lock` reachable).
+        self._unavailable -= set(starting)
+        self._unavailable |= failed_backends | failed_broker_agents
         return errors
 
     async def stop_all(self) -> None:
@@ -377,6 +379,12 @@ class GatewayService:
         self._reloading = False
         self._shutdown_holds_reload_lock = False
         self._notifier: ConnectorPermissionNotifier | None = None
+        # Serializes `_recover_agent` (#158): two watchers on one agent racing
+        # into the gate must produce one start_some, or the runtime manager
+        # builds two permission brokers. NOT `_reload_lock` — shutdown holds
+        # that while draining verbs, and a verb waiting on it here would
+        # deadlock the drain.
+        self._recover_lock = asyncio.Lock()
         # Why each unavailable agent is unavailable — the start error, kept so
         # `status` can say more than "failed to start".
         self._agent_errors: dict[str, str] = {}
@@ -492,6 +500,8 @@ class GatewayService:
             # watcher configs: a rule binds to one connector by name, and the
             # manager keys its matches on that same name.
             watcher_rules=config.rules_for(cc.name),
+            # A verb's way out of the boot-time unavailable snapshot (#158).
+            recover_agent=self._recover_agent,
             # The membership-remove handler's job cancellation (§2.7).
             # The expiry-exemption oracle that used to sit here is gone with
             # the exemption itself: a job records the room it targets and can
@@ -1025,6 +1035,48 @@ class GatewayService:
             out["config"] = redacted_config(self._config)
         return out
 
+    async def _start_agents(self, names: set[str]) -> list[str]:
+        """The start pass a reload and a verb's recovery share: backends and
+        brokers through the runtime manager, `status`'s per-agent errors kept
+        in step, and the permission-expiry task once a broker exists. Returns
+        the start errors. Does NOT rewrite the lifecycles' blocked sets — the
+        callers do, because a reload must do that even when nothing started."""
+        notifier = self._notifier or ConnectorPermissionNotifier(self._maps.connector_view)
+        errors = await self._runtime_manager.start_some(
+            names, self._registry, notifier, self._maps)
+        self._note_agent_errors(errors)
+        if self._runtime_manager.has_active_brokers and self._expiry_task is None:
+            self._expiry_task = asyncio.create_task(
+                run_expiry_task(self._registry, notifier), name="permission-expiry")
+        return errors
+
+    def _push_unavailable_agents(self) -> None:
+        """Every connector's lifecycle judges starts by the runtime manager's
+        unavailable set; whoever changed it pushes it."""
+        for e in self._entries:
+            e.session_manager.set_unavailable_agents(self._runtime_manager.unavailable_agents)
+
+    async def _recover_agent(self, name: str) -> bool:
+        """Bring an unavailable agent up on a watcher verb's behalf (#158).
+
+        `WatcherLifecycle.recover_agent`. The reload's start pass for one
+        agent, then every connector's gate rewritten — so the sibling watchers
+        on this agent are unblocked too, and `status` stops carrying the
+        boot-time error. Returns whether the agent is available now. An agent
+        that is not unavailable is not restarted (`start()` is idempotent; the
+        broker is not), but the gates are still pushed, in case one holds a
+        stale copy.
+
+        Precondition: the caller is inside a verb's inflight window
+        (`_enter_verb`), so shutdown's and a reload's drain wait for the start
+        this awaits instead of stopping around it.
+        """
+        async with self._recover_lock:
+            if name in self._runtime_manager.unavailable_agents:
+                await self._start_agents({name})
+            self._push_unavailable_agents()
+            return name not in self._runtime_manager.unavailable_agents
+
     def _note_agent_errors(self, errors: list[str]) -> None:
         """Keep each unavailable agent's start error, by name, for `status`."""
         for name in self._runtime_manager.unavailable_agents:
@@ -1421,18 +1473,13 @@ class GatewayService:
 
             # 5. Start pass — agents first.
             if new_backends:
-                notifier = self._notifier or ConnectorPermissionNotifier(self._maps.connector_view)
-                errors = await self._runtime_manager.start_some(
-                    set(new_backends), self._registry, notifier, self._maps)
-                self._note_agent_errors(errors)
+                await self._start_agents(set(new_backends))
                 for name in sorted(set(new_backends) & self._runtime_manager.unavailable_agents):
                     plan.degraded.append(Degraded(
                         "agent", name, self._agent_errors.get(name, "failed to start")))
-                if self._runtime_manager.has_active_brokers and self._expiry_task is None:
-                    self._expiry_task = asyncio.create_task(
-                        run_expiry_task(self._registry, notifier), name="permission-expiry")
             # The kept lifecycles judge starts by a set boot wrote; a reload that
-            # changed which agents are up must rewrite it before anything starts.
+            # changed which agents are up must rewrite it before anything starts
+            # — even when nothing started (a removed agent leaves the set).
             for e in kept:
                 e.session_manager.set_unavailable_agents(self._runtime_manager.unavailable_agents)
 

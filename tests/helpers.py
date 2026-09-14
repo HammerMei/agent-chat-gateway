@@ -475,6 +475,7 @@ def make_bare_gateway_service(**attrs):
     svc._reloading = False
     svc._shutdown_holds_reload_lock = False
     svc._notifier = None
+    svc._recover_lock = asyncio.Lock()
     svc._agent_errors = {}
     svc._core_config = MagicMock()
     svc._registry = MagicMock()
@@ -629,6 +630,7 @@ def make_lifecycle(**overrides):
         "injector": MagicMock(),
         "permission_registry": None,
         "maps": MagicMock(),
+        "recover_agent": None,
     }
     defaults.update(overrides)
     return WatcherLifecycle(**defaults)

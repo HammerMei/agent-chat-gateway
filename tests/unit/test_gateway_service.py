@@ -959,3 +959,142 @@ class TestRecordsSettleBeforeTheIdentityBarrier(unittest.IsolatedAsyncioTestCase
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestRecoverAgent(unittest.IsolatedAsyncioTestCase):
+    """`_recover_agent` is what a watcher verb calls on a blocked agent (#158):
+    one `start_some` for backend and broker, then both stores updated — the
+    runtime manager's set (by start_some itself), `status`'s start error, and
+    every connector's lifecycle gate."""
+
+    def _service(self, *, start_ok=True, initially_unavailable=("opencode",)):
+        from types import SimpleNamespace
+
+        svc = make_bare_gateway_service()
+        rm = svc._runtime_manager
+        rm.unavailable_agents = set(initially_unavailable)
+
+        async def start_some(names, registry, notifier, maps):
+            if start_ok:
+                rm.unavailable_agents -= set(names)
+                rm.has_active_brokers = True
+                return []
+            return [f"Agent '{n}': backend failed to start — still down" for n in names]
+
+        rm.start_some = AsyncMock(side_effect=start_some)
+        svc._agent_errors = {n: f"Agent '{n}': boot-time error" for n in initially_unavailable}
+        svc._entries = [
+            SimpleNamespace(name="rc", session_manager=MagicMock()),
+            SimpleNamespace(name="mm", session_manager=MagicMock()),
+        ]
+        return svc
+
+    async def test_success_clears_status_error_and_every_lifecycle_gate(self):
+        svc = self._service(start_ok=True)
+
+        ok = await svc._recover_agent("opencode")
+
+        self.assertTrue(ok)
+        svc._runtime_manager.start_some.assert_awaited_once()
+        self.assertEqual(svc._runtime_manager.start_some.await_args.args[0], {"opencode"})
+        self.assertNotIn("opencode", svc._agent_errors, "status must stop showing the boot error")
+        for e in svc._entries:
+            e.session_manager.set_unavailable_agents.assert_called_once_with(set())
+        self.assertIsNotNone(svc._expiry_task, "a broker came up: the expiry task runs")
+        svc._expiry_task.cancel()
+
+    async def test_failure_keeps_the_agent_unavailable_with_a_fresh_error(self):
+        svc = self._service(start_ok=False)
+
+        ok = await svc._recover_agent("opencode")
+
+        self.assertFalse(ok)
+        self.assertIn("still down", svc._agent_errors["opencode"])
+        for e in svc._entries:
+            e.session_manager.set_unavailable_agents.assert_called_once_with({"opencode"})
+
+    async def test_an_agent_that_is_not_unavailable_is_not_restarted(self):
+        """No second broker for a healthy agent — but the gates are still
+        pushed, in case the lifecycle that asked holds a stale copy."""
+        svc = self._service(start_ok=True, initially_unavailable=())
+
+        ok = await svc._recover_agent("opencode")
+
+        self.assertTrue(ok)
+        svc._runtime_manager.start_some.assert_not_awaited()
+        for e in svc._entries:
+            e.session_manager.set_unavailable_agents.assert_called_once_with(set())
+
+    async def test_concurrent_recoveries_start_the_agent_once(self):
+        """Two watchers on one agent racing into the gate: one start_some, or
+        the runtime manager would build two permission brokers."""
+        svc = self._service(start_ok=True)
+        gate = asyncio.Event()
+        rm = svc._runtime_manager
+
+        entered = asyncio.Event()
+
+        async def slow_start(names, registry, notifier, maps):
+            entered.set()
+            await gate.wait()
+            rm.unavailable_agents -= set(names)
+            return []
+
+        rm.start_some = AsyncMock(side_effect=slow_start)
+        first = asyncio.create_task(svc._recover_agent("opencode"))
+        second = asyncio.create_task(svc._recover_agent("opencode"))
+        # The first is inside start_some; the second is parked on the lock
+        # (or, without the lock, would be inside a second start_some).
+        await asyncio.wait_for(entered.wait(), 1)
+        await asyncio.sleep(0)
+        gate.set()
+
+        self.assertEqual(await asyncio.gather(first, second), [True, True])
+        rm.start_some.assert_awaited_once()
+
+
+class TestRecoverAgentThroughRealLifecycles(unittest.IsolatedAsyncioTestCase):
+    """The end-to-end seam (#158): a real `_recover_agent` wired into two real
+    `WatcherLifecycle`s on different connectors. A reset on one unblocks the
+    other through the gateway's push, not through the resetting lifecycle's
+    own discard."""
+
+    async def test_reset_on_one_connector_unblocks_the_other(self):
+        from tests.helpers import install_record, make_lifecycle, make_rule_derived_record
+
+        svc = make_bare_gateway_service()
+        rm = svc._runtime_manager
+        rm.unavailable_agents = {"opencode"}
+
+        async def start_some(names, registry, notifier, maps):
+            rm.unavailable_agents -= set(names)
+            return []
+
+        rm.start_some = AsyncMock(side_effect=start_some)
+
+        lifecycles = []
+        for connector in ("rc", "mm"):
+            lc = make_lifecycle(
+                agents={"opencode": MagicMock()},
+                state_store=MagicMock(load=MagicMock(return_value={}), save=MagicMock()),
+                recover_agent=svc._recover_agent,
+            )
+            lc.set_blocked_agents({"opencode"})
+            install_record(lc, make_rule_derived_record(f"{connector}-support", agent="opencode"))
+            lifecycles.append(lc)
+        svc._entries = [
+            SimpleNamespace(name=n, session_manager=SimpleNamespace(
+                set_unavailable_agents=lc.set_blocked_agents))
+            for n, lc in zip(("rc", "mm"), lifecycles, strict=True)
+        ]
+        rc, mm = lifecycles
+
+        with patch.object(rc, "_reset_locked", new_callable=AsyncMock):
+            await rc.reset_watcher("rc-support")
+
+        rm.start_some.assert_awaited_once()
+        self.assertEqual(mm.blocked_agents, set(), "the sibling connector's gate was rewritten")
+        with patch.object(mm, "_reset_locked", new_callable=AsyncMock) as inner:
+            await mm.reset_watcher("mm-support")
+        inner.assert_awaited_once()
+        rm.start_some.assert_awaited_once()  # no second start for a healthy agent

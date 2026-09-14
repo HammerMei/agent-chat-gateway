@@ -103,6 +103,7 @@ class SessionManager:
         session_maps: SessionMaps | None = None,
         watcher_rules: list | None = None,
         cancel_jobs=None,
+        recover_agent=None,
     ) -> None:
         self._connector = connector
         # `state_name` is the connector's config name in production (service.py
@@ -124,6 +125,7 @@ class SessionManager:
             injector=self._injector,
             permission_registry=permission_registry,
             maps=maps,
+            recover_agent=recover_agent,
         )
         # The manager is constructed UNCONDITIONALLY, empty rule list and all
         # (Codex round 5, P1). It was once gated on rules existing — a
@@ -630,8 +632,9 @@ class SessionManager:
                 if self._lifecycle.processor_for_room(ws.room_id) is not None}
 
     def set_unavailable_agents(self, names: set[str]) -> None:
-        """Push the agents a reload could not start (or brought back) to the
-        lifecycle's fail-closed gate — boot wrote it once; a reload rewrites it."""
+        """Push the current unavailable-agent set to the lifecycle's fail-closed
+        gate — written at boot, rewritten by a reload and by a verb's recovery
+        attempt (#158)."""
         self._lifecycle.set_blocked_agents(names)
 
     def replace_rules(self, rules: list[WatcherRule]) -> None:

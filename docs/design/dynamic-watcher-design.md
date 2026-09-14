@@ -1127,11 +1127,22 @@ this whole section exists to remove — a broken watcher that looks fine.
 
 * `resume` and `reset` retry the start, which is the in-place recovery for a
   fault outside the gateway — a room that had gone, a server that was down.
-  **Neither can recover an unavailable agent.** Availability is decided once, at
-  boot, and both verbs refuse fail-closed on it rather than starting a watcher
-  with no permission broker. Restarting the daemon is the only thing that
-  re-evaluates it, and operator-facing text has to say so rather than offering
-  `resume` as the general answer.
+  **They also retry an unavailable agent** (#158). Availability is decided at
+  boot and recorded as a snapshot; a verb on a watcher whose agent is in it
+  asks the gateway to start that agent's backend *and* permission broker
+  before refusing, and refuses fail-closed only if that attempt fails — never
+  starting a watcher with no broker. A success clears the agent for every
+  watcher bound to it, on every connector, and `status` stops carrying its
+  boot-time error. The creation paths (a message wake, the eager boot loop) do
+  not retry: a broken backend is re-attempted on an operator's word or on a
+  `config reload`, not per inbound message. The refusal names both ways out.
+  The seam: `WatcherLifecycle(recover_agent=...)`, a
+  `Callable[[str], Awaitable[bool]] | None` tunnelled unchanged through
+  `SessionManager` — `GatewayService._recover_agent` in production, `None`
+  (plain refusal) for a lifecycle with no gateway behind it. It runs inside
+  the verb's inflight window, after the disarm check: it awaits a backend
+  start, and a wait outside that count is exactly the hole shutdown's drain
+  closed. A caller outside a verb must not use it.
 * `pause` mutes it, and the resulting `paused=True` is what stops boot from
   retrying — the honest way to say "stop trying this one for now", as against
   the system deciding that for itself.

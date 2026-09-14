@@ -903,10 +903,12 @@ quietly settles for a broken watcher.
 
 **To recover one:** `resume` or `reset` retries the start in place, which is
 what you want when the fault was outside the gateway — a room that had gone, a
-server that was down. **If the agent backend itself was unavailable, restart the
-daemon instead:** agent availability is decided once at startup, and `resume`
-and `reset` deliberately refuse rather than start a watcher whose permission
-broker never came up.
+server that was down. If the agent backend itself was unavailable, the same two
+verbs first try to bring it up — backend and permission broker — and proceed if
+that works, unblocking every watcher on that agent; they refuse only if the
+attempt fails, and never start a watcher whose broker did not come up. `coop
+status` shows the start error to fix first; `coop config reload` re-evaluates
+every agent as well.
 
 To stop a watcher being retried at all, `pause` it; that is also how a watcher
 with no record is kept from being started, since pausing one creates a paused
