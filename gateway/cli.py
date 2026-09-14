@@ -512,10 +512,12 @@ def main():
 
 _LIFECYCLE_VERBS = ("pause", "resume", "reset", "expire")
 
-# Reset stops and restarts the agent process and injects context (an agent
-# round-trip). That can take minutes for a slow agent (OpenCode startup +
-# injection), so its per-command wait is 5 minutes, not the default 60 s.
-_LIFECYCLE_TIMEOUT = {"reset": 300.0}
+# Resume and reset may first bring an unavailable agent up (#158): an OpenCode
+# sidecar start is bounded at ~40 s, and a verb can queue behind another
+# agent's attempt. Reset additionally restarts the agent process and injects
+# context (an agent round-trip), which can take minutes for a slow agent. Both
+# wait 5 minutes per command, not the default 60 s.
+_LIFECYCLE_TIMEOUT = {"resume": 300.0, "reset": 300.0}
 
 # Present participle per verb, for the batch path's per-watcher lines
 # ("Resuming watcher 'x'…" / "Done resuming watcher 'x'"). The single-name

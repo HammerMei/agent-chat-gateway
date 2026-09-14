@@ -28,6 +28,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   it dropped. A second `role-enforcement.ts` that also loads (the
   wizard's copy in `~/.opencode/plugins/` up to v1.0.0) is logged as a warning; remove it by
   hand (`docs/migration-v1.md`).
+- **`resume` and `reset` retry an unavailable agent instead of trusting the
+  boot-time snapshot** (#158). An agent whose backend or broker failed at boot
+  was refused by every watcher verb until a `config reload` or a daemon
+  restart, even after the operator had fixed the cause. The two operator verbs
+  now ask the gateway to start the agent's backend and permission broker, and
+  refuse only if that fails; a success unblocks every watcher bound to the
+  agent on every connector, and `coop status` stops reporting its start error.
+  Message wakes and the eager boot loop still refuse without retrying, so a
+  broken backend is re-attempted on an operator's word, not per inbound
+  message. The refusal now names the remedy: the start error is in `coop
+  status`; after a fix, `resume`/`reset` retries the agent and `coop config
+  reload` re-evaluates every agent. The attempt runs inside the verb, so a
+  `coop stop` or `config reload` issued while one is in flight waits for it —
+  bounded by the backend's startup timeout (about 40 s for OpenCode) — rather
+  than tearing the sidecar down around it; `resume` now gets the same
+  five-minute client wait `reset` already had.
 
 ## [1.0.0] - 2026-09-10
 

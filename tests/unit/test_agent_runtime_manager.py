@@ -160,6 +160,39 @@ class TestAgentRuntimeManager(unittest.IsolatedAsyncioTestCase):
         # Broker should never have been created
         self.assertIsNone(backend._mock_broker)
 
+    async def test_start_some_clears_an_agent_that_now_starts(self):
+        """The recovery direction of the unavailable arithmetic (#158): an agent
+        that failed at boot and succeeds on a later start_some leaves the set."""
+        backend = _TestBackend(start_error=RuntimeError("down"), has_broker=True)
+        mgr = AgentRuntimeManager({"flaky": backend})
+        registry, notifier, maps = PermissionRegistry(), _make_notifier(), SessionMaps()
+
+        await mgr.start_all(registry=registry, notifier=notifier, maps=maps)
+        self.assertIn("flaky", mgr.unavailable_agents)
+
+        backend._start_error = None
+        errors = await mgr.start_some({"flaky"}, registry, notifier, maps)
+
+        self.assertEqual(errors, [])
+        self.assertNotIn("flaky", mgr.unavailable_agents)
+        self.assertTrue(mgr.has_active_brokers, "the broker skipped at boot starts now")
+
+    async def test_start_some_mutates_the_unavailable_set_in_place(self):
+        """`unavailable_agents` is handed out by reference and held across
+        awaits by boot's `_start_entries`; a start that rebinds the set would
+        leave such a holder judging by a stale copy (#158)."""
+        backend = _TestBackend(start_error=RuntimeError("down"))
+        mgr = AgentRuntimeManager({"flaky": backend})
+        registry, notifier, maps = PermissionRegistry(), _make_notifier(), SessionMaps()
+        await mgr.start_all(registry=registry, notifier=notifier, maps=maps)
+        held = mgr.unavailable_agents
+
+        backend._start_error = None
+        await mgr.start_some({"flaky"}, registry, notifier, maps)
+
+        self.assertIs(mgr.unavailable_agents, held)
+        self.assertEqual(held, set())
+
     async def test_broker_failure_marks_agent_unavailable(self):
         """Backend OK but broker fails → agent unavailable."""
         backend = _TestBackend(

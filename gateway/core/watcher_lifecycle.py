@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections.abc import Awaitable, Callable
 from datetime import datetime
 from typing import Any
 
@@ -109,9 +110,13 @@ class WatcherLifecycle:
         injector: InjectedContextBuilder,
         permission_registry: PermissionRegistry | None,
         maps: SessionMaps,
+        recover_agent: Callable[[str], Awaitable[bool]] | None = None,
     ) -> None:
         self._connector = connector
         self._agents = agents
+        # How resume/reset bring a blocked agent up (#158) — see
+        # `_ensure_agent_available_or_recover`. None keeps the refusal.
+        self._recover_agent = recover_agent
         self._config = config
         self._state_store = state_store
         self._dispatcher = dispatcher
@@ -177,17 +182,17 @@ class WatcherLifecycle:
     @property
     def blocked_agents(self) -> set[str]:
         """The agents `_ensure_agent_available` refuses — unavailable since boot,
-        or since the last reload rewrote the set."""
+        the last reload, or the last verb-driven recovery attempt (#158)."""
         return set(self._blocked_agents)
 
     def set_blocked_agents(self, names: set[str]) -> None:
-        """Replace the unavailable-agent set after a reload changed it (#144).
+        """Replace the unavailable-agent set after the gateway re-evaluated it.
 
-        Boot writes it once in `sync_watchers`; a reload that rebuilt an agent
-        — successfully or not — must push the new answer to every lifecycle it
-        kept, or `_ensure_agent_available` judges by a boot-time set in both
-        directions: starting on a backend that never came up, or refusing one
-        that is fine now."""
+        Boot writes it in `sync_watchers`; a reload that rebuilt an agent (#144)
+        and a verb's recovery attempt (#158, `_recover_agent`) each push the new
+        answer to every lifecycle, or `_ensure_agent_available` judges by a
+        stale set in both directions: starting on a backend that never came up,
+        or refusing one that is fine now."""
         self._blocked_agents = set(names)
 
     def disarm_transitions(self, reason: str = _SHUTTING_DOWN) -> None:
@@ -1007,11 +1012,13 @@ class WatcherLifecycle:
                 f"record, and this name has none. See 'list' for the "
                 f"records that exist."
             )
-        self._ensure_agent_available(wc)
         # The shutdown barrier (Codex round 9): checked and entered in one
-        # synchronous segment, exited via finally — see drain_verbs.
+        # synchronous segment, exited via finally — see drain_verbs. The agent
+        # gate comes AFTER it (#158): it may now await a backend start, and a
+        # wait outside the inflight count is the hole round 9 closed.
         self._enter_verb("resume", name)
         try:
+            await self._ensure_agent_available_or_recover(wc)
             await self._resume_locked(name, wc, record)
         finally:
             self._exit_verb()
@@ -1205,10 +1212,11 @@ class WatcherLifecycle:
                 f"Watcher '{name}' is paused — reset does not clear a pause "
                 f"(§2.5). Resume it first, then reset."
             )
-        self._ensure_agent_available(wc)
-        # The shutdown barrier (Codex round 9) — same shape as resume's.
+        # The shutdown barrier (Codex round 9) — same shape as resume's, gate
+        # inside it for the same reason (#158).
         self._enter_verb("reset", name)
         try:
+            await self._ensure_agent_available_or_recover(wc)
             await self._reset_locked(name, wc, record)
         finally:
             self._exit_verb()
@@ -2249,8 +2257,33 @@ class WatcherLifecycle:
         agent_name = self._resolve_agent_name(wc.agent)
         if agent_name in self._blocked_agents:
             raise RuntimeError(
-                f"Watcher '{wc.name}' cannot start because agent '{agent_name}' is unavailable"
+                f"Watcher '{wc.name}' cannot start because agent '{agent_name}' is "
+                f"unavailable. 'coop status' has its start error; once that is fixed, "
+                f"'resume' or 'reset' retries the agent, and 'coop config reload' "
+                f"re-evaluates every agent."
             )
+
+    async def _ensure_agent_available_or_recover(self, wc: WatcherConfig) -> None:
+        """The verb form of the gate (#158): try to bring a blocked agent up
+        before refusing.
+
+        The recovery goes through `recover_agent` (the gateway's
+        `GatewayService._recover_agent`), because an unavailable agent has no
+        permission broker either and this gate exists so a watcher never runs
+        without one: the callback starts both and rewrites every connector's
+        blocked set, so sibling watchers on the agent are unblocked by the same
+        attempt. The local discard is belt and braces for a callback that
+        reports success without rewriting. Only resume/reset call this — see
+        the class docstring for why the creation-path gate does not. It MUST
+        run inside the verb's `_enter_verb`/`_exit_verb` window: it awaits a
+        backend start, and a wait outside the inflight count is the hole
+        shutdown's drain closed. Whatever the outcome, the plain gate below
+        decides and words the refusal.
+        """
+        if (wc.agent in self._blocked_agents and self._recover_agent is not None
+                and await self._recover_agent(wc.agent)):
+            self._blocked_agents.discard(wc.agent)
+        self._ensure_agent_available(wc)
 
     def _resolve_agent_name(self, name: str | None) -> str:
         """The agent a watcher runs on. There is nothing to substitute.

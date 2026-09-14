@@ -225,7 +225,8 @@ The processors of a changing agent are stopped in step 3 **before** their
 backend, while it is still alive: a processor's stop drains its queue by
 processing it, and against a stopped sidecar every drained message would
 fail into the room. The kept lifecycles are also told which agents came up
-(`set_blocked_agents`) — boot writes that set once; a reload rewrites it.
+(`set_blocked_agents`) — boot writes that set; a reload rewrites it, and so
+does a `resume`/`reset` that brings an agent back (#158).
 
 **Nothing refuses after construction, and nothing is rolled back** (owner,
 2026-09-05). A rollback can fail too, and even one that succeeds has not

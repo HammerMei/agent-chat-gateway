@@ -21,14 +21,18 @@ import pytest
 from gateway.config import AgentConfig, WatcherConfig
 from gateway.connectors.script import ScriptConnector
 from gateway.core.config import CoreConfig
+from gateway.core.connector import Room
 from gateway.core.state import WatcherState
+from gateway.core.watcher_manager import config_from_record
 from tests.helpers import (
     CleanupTrackingAgent,
     IsolatedTestCase,
     MockAgentBackend,
+    install_record,
     make_lifecycle,
     make_manager,
     make_rule,
+    make_rule_derived_record,
     start_watcher,
 )
 
@@ -509,6 +513,103 @@ class TestGetWatcherLock(unittest.IsolatedAsyncioTestCase):
         lifecycle, _, _, _ = _make_lifecycle_r14(["support"])
         lock = lifecycle._get_watcher_lock("support")
         self.assertIsInstance(lock, asyncio.Lock)
+
+
+# ── A verb retries an unavailable agent (#158) ───────────────────────────────
+
+
+class TestVerbRetriesUnavailableAgent(unittest.IsolatedAsyncioTestCase):
+    """resume/reset try to bring a blocked agent up through the service's
+    `recover_agent` callback before refusing; every other gate site stays a
+    pure check, so a broken backend is retried on an operator's word only."""
+
+    def _lifecycle(self, recover=None, blocked=("opencode",)):
+        lc = make_lifecycle(
+            agents={"opencode": MagicMock()},
+            state_store=MagicMock(load=MagicMock(return_value={}), save=MagicMock()),
+            recover_agent=recover,
+        )
+        lc._blocked_agents = set(blocked)
+        record = make_rule_derived_record("support", agent="opencode")
+        install_record(lc, record)
+        return lc, record
+
+    async def test_reset_recovers_a_blocked_agent_and_proceeds(self):
+        recovered: list[str] = []
+
+        async def recover(name):
+            recovered.append(name)
+            return True
+
+        lc, _ = self._lifecycle(recover)
+        with patch.object(lc, "_reset_locked", new_callable=AsyncMock) as inner:
+            await lc.reset_watcher("support")
+
+        self.assertEqual(recovered, ["opencode"])
+        inner.assert_awaited_once()
+        self.assertNotIn("opencode", lc._blocked_agents)
+
+    async def test_resume_recovers_too_and_a_sibling_watcher_is_unblocked(self):
+        async def recover(name):
+            return True
+
+        lc, _ = self._lifecycle(recover)
+        install_record(lc, make_rule_derived_record("sales", agent="opencode"))
+
+        with patch.object(lc, "_resume_locked", new_callable=AsyncMock):
+            await lc.resume_watcher("support")
+        # The agent is shared: recovering it for one watcher clears the gate
+        # for the other, with no second recovery attempt.
+        with patch.object(lc, "_reset_locked", new_callable=AsyncMock) as inner:
+            await lc.reset_watcher("sales")
+        inner.assert_awaited_once()
+
+    async def test_still_broken_agent_is_refused_with_the_remedy(self):
+        async def recover(name):
+            return False
+
+        lc, _ = self._lifecycle(recover)
+        with self.assertRaises(RuntimeError) as ctx:
+            await lc.reset_watcher("support")
+
+        msg = str(ctx.exception)
+        self.assertIn("agent 'opencode' is unavailable", msg)
+        self.assertIn("coop status", msg)
+        self.assertIn("config reload", msg)
+        self.assertIn("opencode", lc._blocked_agents)
+
+    async def test_no_callback_keeps_the_fail_closed_refusal(self):
+        lc, _ = self._lifecycle(recover=None)
+        with self.assertRaises(RuntimeError) as ctx:
+            await lc.resume_watcher("support")
+        self.assertIn("is unavailable", str(ctx.exception))
+
+    async def test_disarmed_lifecycle_refuses_before_trying_to_recover(self):
+        """The recovery awaits a backend start (up to its startup timeout);
+        it must sit inside the verb's inflight accounting, after the disarm
+        check, or shutdown's drain could complete around it."""
+        async def recover(name):
+            self.fail("recovery must not run once transitions are disarmed")
+
+        lc, _ = self._lifecycle(recover)
+        lc._disarmed = True
+        with self.assertRaises(RuntimeError) as ctx:
+            await lc.reset_watcher("support")
+        self.assertIn("Cannot reset", str(ctx.exception))
+
+    async def test_a_creation_start_does_not_try_to_recover(self):
+        """start_watcher_in_room's step-0 gate is reached by message wakes and
+        the eager boot loop; those keep refusing — retrying a broken backend
+        per inbound message is not the increment (owner decision)."""
+        async def recover(name):
+            self.fail("step 0 must stay a pure check")
+
+        lc, record = self._lifecycle(recover)
+        wc = config_from_record(record)
+        room = Room(id=record.room_id, name="support", type=record.room_kind or record.room_type)
+        with self.assertRaises(RuntimeError) as ctx:
+            await lc.start_watcher_in_room(wc, record, room)
+        self.assertIn("is unavailable", str(ctx.exception))
 
 
 # ── Tests from test_round16_fixes.py ──────────────────────────────────────────
