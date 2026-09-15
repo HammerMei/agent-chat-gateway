@@ -1114,7 +1114,8 @@ class TestBuildAgentBackendUsesEffectiveMethods(unittest.TestCase):
         captured = {}
 
         def _capture_broker(
-            owner_allowed_tools, guest_allowed_tools, timeout, skip_owner_approval
+            owner_allowed_tools, guest_allowed_tools, timeout, skip_owner_approval,
+            human_approval,
         ):
             captured["guest"] = list(guest_allowed_tools)
             m = MagicMock()
@@ -1130,6 +1131,104 @@ class TestBuildAgentBackendUsesEffectiveMethods(unittest.TestCase):
             any("fetch-history" in (p or "") for p in guest_params),
             f"Built-in fetch-history rule missing from broker guest_allowed_tools: {guest_params}",
         )
+
+
+class TestBuildAgentBackendAlwaysHasBroker(unittest.TestCase):
+    """Every agent gets a permission broker (ADR-0002). `permissions.enabled`
+    only sets `human_approval` on the config: ask a human, or deny. The built-in
+    owner rules ride along in both modes so `coop send` keeps working when
+    approval is off — the whole point of not removing the broker."""
+
+    def _build(self, backend_type: str, enabled: bool, **perm) -> dict:
+        from gateway.core.config import AgentConfig, PermissionConfig
+        from tests.helpers import build_backend_kwargs
+
+        return build_backend_kwargs(
+            AgentConfig(
+                name="a", type=backend_type, command=backend_type,
+                permissions=PermissionConfig(enabled=enabled, **perm),
+            ),
+            "OpenCodeBackend" if backend_type == "opencode" else "ClaudeBackend",
+        )
+
+    def test_disabled_permissions_still_build_a_broker_that_denies(self):
+        for backend_type in ("claude", "opencode"):
+            kwargs = self._build(backend_type, enabled=False)
+            broker = kwargs["broker_config"]
+            self.assertIsNotNone(broker, backend_type)
+            self.assertFalse(broker.human_approval, backend_type)
+            self.assertFalse(broker.skip_owner_approval, backend_type)
+
+    def test_enabled_permissions_ask(self):
+        for backend_type in ("claude", "opencode"):
+            broker = self._build(backend_type, enabled=True)["broker_config"]
+            self.assertTrue(broker.human_approval, backend_type)
+
+    def test_builtin_owner_rules_reach_the_broker_when_approval_is_off(self):
+        """effective_owner_allowed_tools() is used in deny mode too, so the
+        gateway's own `coop send` rule is still an allow — not a deny."""
+        broker = self._build("claude", enabled=False)["broker_config"]
+        params = [r.params or "" for r in broker.owner_allowed_tools]
+        self.assertTrue(any("coop" in p and "send" in p for p in params), params)
+
+    def test_opencode_sidecar_env_is_role_only(self):
+        """No approval-mode env var: the sidecar always asks and the broker
+        always answers, so there is nothing for the sidecar to be told."""
+        for enabled in (False, True):
+            env = self._build("opencode", enabled=enabled)["sidecar_env"]
+            self.assertEqual(env, {"COOP_ROLE": "owner"}, enabled)
+
+
+class TestSkipOwnerApprovalRequiresEnabled(unittest.TestCase):
+    """enabled: false + skip_owner_approval: true is contradictory (nothing to
+    skip when nobody is asked) and is refused at load, naming both keys."""
+
+    def _load(self, enabled: bool, skip: bool):
+        cfg = textwrap.dedent(f"""\
+            connectors:
+              - name: rc
+                type: rocketchat
+                server:
+                  url: http://localhost:3000
+                  username: bot
+                  password: pw
+            agents:
+              a:
+                type: claude
+                working_directory: /tmp
+                permissions:
+                  enabled: {str(enabled).lower()}
+                  skip_owner_approval: {str(skip).lower()}
+            watcher_rules:
+              - name: w1
+                connector: rc
+                agent: a
+                rooms:
+                  include: [general]
+        """)
+        with tempfile.NamedTemporaryFile("w", suffix=".yaml", delete=False) as f:
+            f.write(cfg)
+            path = f.name
+        try:
+            return GatewayConfig.from_file(path)
+        finally:
+            os.unlink(path)
+
+    def test_disabled_with_skip_is_rejected(self):
+        with self.assertRaises(ValueError) as cm:
+            self._load(enabled=False, skip=True)
+        msg = str(cm.exception)
+        self.assertIn("skip_owner_approval", msg)
+        self.assertIn("permissions.enabled", msg)
+        self.assertIn("'a'", msg)
+
+    def test_enabled_with_skip_loads(self):
+        cfg = self._load(enabled=True, skip=True)
+        self.assertTrue(cfg.agents["a"].permissions.skip_owner_approval)
+
+    def test_disabled_without_skip_loads(self):
+        cfg = self._load(enabled=False, skip=False)
+        self.assertFalse(cfg.agents["a"].permissions.enabled)
 
 
 # ── Tests: _deep_merge helper ─────────────────────────────────────────────────

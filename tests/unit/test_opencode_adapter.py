@@ -8,6 +8,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
 
+from gateway.agents import GatewayBrokerConfig
 from gateway.agents.errors import AgentExecutionError, AgentRateLimitedError, AgentUnavailableError
 from gateway.agents.opencode import OpenCodeBackend
 from gateway.agents.opencode.plugin import PLUGIN_SPEC
@@ -2940,24 +2941,55 @@ class TestBuildSafeOpencodeConfig(unittest.TestCase):
     """Tests for _build_safe_opencode_config() and its integration in __init__."""
 
     def setUp(self):
-        from gateway.agents.opencode.adapter import (
-            _DEFAULT_BASH_ALLOW_PATTERNS,
-            _build_safe_opencode_config,
-        )
+        from gateway.agents.opencode.adapter import _build_safe_opencode_config
         self.fn = _build_safe_opencode_config
-        self.default_patterns = _DEFAULT_BASH_ALLOW_PATTERNS
 
     # ── no existing config ────────────────────────────────────────────────────
 
-    def test_empty_env_injects_full_defaults(self):
-        """No OPENCODE_CONFIG_CONTENT → full default bash config is injected."""
+    def test_empty_env_injects_ask_for_every_gated_permission(self):
+        """No OPENCODE_CONFIG_CONTENT → bash gets the "ask" catch-all and the
+        other gated permissions get "ask" too. No gateway allow patterns: an
+        allow opencode applies itself never reaches the broker, and the sidecar
+        is COOP_ROLE=owner for every chatter, so a guest would run it unprompted."""
         result = self.fn({})
         self.assertIsNotNone(result)
-        config = json.loads(result)
-        bash = config["permission"]["bash"]
-        self.assertEqual(bash["*"], "ask")
-        for p in self.default_patterns:
-            self.assertEqual(bash[p], "allow", f"Expected '{p}' to be 'allow'")
+        perms = json.loads(result)["permission"]
+        self.assertEqual(perms, {"bash": {"*": "ask"}, "edit": "ask", "webfetch": "ask", "websearch": "ask"})
+
+    def test_edit_is_gated_because_the_plugin_owner_path_is_inert(self):
+        """write/edit/multiedit ask under opencode's `edit` permission. With the
+        default `edit: allow` a write completed with no permission.asked at all
+        (live, 1.18.13) — the plugin's output.status="ask" is discarded by
+        opencode — so the ruleset must carry it, or owner AND guest writes run
+        ungated."""
+        perms = json.loads(self.fn({}))["permission"]
+        self.assertEqual(perms["edit"], "ask")
+
+    def test_user_values_for_gated_permissions_are_respected(self):
+        user = json.dumps({"permission": {"edit": "allow", "webfetch": {"*": "deny"}}})
+        perms = json.loads(self.fn({"OPENCODE_CONFIG_CONTENT": user}))["permission"]
+        self.assertEqual(perms["edit"], "allow")
+        self.assertEqual(perms["webfetch"], {"*": "deny"})
+        self.assertEqual(perms["websearch"], "ask")
+        self.assertEqual(perms["bash"], {"*": "ask"})
+
+    def test_user_bash_catchall_stops_bash_injection_only(self):
+        """A user "*" on bash is their decision; edit/webfetch/websearch are
+        still gated, so the result is not None."""
+        user = json.dumps({"permission": {"bash": {"*": "allow"}}})
+        perms = json.loads(self.fn({"OPENCODE_CONFIG_CONTENT": user}))["permission"]
+        self.assertEqual(perms["bash"], {"*": "allow"})
+        self.assertEqual(perms["edit"], "ask")
+
+    def test_user_bash_string_shorthand_is_a_catchall(self):
+        user = json.dumps({"permission": {"bash": "allow"}})
+        perms = json.loads(self.fn({"OPENCODE_CONFIG_CONTENT": user}))["permission"]
+        self.assertEqual(perms["bash"], "allow")
+
+    def test_nothing_to_add_returns_none(self):
+        user = json.dumps({"permission": {
+            "bash": {"*": "ask"}, "edit": "ask", "webfetch": "ask", "websearch": "ask"}})
+        self.assertIsNone(self.fn({"OPENCODE_CONFIG_CONTENT": user}))
 
     def test_empty_string_value_treated_as_no_config(self):
         """OPENCODE_CONFIG_CONTENT='' is equivalent to no config."""
@@ -2992,38 +3024,40 @@ class TestBuildSafeOpencodeConfig(unittest.TestCase):
         self.assertEqual(bash["git log *"], "deny")
         self.assertEqual(bash["*"], "ask")
 
-    def test_default_allow_patterns_added_when_absent(self):
-        """Default allow patterns are added when not present in user config."""
+    def test_no_gateway_allow_patterns(self):
+        """The gateway adds no bash allow patterns of its own — the ruleset is
+        the catch-all plus whatever the user wrote. The old read-only set
+        (`git … *`, `coop send *`) would let a guest run `coop send` on the
+        role-blind sidecar and any git command overwrite a file via
+        `--output=<path>` (#167 review). `coop send` is allowed by the broker's
+        built-in owner rule instead."""
         existing = json.dumps({"permission": {"bash": {"my-custom *": "allow"}}})
-        result = self.fn({"OPENCODE_CONFIG_CONTENT": existing})
-        self.assertIsNotNone(result)
-        config = json.loads(result)
-        bash = config["permission"]["bash"]
-        # All default patterns injected
-        for p in self.default_patterns:
-            self.assertIn(p, bash, f"Expected default pattern '{p}' to be injected")
-        # Custom user pattern preserved
-        self.assertEqual(bash["my-custom *"], "allow")
+        bash = json.loads(self.fn({"OPENCODE_CONFIG_CONTENT": existing}))["permission"]["bash"]
+        self.assertEqual(bash, {"*": "ask", "my-custom *": "allow"})
 
-    # ── user has "*" catch-all — no injection ─────────────────────────────────
+    # ── user has "*" catch-all — no bash injection ────────────────────────────
+    # A user bash "*" is their decision for bash only; edit/webfetch/websearch
+    # are still gated, so the result is not None — the bash ruleset is untouched.
 
     def test_user_catchall_allow_respected(self):
-        """bash['*'] = 'allow' → user's explicit choice, return None."""
+        """bash['*'] = 'allow' → user's explicit choice, bash left alone."""
         existing = json.dumps({"permission": {"bash": {"*": "allow"}}})
-        result = self.fn({"OPENCODE_CONFIG_CONTENT": existing})
-        self.assertIsNone(result)
+        perms = json.loads(self.fn({"OPENCODE_CONFIG_CONTENT": existing}))["permission"]
+        self.assertEqual(perms["bash"], {"*": "allow"})
+        self.assertEqual(perms["edit"], "ask")
 
     def test_user_catchall_ask_respected(self):
-        """bash['*'] = 'ask' already set → already secure, return None."""
+        """bash['*'] = 'ask' already set → bash left alone, patterns and order kept."""
         existing = json.dumps({"permission": {"bash": {"*": "ask", "ls *": "allow"}}})
-        result = self.fn({"OPENCODE_CONFIG_CONTENT": existing})
-        self.assertIsNone(result)
+        perms = json.loads(self.fn({"OPENCODE_CONFIG_CONTENT": existing}))["permission"]
+        self.assertEqual(perms["bash"], {"*": "ask", "ls *": "allow"})
+        self.assertEqual(list(perms["bash"]), ["*", "ls *"])
 
     def test_user_catchall_deny_respected(self):
-        """bash['*'] = 'deny' → user's explicit choice, return None."""
+        """bash['*'] = 'deny' → user's explicit choice, bash left alone."""
         existing = json.dumps({"permission": {"bash": {"*": "deny"}}})
-        result = self.fn({"OPENCODE_CONFIG_CONTENT": existing})
-        self.assertIsNone(result)
+        perms = json.loads(self.fn({"OPENCODE_CONFIG_CONTENT": existing}))["permission"]
+        self.assertEqual(perms["bash"], {"*": "deny"})
 
     # ── user has no bash key but has other permission keys ────────────────────
 
@@ -3063,25 +3097,58 @@ class TestBuildSafeOpencodeConfig(unittest.TestCase):
         msg = str(cm.exception)
         self.assertIn("OPENCODE_CONFIG_CONTENT", msg)
 
+    def test_catchall_comes_first_within_this_value(self):
+        """opencode applies the LAST matching bash rule, so "*" must be the
+        first key or it silences every pattern after it (verified live on
+        1.18.13: {"git status *": "allow", "*": "deny"} denies git status).
+        The guarantee holds only for patterns in this same value: opencode
+        merges opencode.json before the env value, so a file pattern still
+        lands before "*" and is overridden by it."""
+        existing = json.dumps({"permission": {"bash": {"npm test": "allow"}}})
+        keys = list(json.loads(self.fn({"OPENCODE_CONFIG_CONTENT": existing}))["permission"]["bash"])
+        self.assertEqual(keys, ["*", "npm test"], "catch-all first; the user's own pattern last")
+
+    def test_no_deny_mode_and_opencodes_own_ask_rules_are_left_alone(self):
+        """The broker always runs and answers every ask (ADR-0002), so there
+        is no deny mode here and opencode's own ask-by-default rules
+        (external_directory, doom_loop, .env reads) are left to it — they
+        reach the broker as permission names and are decided there. Read-only
+        in-directory permissions (read/glob/grep/list) are not gated."""
+        perms = json.loads(self.fn({}))["permission"]
+        for key in ("external_directory", "doom_loop", "read", "glob", "grep", "list"):
+            self.assertNotIn(key, perms, key)
+        self.assertNotIn("deny", json.dumps(perms))
+
     # ── __init__ integration ──────────────────────────────────────────────────
 
-    def test_init_injects_config_when_no_existing_env(self):
-        """OpenCodeBackend.__init__ injects OPENCODE_CONFIG_CONTENT by default."""
-        b = _make_backend()
-        self.assertIn("OPENCODE_CONFIG_CONTENT", b._sidecar_env)
+    def test_init_injects_bash_ask_defaults_when_a_broker_will_answer(self):
+        """With a broker configured, __init__ injects the bash "ask" defaults."""
+        b = _make_backend(broker_config=GatewayBrokerConfig())
+        config = json.loads(b._sidecar_env["OPENCODE_CONFIG_CONTENT"])
+        self.assertEqual(config["permission"]["bash"]["*"], "ask")
+
+    def test_init_still_injects_bash_ask_for_the_callable_broker_path(self):
+        """AgentSession(permission_handler=...) builds the backend with no
+        broker_config and attaches an OpenCodeCallablePermissionBroker after
+        start(); its handler must still be asked about bash, so the injection
+        must not be gated on broker_config."""
+        b = _make_backend()  # broker_config=None
         config = json.loads(b._sidecar_env["OPENCODE_CONFIG_CONTENT"])
         self.assertEqual(config["permission"]["bash"]["*"], "ask")
 
     def test_init_merges_with_existing_sidecar_env(self):
         """__init__ merges injection with other sidecar_env vars."""
-        b = _make_backend(sidecar_env={"COOP_ROLE": "owner"})
+        b = _make_backend(sidecar_env={"COOP_ROLE": "owner"}, broker_config=GatewayBrokerConfig())
         self.assertEqual(b._sidecar_env["COOP_ROLE"], "owner")
         self.assertIn("OPENCODE_CONFIG_CONTENT", b._sidecar_env)
 
     def test_init_respects_user_catchall_in_sidecar_env(self):
         """__init__ does not overwrite user's explicit '*' catch-all."""
         user_config = json.dumps({"permission": {"bash": {"*": "allow"}}})
-        b = _make_backend(sidecar_env={"OPENCODE_CONFIG_CONTENT": user_config})
+        b = _make_backend(
+            sidecar_env={"OPENCODE_CONFIG_CONTENT": user_config},
+            broker_config=GatewayBrokerConfig(),
+        )
         stored = json.loads(b._sidecar_env["OPENCODE_CONFIG_CONTENT"])
         # Must not have been changed — user chose "allow"
         self.assertEqual(stored["permission"]["bash"]["*"], "allow")
@@ -3151,11 +3218,14 @@ class TestPluginInjection(unittest.TestCase):
         self.assertIn(PLUGIN_SPEC, config["plugin"])
 
     def test_init_injects_even_when_user_set_bash_catchall(self):
-        """_build_safe_opencode_config yields to a user "*" catch-all and returns
-        None; the plugin must not yield with it — it rides the same variable but
-        is not optional."""
+        """_build_safe_opencode_config yields to a user bash "*" catch-all; the
+        plugin must not yield with it — it rides the same variable but is not
+        optional."""
         user_config = json.dumps({"permission": {"bash": {"*": "allow"}}})
-        b = _make_backend(sidecar_env={"OPENCODE_CONFIG_CONTENT": user_config})
+        b = _make_backend(
+            sidecar_env={"OPENCODE_CONFIG_CONTENT": user_config},
+            broker_config=GatewayBrokerConfig(),  # so the safe-config path actually runs
+        )
 
         stored = json.loads(b._sidecar_env["OPENCODE_CONFIG_CONTENT"])
         self.assertEqual(stored["permission"]["bash"]["*"], "allow")  # user's choice kept
@@ -3163,7 +3233,10 @@ class TestPluginInjection(unittest.TestCase):
 
     def test_init_keeps_user_plugins_and_safe_bash_defaults_together(self):
         user_config = json.dumps({"plugin": ["their-plugin"]})
-        b = _make_backend(sidecar_env={"OPENCODE_CONFIG_CONTENT": user_config})
+        b = _make_backend(
+            sidecar_env={"OPENCODE_CONFIG_CONTENT": user_config},
+            broker_config=GatewayBrokerConfig(),
+        )
 
         stored = json.loads(b._sidecar_env["OPENCODE_CONFIG_CONTENT"])
         self.assertEqual(stored["plugin"], ["their-plugin", PLUGIN_SPEC])

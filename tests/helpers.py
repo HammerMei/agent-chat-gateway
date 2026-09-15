@@ -699,3 +699,20 @@ def make_opencode_sidecar_http(plugin_specs=None, config_status=200):
         return resp
 
     return AsyncMock(side_effect=_get)
+
+
+def build_backend_kwargs(agent_cfg, backend_name: str) -> dict:
+    """Run `gateway.service._build_agent_backend(agent_cfg)` with the named
+    backend class (`"ClaudeBackend"` / `"OpenCodeBackend"`) replaced by a
+    capture, and return the keyword arguments it was constructed with."""
+    from gateway.service import _build_agent_backend
+
+    captured: dict = {}
+
+    def _capture(**kwargs):
+        captured.update(kwargs)
+        return MagicMock()
+
+    with patch(f"gateway.service.{backend_name}", side_effect=_capture):
+        _build_agent_backend(agent_cfg)
+    return captured

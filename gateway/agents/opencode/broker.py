@@ -66,6 +66,14 @@ class OpenCodePermissionBroker(PermissionBroker):
     Guest enforcement mirrors ClaudePermissionBroker: tools matching any pattern
     in ``guest_allowed_tools`` are auto-approved; all others are auto-denied without
     posting a 🔐 notification to RC.
+
+    With ``human_approval=False`` (``permissions.enabled: false``) an owner tool
+    outside the allow-list is rejected at once instead of posted to RC. The reply
+    API carries only ``once``/``reject``, so the model sees opencode's own
+    rejection, not a gateway reason (ADR-0002). Everything opencode asks about
+    reaches this broker — bash and write tools via the plugin and injected
+    ruleset, and opencode's own ``external_directory`` / ``doom_loop`` /
+    ``.env`` read rules — so nothing waits on an answer that never comes (#165).
     """
 
     def __init__(
@@ -80,6 +88,7 @@ class OpenCodePermissionBroker(PermissionBroker):
         guest_allowed_tools: "list[ToolRule] | None" = None,
         timeout_seconds: int = 300,
         skip_owner_approval: bool = False,
+        human_approval: bool = True,
     ) -> None:
         super().__init__(registry, notifier, timeout_seconds)
         self._base_url = opencode_base_url.rstrip("/")
@@ -99,6 +108,7 @@ class OpenCodePermissionBroker(PermissionBroker):
             guest_allowed_tools if guest_allowed_tools is not None else []
         )
         self._skip_owner_approval: bool = skip_owner_approval
+        self._human_approval: bool = human_approval
         self._sse_task: asyncio.Task | None = None
         self._pending_tasks: set[asyncio.Task] = set()
         self._pending_request_ids: dict[asyncio.Task, tuple[str, bool]] = {}
@@ -308,6 +318,20 @@ class OpenCodePermissionBroker(PermissionBroker):
                 session_id[:8],
             )
             self._queue_auto_reply(opencode_req_id, approved=True)
+            return
+
+        # Owner + unlisted tool, and nobody is to be asked (permissions.enabled:
+        # false): reject now rather than post a request. Same outcome for an
+        # opencode-internal permission (external_directory, doom_loop, a .env
+        # read) — it arrived here as a tool name and matched no rule.
+        if not self._human_approval:
+            logger.info(
+                "Owner: auto-denying %r for session %s (permissions.enabled: false, "
+                "not in owner_allowed_tools)",
+                tool_name,
+                session_id[:8],
+            )
+            self._queue_auto_reply(opencode_req_id, approved=False)
             return
 
         thread_id = self._session_permission_thread_map.get(session_id)

@@ -19,6 +19,7 @@ def _make_broker(
     owner_allowed_tools: list[str] | None = None,
     guest_allowed_tools: list[str] | None = None,
     skip_owner_approval: bool = False,
+    human_approval: bool = True,
 ) -> OpenCodePermissionBroker:
     from gateway.core.permission import ConnectorPermissionNotifier
 
@@ -37,6 +38,7 @@ def _make_broker(
         owner_allowed_tools=[ToolRule(tool=t) for t in (owner_allowed_tools or [])],
         guest_allowed_tools=[ToolRule(tool=t) for t in (guest_allowed_tools or [])],
         skip_owner_approval=skip_owner_approval,
+        human_approval=human_approval,
     )
 
 
@@ -844,3 +846,84 @@ class TestListenSseReconnect(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestHumanApprovalDisabled(unittest.IsolatedAsyncioTestCase):
+    """permissions.enabled: false → owner asks outside the allow-list are
+    rejected at once through the reply API; nothing is posted to chat. The
+    allow-lists (incl. the built-in owner rules) still approve (ADR-0002, #165)."""
+
+    def _payload(self, req_id: str, permission: str, session: str, patterns: list[str]) -> dict:
+        return {
+            "type": "permission.asked",
+            "properties": {
+                "id": req_id, "permission": permission, "sessionID": session,
+                "patterns": patterns, "metadata": {},
+            },
+        }
+
+    async def _run(self, broker, payload) -> None:
+        broker._reply_to_opencode = AsyncMock()
+        broker._handle_permission_request = AsyncMock()
+        await broker._handle_sse_line(_sse_line(payload))
+        await asyncio.gather(*list(broker._pending_tasks), return_exceptions=True)
+
+    async def test_owner_unlisted_bash_is_rejected_without_asking(self):
+        broker = _make_broker(
+            session_room_map={"ses_o": "room_o"}, session_role_map={"ses_o": "owner"},
+            owner_allowed_tools=[], human_approval=False,
+        )
+        await self._run(broker, self._payload("per_1", "bash", "ses_o", ["rm -rf /"]))
+        broker._reply_to_opencode.assert_called_once_with("per_1", approved=False)
+        broker._handle_permission_request.assert_not_called()
+
+    async def test_opencode_internal_permission_is_rejected_the_same_way(self):
+        """external_directory / doom_loop / a .env read / edit (write, edit,
+        multiedit) / webfetch / websearch arrive as permission names; unlisted,
+        they are rejected — never left waiting (the #165 hang)."""
+        broker = _make_broker(
+            session_room_map={"ses_o": "room_o"}, session_role_map={"ses_o": "owner"},
+            human_approval=False,
+        )
+        for perm in ("external_directory", "doom_loop", "read", "edit", "webfetch", "websearch"):
+            await self._run(broker, self._payload(f"per_{perm}", perm, "ses_o", ["/etc/*"]))
+            broker._reply_to_opencode.assert_called_once_with(f"per_{perm}", approved=False)
+            broker._handle_permission_request.assert_not_called()
+
+    async def test_owner_allow_listed_tool_is_approved(self):
+        broker = _make_broker(
+            session_room_map={"ses_o": "room_o"}, session_role_map={"ses_o": "owner"},
+            owner_allowed_tools=["read"], human_approval=False,
+        )
+        await self._run(broker, self._payload("per_2", "read", "ses_o", ["a.txt"]))
+        broker._reply_to_opencode.assert_called_once_with("per_2", approved=True)
+
+    async def test_builtin_owner_rule_still_approves_coop_send(self):
+        from gateway.core.config import AgentConfig
+
+        broker = _make_broker(
+            session_room_map={"ses_o": "room_o"}, session_role_map={"ses_o": "owner"},
+            human_approval=False,
+        )
+        broker._owner_allowed_tools = AgentConfig().effective_owner_allowed_tools()
+        await self._run(broker, self._payload("per_3", "bash", "ses_o", ["coop send --room r hi"]))
+        broker._reply_to_opencode.assert_called_once_with("per_3", approved=True)
+
+    async def test_guest_policy_unchanged(self):
+        broker = _make_broker(
+            session_room_map={"ses_g": "room_g"}, session_role_map={"ses_g": "guest"},
+            guest_allowed_tools=["read"], human_approval=False,
+        )
+        await self._run(broker, self._payload("per_4", "read", "ses_g", ["a"]))
+        broker._reply_to_opencode.assert_called_once_with("per_4", approved=True)
+        await self._run(broker, self._payload("per_5", "bash", "ses_g", ["ls"]))
+        broker._reply_to_opencode.assert_called_once_with("per_5", approved=False)
+
+    async def test_skip_owner_approval_wins_over_disabled_approval(self):
+        broker = _make_broker(
+            session_room_map={"ses_o": "room_o"}, session_role_map={"ses_o": "owner"},
+            human_approval=False, skip_owner_approval=True,
+        )
+        await self._run(broker, self._payload("per_6", "bash", "ses_o", ["rm -rf /"]))
+        broker._reply_to_opencode.assert_called_once_with("per_6", approved=True)
+

@@ -189,7 +189,7 @@ watcher_rules:
 ```
 
 **Key settings for this use case:**
-- Set `permissions.enabled: true` to keep humans in the loop for sensitive tool calls
+- Set `permissions.enabled: true` to keep humans in the loop for tool calls outside the allow-list
 - Use `context_inject_files` at the watcher level for room-specific personas or knowledge bases
 - Use `guest_allowed_tools` to restrict what non-owners can ask the agent to do
 - Add a room profiles context file so the agent knows who it's talking to — see the
@@ -222,8 +222,19 @@ agents:
     command: claude
     working_directory: ~/my-agent-work
     timeout: 360
+    owner_allowed_tools:
+      - readonly-builtins  # Read/Glob/Grep/WebSearch — see tool_presets below
+      - tool: "Write"
+      - tool: "Edit"
     permissions:
-      enabled: false     # Skip approval prompts for personal use
+      enabled: false     # no human approval — anything not allow-listed is denied
+
+tool_presets:
+  readonly-builtins:
+    - tool: "Read"
+    - tool: "Glob"
+    - tool: "Grep"
+    - tool: "WebSearch"
 
 watcher_rules:
   - name: my-assistant
@@ -237,7 +248,13 @@ watcher_rules:
 - Use `rooms.direct: true` to serve DMs instead of a channel — a DM has no
   room name for a pattern to match, and the connector's `owners` list gates
   who can talk
-- Set `permissions.enabled: false` for personal use where approval friction isn't needed
+- `permissions.enabled: false` turns off human approval, not the permission
+  system: the gateway still applies `owner_allowed_tools`, and anything outside
+  it is denied on the spot (the agent is told why). List the tools you want the
+  agent to have — on Claude that includes `Read`/`Glob`/`Grep`, since every tool
+  goes through the gateway. To let the agent run *everything* without being
+  asked, use `enabled: true` with `skip_owner_approval: true` instead; the two
+  settings cannot be combined with `enabled: false`
 - Set yourself as the sole owner; omit `guests` entirely
 
 > **Similar to Claude Code Channels:** Claude Code's [Channels](https://code.claude.com/docs/en/channels) feature (v2.1.80+) also connects external platforms (Telegram, Discord, iMessage) to a local Claude Code session via `claude --channels`. The key differences: Channels is Claude Code-specific and single-user focused, while `coop` supports any agent backend (Claude CLI, OpenCode, custom), multi-user RBAC, and is designed for team-shared chat workspaces (Rocket.Chat or Mattermost). If you only use Claude Code and only need personal access, Channels may be simpler to set up; if you need team access or a different agent backend, `coop` is the better fit.
@@ -480,9 +497,9 @@ agents:
 | `owner_allowed_tools` | list | No | Auto-approved tools for owners (see Tool Allow-Lists below) |
 | `guest_allowed_tools` | list | No | Auto-approved tools for guests (see Tool Allow-Lists below) |
 | `timeout` | integer | Yes | Seconds to wait for agent response (must be > `permissions.timeout`) |
-| `permissions.enabled` | boolean | No | Enable human-in-the-loop tool approval |
+| `permissions.enabled` | boolean | No | Ask a human in chat for owner tools outside the allow-list. `false` denies them instead — the allow-lists still apply either way |
 | `permissions.timeout` | integer | No | Seconds before auto-denying unanswered requests (must be < agent `timeout`) |
-| `permissions.skip_owner_approval` | boolean | No | If `true`, owners bypass approval prompts (guests still enforced); only use in trusted sandbox environments |
+| `permissions.skip_owner_approval` | boolean | No | If `true`, owners bypass approval prompts (guests still enforced); only use in trusted sandbox environments. Requires `enabled: true` |
 
 ### Watchers
 
@@ -1100,7 +1117,7 @@ coop reset rc-main:general
 
 ## Permission Approval System
 
-When `permissions.enabled: true` and a user attempts a tool call not in their allow-list, the gateway intercepts it and requires explicit approval from an owner.
+The gateway intercepts every tool call that is not in the caller's allow-list. With `permissions.enabled: true` an owner's call is put to a human for explicit approval; with `enabled: false` it is denied on the spot. Guests are denied either way. The allow-lists — and the gateway's built-in rules for its own `coop …` commands — apply in both modes; `permissions.enabled` only decides what happens to the remainder.
 
 ### How It Works
 
@@ -1164,6 +1181,41 @@ With `skip_owner_approval: true`:
 - **Guests:** Still subject to `guest_allowed_tools` enforcement
 
 Only use this in trusted, sandboxed environments where interactive approval is not feasible.
+`skip_owner_approval` requires `enabled: true`; combining it with `enabled: false` is a
+config error, because with nobody asked there is no approval to skip.
+
+### Turning Approval Off (`enabled: false`)
+
+`permissions.enabled: false` is not "no permissions". The gateway still runs its
+permission broker for the agent and still applies the allow-lists; the one change is
+that an owner's tool call outside `owner_allowed_tools` is **denied immediately**
+instead of posted to chat. Use it when nobody will be watching the room to approve,
+and list the tools the agent needs:
+
+```yaml
+owner_allowed_tools:
+  - readonly-builtins   # a tool_presets entry: Read / Glob / Grep / WebSearch
+  - tool: "Bash"
+    params: "git (status|log|diff).*"
+permissions:
+  enabled: false
+```
+
+Two things to know:
+
+- **On Claude every tool passes through the gateway**, read-only ones included, so an
+  agent with no `owner_allowed_tools` can only run the gateway's built-in `coop …`
+  commands. Claude's own `settings.json` permission rules do not apply under the gateway.
+- **On OpenCode** bash, file edits (`write`/`edit`/`multiedit`), `webfetch`, `websearch`
+  and opencode's own `external_directory` / `doom_loop` / `.env`-read checks reach the
+  gateway; in-directory `read`/`glob`/`grep`/`list` do not. Allow-list rules for an
+  OpenCode agent use opencode's *permission* names: `tool: edit` covers write, edit and
+  multiedit (a Claude-style `tool: Write` never matches), plus `bash`, `webfetch`,
+  `websearch`. A denial on OpenCode ends the agent's turn with no reply — you will see an
+  empty answer in chat, not a reason.
+
+The reasoning behind this design is recorded in
+`docs/adr/0002-the-gateway-is-the-only-permission-gate.md`.
 
 ---
 

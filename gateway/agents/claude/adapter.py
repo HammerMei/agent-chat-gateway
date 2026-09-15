@@ -394,6 +394,7 @@ class ClaudeBackend(AgentBackend):
             timeout_seconds=self._broker_config.timeout,
             skip_owner_approval=self._broker_config.skip_owner_approval,
             backend=self,
+            human_approval=self._broker_config.human_approval,
         )
 
     def create_callable_broker(self, handler, timeout_seconds: int):

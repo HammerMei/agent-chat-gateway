@@ -31,14 +31,23 @@ class GatewayBrokerConfig:
 
     ``owner_allowed_tools`` / ``guest_allowed_tools`` are lists of
     :class:`~gateway.config.ToolRule` parsed from config.  Pass ``None`` to
-    use an empty list (all unmatched owner calls require RC approval; guests
-    are fully blocked).
+    use an empty list (all unmatched owner calls need a human, or are denied;
+    guests are fully blocked).
+
+    ``human_approval`` is ``permissions.enabled`` from config: what an owner's
+    tool call gets when no allow-list matches it. ``True`` asks a human in chat;
+    ``False`` denies it at once (ADR-0002). The broker always runs — this flag
+    never removes it. ``skip_owner_approval`` is checked before ``human_approval``
+    in both brokers, so a config that sets both ``skip_owner_approval=True`` and
+    ``human_approval=False`` auto-approves; config loading rejects that pair,
+    this dataclass does not.
     """
 
     owner_allowed_tools: list = field(default_factory=list)  # list[ToolRule]
     guest_allowed_tools: list = field(default_factory=list)  # list[ToolRule]
     timeout: int = 300
     skip_owner_approval: bool = False  # when True, bypass owner approval for all tool calls
+    human_approval: bool = True  # False: deny what would have asked a human (permissions.enabled: false)
 
 
 def check_backend_signatures(backends) -> None:
@@ -321,7 +330,10 @@ class AgentBackend(ABC):
 
         Called by :class:`~gateway.service.GatewayService` during startup.
         Returns ``None`` if the backend was constructed without a
-        :class:`GatewayBrokerConfig` (i.e. permissions are disabled for this agent).
+        :class:`GatewayBrokerConfig` — the AgentSession/TUI path, which attaches
+        a callable broker after ``start()`` instead. The service always passes a
+        config: ``permissions.enabled: false`` is a broker that denies, not a
+        missing broker (ADR-0002).
 
         The default implementation returns ``None``.  Subclasses override this
         to return the appropriate broker for their permission mechanism:

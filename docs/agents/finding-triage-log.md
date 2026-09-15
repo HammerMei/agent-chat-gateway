@@ -56,3 +56,84 @@ Notes:
 
 **Status: open.** Becomes settled when a queued recovery wait is observed in the field,
 or after a year without one (which would confirm the rate's upper bound was generous).
+
+---
+
+## 2026-09-14 — PR #167 round 1
+
+**Chain detector:** 3 findings over 1 round, no chain.
+**Control finding:** none — PR #166's only entry is still open. Agreement in this
+round is *not* evidence of independence; recorded as **uncorroborated**.
+**Rater independence caveat:** rater 2 was given the reviewed commit to score against
+but read the working tree, where the deletion fix was already sitting uncommitted. It
+did not see rater 1's verdicts or quantities, but it saw the fix, and a fix implies a
+verdict. Weaker than the #166 round on that axis.
+
+All three findings were decided at Step 1; no scoring arithmetic was needed. Codex
+labelled all three P1; re-ranked by consequence below.
+
+### F1 — Deny-mode `coop send *` allow is reachable by guests
+
+Codex P1, `adapter.py` `_build_safe_opencode_config`. Moving the `"*"` catch-all first
+made `_DEFAULT_BASH_ALLOW_PATTERNS` effective for the first time; the sidecar runs as
+`COOP_ROLE=owner` for every chatter, roles come from the connector's `owners`/`guests`
+lists regardless of `permissions.enabled`, and an opencode-level allow never reaches
+the broker — so a guest could run `coop send`.
+
+| | rater 1 (author) | rater 2 (blind) |
+|---|---|---|
+| true? | yes — verified the old order silenced the patterns (1.18.13), so this PR is what would make it live | yes |
+| this change's job? | yes — introduced by this diff | yes, in scope |
+| `cheap` | **yes** — cheapest correct fix is deleting the pattern set (one constant, one merge line), not role-gating it | **yes** — same deletion, ~11 lines, no new concept |
+| verdict | **FIX** (deletion) | **FIX** (deletion) |
+
+### F2 — "Read-only" git allow patterns are write-capable via `--output=<path>`
+
+Codex P1, same site. Confirmed locally: `git diff --output=victim.txt` truncated the
+file; `git log`/`git show` take the same diff options. The broker's builtin owner rules
+carry no git patterns, so the adapter's set was the only place this existed.
+
+| | rater 1 (author) | rater 2 (blind) |
+|---|---|---|
+| true? | yes — reproduced | yes — reproduced |
+| this change's job? | yes — same lineage as F1 | yes |
+| `cheap` | **yes** — same deletion | **yes** — same deletion; Codex's option-filtering fix is the expensive one |
+| `silent` | yes — looks like a safe read-only op; fixed, so not priced | yes |
+| verdict | **FIX** (deletion) | **FIX** (deletion) |
+
+Both raters rank F2 above F1 on consequence: arbitrary file truncation, reachable by a
+legitimate owner, under a mode whose purpose is denying unapproved writes — versus a
+guest-only unauthorized send.
+
+### F3 — Legacy v1.0.0 plugin copy re-introduces `ask` on bash in deny mode
+
+Codex P1, `role-enforcement.ts` bash early-return. Claim: with the wizard-installed
+`~/.opencode/plugins/role-enforcement.ts` still present, both hooks run, the legacy one
+sets `output.status = "ask"` for bash, and the call waits on a broker that does not
+exist.
+
+| | rater 1 (author) | rater 2 (blind) |
+|---|---|---|
+| true? | **no** — ran both plugins together (legacy as a second `file://` entry) in deny mode: an allowed bash pattern completed in 18 s, `write` refused by the current plugin's throw. Outcome proven; that the legacy hook executed is not | **no** — same experiment read as the exact adversarial case; inconsistent with the claimed mechanism |
+| gate | refuted on evidence → **DROP**; also moot after F1/F2: a pure `{"*": "deny"}` offers no bash tool, so no hook sees a bash call | `cannot-occur` (refuted by trace) → **DROP** |
+| residual | `_verify_plugin_accepted` already logs a warning naming the stale file and `docs/migration-v1.md` | same; "duplicate hook, redundant but inert" adequately covered |
+
+Verdicts agree on all three → settled per the Step 4 table, **uncorroborated** (no
+control; rater 2 saw the fix).
+
+Notes:
+- Both `FIX` verdicts resolve to one deletion. What was lost is measured against
+  `main`, where bash hung entirely with permissions disabled: nothing. Against the
+  Claude backend the OpenCode deny mode is now one notch stricter (Claude's built-in
+  read-only classifier still runs `git status`); stated in the PR and CHANGELOG rather
+  than replicated.
+- Layer (F1/F2): the concern is per-message authorization, which the role-blind sidecar
+  cannot do at the opencode ruleset layer; the correct move at that layer is to assert
+  nothing, which is what deletion does.
+- Threads: replied with the reason; resolved by id. F3 is a conscious decline.
+- Adoption this round: 2 of 3 acted on (one fix).
+
+**Status: open.** F1/F2 settle if a guest send or a `--output` truncation is ever
+observed on a release that still carried the patterns (none should — they were dead
+there). F3 settles if a deny-mode bash hang with the legacy copy present is ever
+reported, which would show the experiment missed a plugin-order dependency.

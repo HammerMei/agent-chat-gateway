@@ -130,7 +130,7 @@ watcher_rules:
 
 #### Configuration notes
 
-- ⚠️ **Requires `skip_owner_approval: true`** (or `permissions.enabled: false`) — there is no human in the loop to approve tool requests over a voice channel. Document this in your config; the gateway logs a warning if a permission notification is received on a voice room.
+- ⚠️ **Requires `permissions.enabled: true` with `skip_owner_approval: true`** if the agent is to use tools beyond its `owner_allowed_tools` — there is no human in the loop to approve tool requests over a voice channel, and `permissions.enabled: false` denies such tools rather than approving them (the allow-list still works in either mode). Document this in your config; the gateway logs a warning if a permission notification is received on a voice room.
 - ⚠️ **Network security** — binds to `0.0.0.0` by default; gate at the network level (VPN / firewall) in addition to the bearer token.
 
 #### Known limitations

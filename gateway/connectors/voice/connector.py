@@ -204,9 +204,9 @@ class VoiceConnector(Connector):
             # so the operator can fix the config.
             logger.warning(
                 "VoiceConnector [%s]: send_text received outside active dispatch "
-                "— dropped (%d chars). If this recurs, check that "
-                "skip_owner_approval=true (or permissions.enabled=false) is set "
-                "for the voice agent.",
+                "— dropped (%d chars). If this recurs, check that the voice agent "
+                "has permissions.enabled=true with skip_owner_approval=true — "
+                "there is no human on a voice call to approve a tool.",
                 room_id,
                 len(response.text),
             )

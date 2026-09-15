@@ -23,11 +23,13 @@ sessions are untouched. Verified against opencode 1.18.13 (#157):
   spec pointing at a missing file is listed just the same. The adapter checks
   :data:`PLUGIN_SOURCE` exists separately, before spawning.
 
-The entry is injected unconditionally. That is not gated on the permission
-broker: with ``permissions.enabled: false`` (the default) the sidecar still runs
-as ``COOP_ROLE=owner`` and the plugin marks owner write tools ``ask`` with no
-broker to answer — pre-existing behaviour shared with the bash ``"*": "ask"``
-defaults, tracked as #165.
+The entry is injected unconditionally. What it enforces on 1.18.13 is the
+guest allow-list (it throws for a ``COOP_ROLE=guest`` process — not the
+sidecar, which is always owner). Its owner path sets ``output.status = "ask"``,
+and opencode's ``tool.execute.before`` trigger discards the hook's output, so
+that path gates nothing; the adapter's injected permission ruleset (``bash``,
+``edit``, ``webfetch``, ``websearch`` → ``ask``) is what routes owner tools to
+the gateway's broker, which always answers (ADR-0002, #165).
 """
 
 from __future__ import annotations

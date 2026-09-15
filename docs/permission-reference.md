@@ -15,6 +15,10 @@ The gateway implements a **two-part permission model**:
    - Owner receives 🔐 notification in Rocket.Chat
    - Owner replies `approve <id>` or `deny <id>` to decide
    - Tool execution blocked until owner responds or timeout occurs
+   - Switched per agent with `permissions.enabled`. **The permission broker
+     runs either way**; with approval off, a tool that would have been put to
+     a human is denied at once instead (see *Approval disabled* below and
+     `docs/adr/0002-the-gateway-is-the-only-permission-gate.md`)
 
 ---
 
@@ -112,7 +116,7 @@ Each rule is an object with two regex fields:
 
 | Field | Required | Type | Behavior |
 |-------|----------|------|----------|
-| `tool` | Yes | Regex string | Case-insensitive fullmatch against tool name |
+| `tool` | Yes | Regex string | Case-insensitive fullmatch against tool name. On Claude that is the tool as Claude names it (`Read`, `Write`, `Bash`, …). On OpenCode it is the **permission name** the sidecar asks under — `bash`, `edit` (covers the write, edit and multiedit tools), `webfetch`, `websearch`, `external_directory`, … — so `tool: Write` never matches an OpenCode agent; use `tool: edit` |
 | `params` | No | Regex string | Case-insensitive fullmatch against primary parameter |
 
 **Case Sensitivity:**
@@ -240,10 +244,49 @@ Tool call arrives
   │       ├─ Check owner_allowed_tools
   │       │   └─ matches → ALLOW (auto-approve, no RC notification)
   │       │
+  │       ├─ permissions.enabled == false?
+  │       │   └─ YES → DENY (approval is off; the agent is told why on Claude)
+  │       │
   │       ├─ room_id available?
   │       │   ├─ YES → ASK (post 🔐 notification, await owner decision)
   │       │   └─ NO → DENY (cannot route, block as safe default)
 ```
+
+### Approval disabled (`permissions.enabled: false`)
+
+`permissions.enabled` does not switch the permission system off. It decides one
+thing: what an owner's tool call gets when no allow-list matches it.
+
+| `enabled` | `skip_owner_approval` | Owner tool not in allow-list | Guest tool not in allow-list |
+|---|---|---|---|
+| `true` | `false` | ask a human in chat | deny |
+| `true` | `true` | auto-approve | deny |
+| `false` | `false` | **deny at once** | deny |
+| `false` | `true` | **rejected at config load** | — |
+
+Allow-listed tools run in every row, including the built-in owner rules
+(`coop send`, `coop schedule`, `coop fetch-history`, `coop instructions`,
+`date`), so the gateway's own commands keep working with approval off.
+
+Two backend differences to know about:
+
+- **Claude sends every tool through the hook** (the matcher is `.*`). With
+  approval off, `Read`, `Glob`, `Grep`, `WebFetch` and every other tool are
+  denied unless listed in `owner_allowed_tools` — give such an agent a preset
+  (e.g. `readonly-builtins` from `config.example.yaml`). Claude's own
+  `settings.json` permission rules and its read-only command classifier do not
+  apply under the gateway; the gateway is the only gate.
+- **OpenCode asks only for what is gated**: the adapter injects `"ask"` into
+  opencode's permission ruleset for `bash` (as a `"*"` catch-all), `edit`
+  (which `write`, `edit` and `multiedit` all ask under), `webfetch` and
+  `websearch`; opencode's own `external_directory`, `doom_loop` and
+  `.env`-read rules ask by default. Its `read`, `glob`, `grep` and `list`
+  inside the working directory never reach the broker. A denial on OpenCode
+  ends the turn with **no reply text** — the reply API is `once`/`reject`
+  with no reason field, and after a reject the model says nothing — so the
+  chat sees an empty answer. (The role-enforcement plugin's owner path, which
+  sets `output.status = "ask"`, is inert on opencode 1.18.13; the ruleset is
+  the gate.)
 
 ### Decision Outcomes
 
@@ -415,16 +458,21 @@ _handle_hook(raw_body):
 {
   "hooks": {
     "PreToolUse": [{
-      "matcher": "Bash|Write|Edit|MultiEdit|NotebookEdit",
-      "type": "http",
-      "url": "http://127.0.0.1:<port>/hook",
-      "timeout": 310
+      "matcher": ".*",
+      "hooks": [{
+        "type": "http",
+        "url": "http://127.0.0.1:<port>/hook",
+        "timeout": 310
+      }]
     }]
   }
 }
 ```
 
-The `matcher` field ensures read-only tools (Read, Grep, Glob, WebFetch) never trigger the HTTP hook — guest sessions using whitelisted read-only tools never reach the approval flow.
+The matcher is `.*`: **every** tool call, read-only ones included, reaches the
+broker, and the allow-lists decide. Together with `--dangerously-skip-permissions`
+(always passed alongside `--settings`) this makes the gateway the only
+permission gate on Claude — Claude's own permission rules do not run.
 
 **Fail-Closed Behaviors:**
 - Unknown session → defaults to role="guest"
@@ -540,9 +588,9 @@ agents:
 | `agents[*].guest_allowed_tools` | list[ToolRule \| preset name] | `[]` | Tools guest can execute (auto-approved) |
 | `agents[*].guest_allowed_tools[*].tool` | regex string | (required) | Case-insensitive regex on tool name |
 | `agents[*].guest_allowed_tools[*].params` | regex string | (optional) | Case-insensitive regex on primary parameter |
-| `agents[*].permissions.enabled` | bool | `false` | Enable approval workflow for this agent |
-| `agents[*].permissions.timeout` | int | 300 | Seconds before auto-deny |
-| `agents[*].permissions.skip_owner_approval` | bool | `false` | Auto-approve all owner tool calls (sandbox/dev only) |
+| `agents[*].permissions.enabled` | bool | `false` | Ask a human in chat for owner tools outside the allow-list. When `false`, the broker still runs and applies the allow-lists; such a tool is denied at once instead of asked — it is not auto-approved |
+| `agents[*].permissions.timeout` | int | 300 | Seconds before an unanswered approval request is auto-denied |
+| `agents[*].permissions.skip_owner_approval` | bool | `false` | Auto-approve all owner tool calls (sandbox/dev only). Requires `enabled: true`; the pair with `enabled: false` is rejected at load |
 
 ### Example: Multi-Backend Config
 

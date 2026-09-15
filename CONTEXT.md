@@ -21,3 +21,17 @@ _Avoid_: the server, the service (in prose), "the coop" (for the process)
 **Coop Session Identity**:
 The header block injected at the top of every agent session that tells the agent it is running under Coop and names its watcher and room. The name is deliberate: it lets an agent tell this environment apart from any other session or context it may hold.
 _Avoid_: ACG Session Identity, Session Identity
+
+### Permissions
+
+**permission broker**:
+The gateway component that decides every tool call an agent makes — allow, deny, or ask a human. One per agent, always running; the backend's own permission engine is bypassed so the broker is the only gate (ADR-0002).
+_Avoid_: the hook, the plugin (those are its transports), "permissions" as a synonym for the broker
+
+**allow-list**:
+`owner_allowed_tools` / `guest_allowed_tools`: the tool rules a role may run without being asked. The gateway's built-in rules for its own `coop …` commands are part of the owner allow-list. This is the whole policy; everything else is the remainder.
+_Avoid_: whitelist, auto-approve list
+
+**human approval**:
+What `permissions.enabled` switches: whether an owner's tool call outside the allow-list is put to a person in chat (`true`) or denied at once (`false`). Not a switch for the permission broker or the allow-lists.
+_Avoid_: "permissions on/off", "permission system disabled"

@@ -56,7 +56,7 @@ agents:
     - tool: read
     - tool: glob
     - tool: grep
-    - tool: write
+    - tool: edit             # opencode's permission name — covers write, edit and multiedit
     - tool: external_directory
     - tool: bash
   e2e-claude:

@@ -45,6 +45,84 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   than tearing the sidecar down around it; `resume` now gets the same
   five-minute client wait `reset` already had.
 
+### Changed
+- **The permission broker now runs for every agent; `permissions.enabled: false`
+  means "deny what would have asked a human", not "no permission system"**
+  (#165, ADR-0002). Before, `enabled: false` built no broker at all, and what
+  followed depended on the backend: OpenCode still raised asks that nobody
+  answered, so `write`/`edit`/`multiedit`/`bash` hung until the agent timeout;
+  Claude fell back to Claude Code's own headless permission engine, which
+  ignored `owner_allowed_tools`, `guest_allowed_tools` and the gateway's
+  built-in `coop …` rules alike. Now `permissions.enabled` decides only what an
+  owner's tool call gets when no allow-list matches it — a human in chat
+  (`true`) or an immediate denial (`false`) — and the allow-lists apply in both
+  modes, so `coop send` and the other built-in owner commands keep working with
+  approval off. Consequences worth reading before upgrading:
+  - **Claude with `enabled: false` is stricter.** Every `claude -p` now runs
+    with `--dangerously-skip-permissions` and the gateway's PreToolUse hook
+    (matcher `.*`), exactly as it already did with approval on. The operator's
+    own Claude `settings.json` permission rules and Claude's read-only command
+    classifier no longer apply under the gateway; `Read`, `Glob`, `Grep`,
+    `WebFetch` are denied unless allow-listed. Give such an agent an
+    `owner_allowed_tools` preset (the docs examples now do).
+  - **The two backends are not symmetric.** OpenCode raises an ask only for
+    bash, `edit` (write/edit/multiedit), `webfetch`, `websearch`, and its own
+    `external_directory` / `doom_loop` / `.env`-read rules; its in-directory
+    `read`/`glob`/`grep`/`list` never reach the broker. Claude sends every
+    tool. The same `enabled: false` config leaves an OpenCode agent its read
+    tools and a Claude agent only the allow-list.
+  - **A denial on OpenCode ends the turn with no reply.** The reply API is
+    `once`/`reject` with no reason field, and after a reject the model says
+    nothing, so the chat sees an empty answer; on Claude the model sees why and
+    what the operator can change.
+  - **`enabled: false` together with `skip_owner_approval: true` is now a
+    config load error** — with nobody asked, there is no approval to skip.
+    Previously a warning.
+  - The interim sidecar-side deny mode this release briefly carried
+    (`COOP_APPROVAL_MODE`, a `"*": "deny"` bash catch-all, plugin throws,
+    forced `deny` on `external_directory`/`doom_loop`) is gone; it was one
+    missed opencode ask-by-default rule away from the original hang (`.env`
+    reads), and a broker that always answers does not need the list.
+  `docs/requirements.md` §6.2 said disabled permissions meant "auto-approved
+  for owners"; neither backend ever did that, and it now says "denied".
+  The voice agent guidance that offered `enabled: false` as an alternative to
+  `skip_owner_approval: true` is corrected — it never was one.
+
+### Fixed
+- **OpenCode file edits and web access now go through the permission broker;
+  they never did** (found while verifying #165 live on 1.18.13). The
+  role-enforcement plugin was believed to gate owner `write`/`edit`/`multiedit`
+  by setting `output.status = "ask"`; opencode discards that hook output and
+  runs the tool, so a write completed with no `permission.asked` at all — for
+  an owner or, since the sidecar is owner for every chatter, a guest, with
+  `permissions.enabled` in either state. Only bash was gated, through the
+  injected ruleset. The adapter now injects `"ask"` for `edit` (the key
+  `write`, `edit` and `multiedit` ask under), `webfetch` and `websearch` the
+  same way it does for `bash["*"]`, wherever the user set no value; the broker
+  then applies the allow-lists as for any other tool. **If you run an OpenCode
+  agent with `permissions.enabled: true`, expect 🔐 prompts you did not get
+  before** — for every file edit, `webfetch` and `websearch` outside the
+  allow-list. To keep those unprompted, add rules to `owner_allowed_tools`
+  using opencode's permission names (`tool: edit` covers write, edit and
+  multiedit; `tool: webfetch`; `tool: websearch` — a Claude-style `tool:
+  Write` does not match on OpenCode), or set `skip_owner_approval: true`.
+  In-directory `read`/`glob`/`grep`/`list` remain at opencode's defaults
+  (ADR-0002 records the asymmetry with Claude). The plugin's owner path is
+  left in place and documented as inert.
+- **The injected bash catch-all now comes first, and the gateway's own
+  "read-only" allow patterns are gone** (#165). opencode applies the *last*
+  matching bash rule (verified on 1.18.13: `{"git status *": "allow", "*":
+  "deny"}` denies `git status`), and the `"*"` catch-all was appended last, so
+  it silently overrode every pattern before it — the user's own included. The
+  gateway's pre-approved set (`git log/diff/status/show *`, `coop send *`) was
+  therefore dead on every release, and making it live would have opened two
+  holes: the sidecar runs as owner for every chatter and an allow opencode
+  applies itself never reaches the broker, so a guest could run `coop send`;
+  and each of those git commands takes `--output=<path>`, which truncates any
+  writable file. The set is removed rather than fixed; `coop send` is allowed
+  by the broker's built-in owner rule instead. Every bash call still asks the
+  broker, in both approval modes.
+
 ## [1.0.0] - 2026-09-10
 
 The first release under the new name. Everything below the *Renamed* section

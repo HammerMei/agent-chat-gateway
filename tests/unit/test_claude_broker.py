@@ -49,6 +49,7 @@ def _make_broker(
     guest_allowed_tools: list[str] | None = None,
     timeout_seconds: int = 300,
     skip_owner_approval: bool = False,
+    human_approval: bool = True,
 ) -> ClaudePermissionBroker:
     """Create a broker with mock notifier for testing."""
     registry = PermissionRegistry()
@@ -68,6 +69,7 @@ def _make_broker(
         guest_allowed_tools=[ToolRule(tool=t) for t in (guest_allowed_tools or [])],
         timeout_seconds=timeout_seconds,
         skip_owner_approval=skip_owner_approval,
+        human_approval=human_approval,
     )
 
 
@@ -978,4 +980,82 @@ class TestDecideParamMatching(unittest.TestCase):
         # Two param strings: first matches, second doesn't
         action, _ = broker._decide("Bash", ["git status", "rm -rf /"], "owner", "room_1")
         self.assertEqual(action, "ask")  # not auto-allowed → escalates
+
+
+class TestHumanApprovalDisabled(unittest.IsolatedAsyncioTestCase):
+    """permissions.enabled: false → the broker still runs and still applies the
+    allow-lists; what would have gone to a human is blocked with a reason the
+    model reads. Nothing is ever posted to chat (ADR-0002, #165)."""
+
+    def _broker(self, **kw) -> ClaudePermissionBroker:
+        return _make_broker(
+            session_room_map={"ses_o": "room_o", "ses_g": "room_g"},
+            session_role_map={"ses_o": "owner", "ses_g": "guest"},
+            human_approval=False,
+            **kw,
+        )
+
+    async def test_owner_unlisted_tool_is_blocked_with_reason(self):
+        broker = self._broker(owner_allowed_tools=["Read"])
+        broker.request_permission = AsyncMock()
+        result = json.loads(await broker._handle_hook(_hook_body("Write", session_id="ses_o")))
+        self.assertEqual(result["decision"], "block")
+        self.assertIn("permissions.enabled: false", result["reason"])
+        self.assertIn("Write", result["reason"])
+        broker.request_permission.assert_not_called()
+
+    async def test_owner_allow_listed_tool_runs(self):
+        broker = self._broker(owner_allowed_tools=["Read"])
+        result = json.loads(await broker._handle_hook(_hook_body("Read", session_id="ses_o")))
+        self.assertEqual(result["decision"], "allow")
+
+    async def test_builtin_owner_rule_still_allows_coop_send(self):
+        """The gateway's own commands must not be denied when approval is off —
+        that is why the broker stays and the ruleset is not removed."""
+        from gateway.core.config import AgentConfig
+
+        broker = _make_broker(
+            session_room_map={"ses_o": "room_o"},
+            session_role_map={"ses_o": "owner"},
+            human_approval=False,
+        )
+        broker._owner_allowed_tools = AgentConfig().effective_owner_allowed_tools()
+        body = _hook_body("Bash", tool_input={"command": "coop send --room r hello"}, session_id="ses_o")
+        result = json.loads(await broker._handle_hook(body))
+        self.assertEqual(result["decision"], "allow")
+        body = _hook_body("Bash", tool_input={"command": "rm -rf /"}, session_id="ses_o")
+        result = json.loads(await broker._handle_hook(body))
+        self.assertEqual(result["decision"], "block")
+        self.assertIn("permissions.enabled: false", result["reason"])
+
+    async def test_meta_tool_still_allowed(self):
+        broker = self._broker()
+        result = json.loads(await broker._handle_hook(_hook_body("ToolSearch", session_id="ses_o")))
+        self.assertEqual(result["decision"], "allow")
+
+    async def test_guest_policy_unchanged(self):
+        broker = self._broker(guest_allowed_tools=["Read"])
+        allowed = json.loads(await broker._handle_hook(_hook_body("Read", session_id="ses_g")))
+        self.assertEqual(allowed["decision"], "allow")
+        blocked = json.loads(await broker._handle_hook(_hook_body("Write", session_id="ses_g")))
+        self.assertEqual(blocked["decision"], "block")
+        self.assertIn("Guest", blocked["reason"])
+        self.assertNotIn("permissions.enabled", blocked["reason"])
+
+    def test_deny_precedes_the_room_check(self):
+        """No room mapping + approval off → the approval-off reason, not the
+        room one: the answer does not depend on where a request could be posted."""
+        broker = _make_broker(session_role_map={"ses_o": "owner"}, human_approval=False)
+        action, reason = broker._decide("Write", [""], "owner", "")
+        self.assertEqual(action, "block")
+        self.assertIn("permissions.enabled: false", reason)
+
+    def test_skip_owner_approval_wins_over_disabled_approval(self):
+        """Config rejects this pair; the dataclass does not. If it is built
+        anyway, skip is checked first and approves — pinned so nobody expects
+        the deny to override it."""
+        broker = _make_broker(
+            session_role_map={"ses_o": "owner"}, human_approval=False, skip_owner_approval=True,
+        )
+        self.assertEqual(broker._decide("Write", [""], "owner", "room_o"), ("allow", ""))
 
