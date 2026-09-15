@@ -94,9 +94,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   matched the built-in guest rule and truncated the file under the gateway
   account — any allow rule silently granted "write this command's output to
   any path". Each file redirect is now a parameter string of its own, operator
-  included (`"> /tmp/x"`, `"2> err.log"`, `"< /etc/passwd"`), absolute targets
-  normalized, so it has to match a rule and a rule that allows the redirect
-  cannot allow running the same path. Descriptor duplications (`2>&1`, `>&2`,
+  included (`"> /tmp/x"`, `"2> err.log"`, `"< /etc/passwd"`), so it has to
+  match a rule and a rule that allows the redirect cannot allow running the
+  same path. A literal target is shell-unquoted and normalized so `..` cannot
+  hide behind quotes or a prefix; a target with an expansion in it is matched
+  from the expansion onward, so no path rule can approve a value bash has not
+  computed yet. Descriptor duplications (`2>&1`, `>&2`,
   `3>&-`) and sinks (`/dev/null`, `/dev/stdout`, `/dev/stderr`, `/dev/fd/N`)
   write nothing and are not matched. Guests get no write anywhere by default;
   owners who want scratch files reference the new `scratch-dir` preset

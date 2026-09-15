@@ -33,6 +33,7 @@ import json
 import logging
 import os
 import re
+import shlex
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -130,9 +131,11 @@ _NEVER_EXPANDED_LEAVES: frozenset[str] = frozenset({
 })
 
 
-# Redirect operators that duplicate or close a descriptor rather than open a
-# file: ``2>&1``, ``>&2``, ``3>&-``, ``<&0``.  Nothing is written anywhere.
+# Redirect operators that duplicate, move or close a descriptor rather than
+# open a file: ``2>&1``, ``>&2``, ``3>&1-``, ``3>&-``, ``<&0``.  Nothing is
+# written anywhere.
 _FD_ONLY_REDIRECT_OPERATORS: frozenset[str] = frozenset({">&", "<&", ">&-", "<&-"})
+_FD_OPERAND = re.compile(r"\d*-?")  # "1", "1-" (move), "-" (close), "" (with >&-)
 
 # Destinations that are sinks, not files: writing to them has no persistent
 # effect, so a redirect to one is not a parameter to match.
@@ -140,21 +143,48 @@ _SINK_DESTINATIONS: frozenset[str] = frozenset({"/dev/null", "/dev/stdout", "/de
 _DEV_FD = re.compile(r"/dev/fd/\d+")
 
 
+def _first_expansion(text: str) -> int:
+    """Index of the first unescaped ``$`` or backtick in ``text``, or -1."""
+    i = 0
+    while i < len(text):
+        if text[i] == "\\":
+            i += 2
+            continue
+        if text[i] in "$`":
+            return i
+        i += 1
+    return -1
+
+
 def _redirect_param(file_redirect, src: bytes) -> str | None:
     """Return the parameter string for a ``file_redirect`` node, or None.
 
-    ``cmd > /tmp/x`` yields ``"> /tmp/x"``: the operator is kept so a rule
-    that allows a redirect (``>>?\\s*/tmp/.*``) cannot also allow *running*
-    ``/tmp/x``, and an absolute destination is ``normpath``-ed so
-    ``> /tmp/../etc/passwd`` is matched as ``> /etc/passwd``.  A descriptor
-    duplication (``2>&1``), a descriptor close (``3>&-``) and a redirect to
-    ``/dev/null`` / ``/dev/stdout`` / ``/dev/stderr`` / ``/dev/fd/N`` write
-    nothing and return None.  Input redirects (``< file``) are returned too —
-    the file's contents reach the command.
+    ``cmd > /tmp/x`` yields ``"> /tmp/x"``.  The operator is kept so a rule that
+    allows a redirect (``>>?\\s*/tmp/.*``) cannot also allow *running* ``/tmp/x``.
+
+    The target is matched as the path bash will open, as far as that is knowable:
+
+    - A **literal** target (no unescaped ``$`` or backtick) is shell-unquoted
+      as a whole — ``/tmp/'..'/etc/passwd`` is ``/tmp/../etc/passwd`` — and
+      then ``normpath``-ed, relative or absolute, so ``..`` cannot hide behind
+      quotes or a prefix: ``> /tmp/../etc/passwd`` matches as ``> /etc/passwd``,
+      ``> logs/../../x`` as ``> ../x``.
+    - A target with an **expansion** in it has no knowable value before bash
+      runs, so it is returned from the first ``$`` / backtick onward —
+      ``> ${HOME//root/../..}/etc/passwd`` — and no path-anchored rule can
+      match it (the same rule as for unparsed substitutions).
+
+    Not returned, because nothing is opened by the user's choice: descriptor
+    duplications, moves and closes (``2>&1``, ``3>&1-``, ``3>&-``); sinks
+    (``/dev/null``, ``/dev/stdout``, ``/dev/stderr``, ``/dev/fd/N``); a
+    process substitution target (``> >(cmd)`` — the nested command is
+    returned by the walk).  Input redirects (``< file``) are returned — the
+    file's contents reach the command.
     """
     fd = ""
     operator = ""
     dest = ""
+    dest_type = ""
     for child in file_redirect.children:
         text = src[child.start_byte:child.end_byte].decode()
         if child.type == "file_descriptor":
@@ -165,13 +195,28 @@ def _redirect_param(file_redirect, src: bytes) -> str | None:
             operator += text.strip()
         else:
             dest = text.strip()
-    if operator in _FD_ONLY_REDIRECT_OPERATORS and (not dest or dest.isdigit()):
+            dest_type = child.type
+    if dest_type == "process_substitution":
         return None
-    if len(dest) >= 2 and dest[0] == dest[-1] and dest[0] in "'\"" and not any(
-        ch in dest for ch in "$`"
-    ):
-        dest = dest[1:-1]  # a plainly quoted path is the same path
-    if dest.startswith("/"):
+    expansion_at = _first_expansion(dest)
+    if expansion_at >= 0:
+        # Cut off a literal path prefix (``/tmp/`` in ``/tmp/${X}``) so no
+        # directory rule can match a value bash has not computed; a target
+        # that has no such prefix (``"$HOME/x"``) is returned whole.
+        if "/" in dest[:expansion_at]:
+            dest = dest[expansion_at:]
+        return f"{fd}{operator} {dest}"
+    if dest:
+        try:
+            parts = shlex.split(dest)
+        except ValueError:
+            parts = []
+        if len(parts) != 1:
+            return f"{fd}{operator} {dest}"  # not one plain word: match the raw text
+        dest = parts[0]
+    if operator in _FD_ONLY_REDIRECT_OPERATORS and _FD_OPERAND.fullmatch(dest):
+        return None
+    if dest:
         dest = os.path.normpath(dest)
     if dest in _SINK_DESTINATIONS or _DEV_FD.fullmatch(dest):
         return None
@@ -282,10 +327,25 @@ def extract_bash_subcommands(command: str) -> list[str]:
             # The target of ``> file`` is a consequence of its own — the file is
             # created or truncated under the gateway account — so it is a
             # parameter string of its own, operator included (#173).  Descend
-            # too: ``> $(id)`` still has a command in it.
+            # too: ``> $(id)`` still has a command in it.  An ERROR child is
+            # already folded into the operator by ``_redirect_param``.
             param = _redirect_param(node, src)
             if param is not None:
                 commands.append(param)
+            for child in node.children:
+                if child.type != "ERROR":
+                    walk(child)
+            return
+        if node.type == "ERROR":
+            # Text the grammar could not place.  bash will still interpret it —
+            # ``grep x <>/tmp/f`` parses as ERROR(``<``) + ``>/tmp/f`` — so a
+            # fragment carrying shell syntax (a redirect, pipe, list operator or
+            # expansion) is returned as a sub-command that must match a rule on
+            # its own (fail closed).  A stray plain word (the ``EOF`` the grammar
+            # drops after a ``<< E"OF"`` heredoc) is not.  Walked either way.
+            text = src[node.start_byte:node.end_byte].decode().strip()
+            if any(ch in text for ch in "<>|&;$`"):
+                commands.append(text)
             descend(node)
             return
         if node.type == "command":

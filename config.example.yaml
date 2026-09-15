@@ -44,11 +44,13 @@ tool_presets:
   # A bash redirect is matched as its own string, operator included, so this
   # never allows *running* something from /tmp. Not in any built-in list:
   # guests are read-only, and owners opt in by referencing the preset.
+  # params regexes match case-insensitively; `(?-i:...)` keeps the directory
+  # prefix exact so `/TMP/x` (a different directory on Linux) is not granted.
   scratch-dir:
     - tool: "Write"
-      params: "/tmp/.*"
+      params: "(?-i:/tmp/).*"
     - tool: "Bash"
-      params: ">>?\\s*/tmp/.*"
+      params: ">>?\\s*(?-i:/tmp/).*"
 
 connectors:
   # ── Voice Gateway (Siri / iOS Shortcuts) ─────────────────────────────────

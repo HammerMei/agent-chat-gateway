@@ -547,6 +547,66 @@ class TestRedirectTargets(unittest.TestCase):
         self.assertFalse(all_params_match_any(rules, "Bash", ["< /tmp/x"]))  # read is not granted
         self.assertFalse(all_params_match_any(rules, "Write", ["/etc/passwd"]))
 
+    # ── Codex round 1 on #177: the target must be the path bash opens ────────
+
+    def _preset(self):
+        import yaml
+
+        example = yaml.safe_load(
+            (pathlib.Path(__file__).resolve().parents[2] / "config.example.yaml").read_text()
+        )
+        return self.OWNER + [ToolRule(**r) for r in example["tool_presets"]["scratch-dir"]]
+
+    def test_expansion_in_target_is_returned_from_the_opener(self):
+        """`/tmp/${HOME//root/../..}/etc/passwd` has no knowable value; no path rule may match it."""
+        cmd = f"{self.FETCH} > /tmp/${{HOME//root/../..}}/etc/passwd"
+        params = extract_bash_subcommands(cmd)
+        self.assertEqual(params, [self.FETCH, "> ${HOME//root/../..}/etc/passwd"])
+        self.assertFalse(all_params_match_any(self._preset(), "Bash", params))
+        self.assertEqual(extract_bash_subcommands(f"{self.FETCH} > $HOME/x"), [self.FETCH, "> $HOME/x"])
+        self.assertEqual(extract_bash_subcommands(f"{self.FETCH} > /tmp/$(id)"), [self.FETCH, "> $(id)", "id"])
+
+    def test_quote_fragments_are_removed_before_normalizing(self):
+        for cmd in (f"{self.FETCH} > /tmp/'..'/etc/passwd", f'{self.FETCH} > "/tmp/../etc/passwd"', f"{self.FETCH} > /tmp/\"..\"/etc/passwd"):
+            with self.subTest(cmd):
+                params = extract_bash_subcommands(cmd)
+                self.assertEqual(params, [self.FETCH, "> /etc/passwd"])
+                self.assertFalse(all_params_match_any(self._preset(), "Bash", params))
+
+    def test_relative_target_is_normalized_so_traversal_shows(self):
+        params = extract_bash_subcommands(f"{self.FETCH} > logs/../../secrets")
+        self.assertEqual(params, [self.FETCH, "> ../secrets"])
+        rule = [ToolRule(tool="Bash", params=r">>?\s*logs/.*")]
+        self.assertFalse(all_params_match_any(rule, "Bash", params[1:]))
+        self.assertTrue(all_params_match_any(rule, "Bash", extract_bash_subcommands("x > logs/a/../b.log")[1:]))
+
+    def test_compact_read_write_redirect_fails_closed(self):
+        """`<>/tmp/f` parses as ERROR(`<`) + `>/tmp/f`; the stray `<` is a fragment nothing matches."""
+        params = extract_bash_subcommands("grep root <>/tmp/link")
+        self.assertIn("<", params)
+        self.assertFalse(all_params_match_any(self._preset() + [ToolRule(tool="Bash", params="grep .*")], "Bash", params))
+
+    def test_descriptor_moves_closes_and_quoted_operands_are_not_params(self):
+        for cmd in (f'{self.FETCH} 2>&"1"', f"{self.FETCH} 3>&1-", f"{self.FETCH} 3>& -", f"{self.FETCH} 4<&0"):
+            with self.subTest(cmd):
+                self.assertEqual(extract_bash_subcommands(cmd), [self.FETCH])
+
+    def test_process_substitution_target_is_not_a_file(self):
+        """`> >(cmd)` opens a pipe, not a path; the nested command is what must match."""
+        params = extract_bash_subcommands(f"{self.FETCH} > >(coop send --room r -)")
+        self.assertEqual(params, [self.FETCH, "coop send --room r -"])
+        self.assertTrue(all_params_match_any(self.OWNER, "Bash", params))
+
+    def test_shipped_preset_is_case_sensitive_on_the_directory(self):
+        preset = self._preset()
+        self.assertTrue(all_params_match_any(preset, "Bash", ["> /tmp/x"]))
+        self.assertFalse(all_params_match_any(preset, "Bash", ["> /TMP/x"]))
+        self.assertFalse(all_params_match_any(preset, "Write", ["/Tmp/x"]))
+        self.assertTrue(all_params_match_any(preset, "Write", ["/tmp/x"]))
+
+    def test_escaped_space_in_target_is_one_path(self):
+        self.assertEqual(extract_bash_subcommands(f"{self.FETCH} > /tmp/x\\ y"), [self.FETCH, "> /tmp/x y"])
+
     def test_owner_coop_send_with_stderr_to_dev_null_still_passes(self):
         params = extract_bash_subcommands('coop send --room r "hi" 2>/dev/null')
         self.assertTrue(all_params_match_any(self.OWNER, "Bash", params))
