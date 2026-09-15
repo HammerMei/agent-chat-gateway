@@ -321,17 +321,38 @@ def get_param_strings_for_claude(
     return [json.dumps(tool_input, ensure_ascii=False)]
 
 
-def get_param_strings_for_opencode(patterns: list) -> list[str]:
+def get_param_strings_for_opencode(
+    patterns: list,
+    permission: str = "",
+    metadata: dict | None = None,
+) -> list[str]:
     """Return the list of parameter strings to match for an OpenCode permission event.
 
     OpenCode already parses compound bash commands via tree-sitter internally,
     producing one pattern per AST command node.  The gateway must require ALL
     patterns to match — not just patterns[0].
 
+    For a ``bash`` ask the sidecar also sends the full command text as
+    ``metadata["command"]`` (opencode ``shell.ts`` ``ask()``).  The gateway
+    splits that text itself with :func:`extract_bash_subcommands` and requires
+    those strings to match **as well**.  The sidecar's patterns come from the
+    same tree-sitter-bash grammar and share its gaps — a ``$(...)`` on an
+    indented heredoc line, a backtick in a heredoc body or inside ``${x:-...}``
+    produce no nested pattern there — while the gateway's split returns the
+    unparsed substitution from its opener and so fails closed (#175).  Without
+    ``metadata["command"]`` only the sidecar's patterns are matched; the caller
+    should log that, because it means the sidecar stopped sending the text.
+
     Returns ``[""]`` for an empty patterns list so that a tool-name-only rule
     (``rule.params is None``) still matches correctly.
     """
-    return list(patterns) if patterns else [""]
+    strings = list(patterns)
+    command = metadata.get("command") if isinstance(metadata, dict) else None
+    if permission.lower() == "bash" and isinstance(command, str) and command:
+        for sub in extract_bash_subcommands(command):
+            if sub not in strings:
+                strings.append(sub)
+    return strings or [""]
 
 
 def matches_rule(rule: "ToolRule", tool_name: str, param_string: str) -> bool:

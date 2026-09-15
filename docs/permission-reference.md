@@ -504,7 +504,7 @@ permission gate on Claude — Claude's own permission rules do not run.
     "sessionID": "ses_...",
     "permission": "bash",
     "patterns": ["echo hello", "rm -rf /"],
-    "metadata": {},
+    "metadata": {"command": "echo hello && rm -rf /"},
     "tool": { "messageID": "msg_...", "callID": "call_..." }
   }
 }
@@ -526,6 +526,8 @@ if not all_params_match_any(rules, tool_name, patterns):
 ```
 
 This prevents bypasses where dangerous sub-commands sneak through (see tool_match.py — `all_params_match_any()`).
+
+**The gateway splits the bash command itself as well.** A `bash` ask also carries the full command text as `metadata.command`. The sidecar's patterns come from the same tree-sitter-bash grammar the gateway uses and share its gaps — a `$(…)` on an indented heredoc line, a backtick in a heredoc body or inside `${x:-…}` yield no nested pattern — so the broker runs `extract_bash_subcommands(metadata["command"])` and requires those strings to match **in addition to** the sidecar's patterns. The gateway's split returns an unparsed substitution from its opener, so those forms fail closed on OpenCode exactly as on Claude. If a bash ask arrives without `metadata.command`, the sidecar's patterns alone are matched and a warning is logged naming the request — that means opencode changed its event shape.
 
 **Reply API:**
 ```bash

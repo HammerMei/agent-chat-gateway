@@ -89,6 +89,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `skip_owner_approval: true` is corrected — it never was one.
 
 ### Fixed
+- **The OpenCode broker splits a bash command itself instead of trusting only
+  the sidecar's patterns** (#175). opencode's shell tool derives its
+  `patterns[]` from the same tree-sitter-bash grammar the gateway uses, so it
+  shares the grammar's gaps: a `$(…)` on an indented heredoc line, a backtick
+  in a heredoc body or inside `${x:-…}` produce one pattern — the parent
+  command — which the built-in `coop fetch-history` guest rule matched. A guest
+  on an OpenCode agent got arbitrary command execution through those spellings,
+  auto-approved. The broker now also runs the gateway's own splitter over
+  `metadata.command` (the full text opencode 1.18.13 puts on every bash ask)
+  and requires those strings to match too; the splitter returns an unparsed
+  substitution from its opener, so these forms fail closed on OpenCode as they
+  do on Claude since #174. A bash ask without `metadata.command` is matched on
+  the sidecar's patterns alone and logged as a warning.
 - **Bash allow rules now see the command inside a `$(…)` / backtick / `<(…)`
   substitution** (#171). The Claude broker's command splitter treated
   substitutions as opaque, so `coop fetch-history --room r $(rm -rf x)` was one

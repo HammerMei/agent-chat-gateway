@@ -176,6 +176,88 @@ class TestGuestEnforcement(unittest.IsolatedAsyncioTestCase):
         await asyncio.gather(*list(broker._pending_tasks), return_exceptions=True)
         broker._reply_to_opencode.assert_called_once_with("per_deny", approved=False)
 
+    async def test_guest_bash_denied_when_only_the_gateway_split_sees_the_substitution(self):
+        """#175: opencode's own grammar emits one pattern for `$(…)` on an indented heredoc line.
+
+        Matching the sidecar's patterns alone approves it under the built-in
+        `coop fetch-history` guest rule; the broker also splits
+        ``metadata.command`` itself, which returns the substitution from its
+        opener, and that string matches nothing.
+        """
+        from gateway.core.config import AgentConfig
+
+        broker = _make_broker(
+            session_room_map={"ses_g": "room_g"},
+            session_role_map={"ses_g": "guest"},
+        )
+        broker._guest_allowed_tools = AgentConfig().effective_guest_allowed_tools()
+        broker._reply_to_opencode = AsyncMock()
+
+        cmd = "coop fetch-history --room r <<EOF\n\t$(rm -rf /tmp/x)\nEOF"
+        payload = {
+            "type": "permission.asked",
+            "properties": {
+                "id": "per_gap",
+                "permission": "bash",
+                "sessionID": "ses_g",
+                "patterns": [cmd],  # what opencode 1.18.13 emits for this form
+                "metadata": {"command": cmd},
+            },
+        }
+        await broker._handle_sse_line(_sse_line(payload))
+        await asyncio.gather(*list(broker._pending_tasks), return_exceptions=True)
+        broker._reply_to_opencode.assert_called_once_with("per_gap", approved=False)
+
+    async def test_guest_bash_plain_fetch_history_still_approved_with_command(self):
+        from gateway.core.config import AgentConfig
+
+        broker = _make_broker(
+            session_room_map={"ses_g": "room_g"},
+            session_role_map={"ses_g": "guest"},
+        )
+        broker._guest_allowed_tools = AgentConfig().effective_guest_allowed_tools()
+        broker._reply_to_opencode = AsyncMock()
+
+        cmd = "coop fetch-history --room r --limit 5"
+        payload = {
+            "type": "permission.asked",
+            "properties": {
+                "id": "per_plain",
+                "permission": "bash",
+                "sessionID": "ses_g",
+                "patterns": [cmd],
+                "metadata": {"command": cmd},
+            },
+        }
+        await broker._handle_sse_line(_sse_line(payload))
+        await asyncio.gather(*list(broker._pending_tasks), return_exceptions=True)
+        broker._reply_to_opencode.assert_called_once_with("per_plain", approved=True)
+
+    async def test_bash_ask_without_metadata_command_warns_and_matches_patterns_only(self):
+        """No metadata.command → status quo (sidecar patterns) plus a warning naming the request."""
+        broker = _make_broker(
+            session_room_map={"ses_g": "room_g"},
+            session_role_map={"ses_g": "guest"},
+            guest_allowed_tools=["bash"],
+        )
+        broker._reply_to_opencode = AsyncMock()
+
+        payload = {
+            "type": "permission.asked",
+            "properties": {
+                "id": "per_nometa",
+                "permission": "bash",
+                "sessionID": "ses_g",
+                "patterns": ["ls"],
+                "metadata": {},
+            },
+        }
+        with self.assertLogs("coop.permissions.opencode", level="WARNING") as logs:
+            await broker._handle_sse_line(_sse_line(payload))
+        await asyncio.gather(*list(broker._pending_tasks), return_exceptions=True)
+        self.assertTrue(any("metadata.command" in line and "per_nometa" in line for line in logs.output), logs.output)
+        broker._reply_to_opencode.assert_called_once_with("per_nometa", approved=True)
+
     async def test_guest_auto_approves_listed_tool(self):
         broker = _make_broker(
             session_room_map={"ses_g": "room_g"},

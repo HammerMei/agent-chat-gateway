@@ -531,6 +531,52 @@ class TestGetParamStringsForOpencode(unittest.TestCase):
         result = get_param_strings_for_opencode([])
         self.assertEqual(result, [""])
 
+    # ── bash: the gateway splits metadata["command"] itself (#175) ───────────
+
+    HEREDOC_GAP = "coop fetch-history --room r <<EOF\n\t$(rm -rf /tmp/x)\nEOF"
+
+    def test_bash_command_is_split_by_the_gateway_too(self):
+        """The sidecar's grammar emits one pattern for an indented heredoc `$(…)`; ours adds the opener."""
+        sidecar_patterns = [self.HEREDOC_GAP]  # what opencode 1.18.13 actually emits
+        result = get_param_strings_for_opencode(
+            sidecar_patterns, "bash", {"command": self.HEREDOC_GAP}
+        )
+        self.assertEqual(result, [self.HEREDOC_GAP, "$(rm -rf /tmp/x)\n"])
+
+    def test_bash_gap_form_is_denied_for_a_guest_only_with_the_command(self):
+        guest = AgentConfig().effective_guest_allowed_tools()
+        without = get_param_strings_for_opencode([self.HEREDOC_GAP], "bash", {})
+        with_cmd = get_param_strings_for_opencode(
+            [self.HEREDOC_GAP], "bash", {"command": self.HEREDOC_GAP}
+        )
+        self.assertTrue(all_params_match_any(guest, "bash", without))  # the hole
+        self.assertFalse(all_params_match_any(guest, "bash", with_cmd))  # closed
+
+    def test_bash_gateway_split_is_a_union_without_duplicates(self):
+        cmd = 'coop send --room r "now: $(date +%s)"'
+        result = get_param_strings_for_opencode([cmd, "date +%s"], "bash", {"command": cmd})
+        self.assertEqual(result, [cmd, "date +%s"])
+        owner = AgentConfig().effective_owner_allowed_tools()
+        self.assertTrue(all_params_match_any(owner, "bash", result))
+
+    def test_bash_without_command_matches_sidecar_patterns_only(self):
+        self.assertEqual(get_param_strings_for_opencode(["ls"], "bash", {}), ["ls"])
+        self.assertEqual(get_param_strings_for_opencode(["ls"], "bash", None), ["ls"])
+        self.assertEqual(get_param_strings_for_opencode(["ls"], "bash", {"command": 7}), ["ls"])
+
+    def test_bash_command_with_empty_patterns_needs_no_placeholder(self):
+        """The [""] placeholder is for a tool-name-only match; a split command replaces it."""
+        result = get_param_strings_for_opencode([], "bash", {"command": "echo $(id)"})
+        self.assertEqual(result, ["echo $(id)", "id"])
+
+    def test_non_bash_permission_ignores_metadata_command(self):
+        result = get_param_strings_for_opencode(["/tmp/x"], "edit", {"command": "rm -rf /"})
+        self.assertEqual(result, ["/tmp/x"])
+
+    def test_permission_name_is_case_insensitive(self):
+        result = get_param_strings_for_opencode(["echo $(id)"], "Bash", {"command": "echo $(id)"})
+        self.assertEqual(result, ["echo $(id)", "id"])
+
 
 # ── all_params_match_any ─────────────────────────────────────────────────────
 

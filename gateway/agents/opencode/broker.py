@@ -17,7 +17,7 @@ SSE event format (confirmed from live traffic)::
         "sessionID": "ses_...",
         "permission": "bash",
         "patterns": ["ls", "printf 'hello world 123\\n'"],
-        "metadata": {},
+        "metadata": {"command": "ls && printf 'hello world 123\\n'"},
         "always": ["ls *", "printf *"],
         "tool": { "messageID": "msg_...", "callID": "call_..." }
       }
@@ -25,6 +25,9 @@ SSE event format (confirmed from live traffic)::
 
 All permission fields are nested under ``properties``, not at the top level.
 The tool name is in ``properties.permission`` (not ``properties.type``).
+``metadata.command`` is what opencode 1.18.13's ``shell.ts`` puts on a bash
+ask (read from its source; the live capture above predates it and showed
+``{}``) — the broker splits it itself, see ``get_param_strings_for_opencode``.
 """
 
 from __future__ import annotations
@@ -277,7 +280,22 @@ class OpenCodePermissionBroker(PermissionBroker):
         # Require ALL patterns to match — OpenCode provides one pattern per AST
         # sub-command for compound bash expressions (e.g. "echo hi && rm -rf /").
         # Checking only patterns[0] would allow dangerous sub-commands to slip through.
-        param_strings = get_param_strings_for_opencode(patterns)
+        #
+        # For bash the gateway also splits ``metadata["command"]`` itself: the
+        # sidecar's grammar misses some substitutions bash executes, and the
+        # gateway's split fails closed on those (#175).  tree-sitter's parse()
+        # is a synchronous C extension — offload it like the Claude broker does.
+        if tool_name.lower() == "bash" and not (
+            isinstance(metadata, dict) and isinstance(metadata.get("command"), str)
+        ):
+            logger.warning(
+                "bash ask %s carries no metadata.command — matching the sidecar's "
+                "patterns only (opencode changed its event shape?)",
+                opencode_req_id[:12] if opencode_req_id else "?",
+            )
+        param_strings = await asyncio.to_thread(
+            get_param_strings_for_opencode, patterns, tool_name, metadata
+        )
 
         if role == "guest":
             approved = all_params_match_any(
