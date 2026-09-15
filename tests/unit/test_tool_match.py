@@ -604,6 +604,44 @@ class TestRedirectTargets(unittest.TestCase):
         self.assertFalse(all_params_match_any(preset, "Write", ["/Tmp/x"]))
         self.assertTrue(all_params_match_any(preset, "Write", ["/tmp/x"]))
 
+    # ── Codex round 2 on #177: the value must be knowable, not just slash-prefixed ──
+
+    def test_every_literal_prefix_before_an_expansion_is_cut(self):
+        """`logs${…}` with a relative `logs.*` rule — no slash in the prefix, still cut."""
+        params = extract_bash_subcommands(f"{self.FETCH} > logs${{HOME//root/../../..}}/etc/passwd")
+        self.assertEqual(params, [self.FETCH, "> ${HOME//root/../../..}/etc/passwd"])
+        rule = [ToolRule(tool="Bash", params=r">>?\s*logs.*")]
+        self.assertFalse(all_params_match_any(rule, "Bash", params[1:]))
+
+    def test_glob_metacharacters_make_the_target_unknowable(self):
+        """`normpath` on `/tmp/a/**/../../home/u/f` collapses the wrong components when `**` matches nothing."""
+        cases = {
+            "globstar": (f"{self.FETCH} > /tmp/a/**/../../home/user/file", "> **/../../home/user/file"),
+            "star": (f"{self.FETCH} > /tmp/*.log", "> *.log"),
+            "bracket": (f"{self.FETCH} > /tmp/[ab]/../../etc/x", "> [ab]/../../etc/x"),
+            "question": (f"{self.FETCH} > /tmp/?/../../etc/x", "> ?/../../etc/x"),
+        }
+        for label, (cmd, expected) in cases.items():
+            with self.subTest(label):
+                params = extract_bash_subcommands(cmd)
+                self.assertEqual(params, [self.FETCH, expected])
+                self.assertFalse(all_params_match_any(self._preset(), "Bash", params))
+
+    def test_quote_only_prefix_is_kept_for_readability(self):
+        self.assertEqual(extract_bash_subcommands(f'{self.FETCH} > "$HOME/x"'), [self.FETCH, '> "$HOME/x"'])
+        # single quotes would make bash treat `$HOME` literally; we still fail closed on it
+        self.assertEqual(extract_bash_subcommands(f"{self.FETCH} > '$HOME/x'"), [self.FETCH, "> '$HOME/x'"])
+
+    def test_shipped_preset_covers_every_file_writing_permission_name(self):
+        """Claude asks as Write/Edit/MultiEdit; OpenCode asks as `edit` for all three."""
+        preset = self._preset()
+        for tool in ("Write", "Edit", "MultiEdit", "edit"):
+            with self.subTest(tool):
+                self.assertTrue(all_params_match_any(preset, tool, ["/tmp/notes.md"]))
+                self.assertFalse(all_params_match_any(preset, tool, ["/TMP/notes.md"]))
+                self.assertFalse(all_params_match_any(preset, tool, ["/etc/passwd"]))
+        self.assertFalse(all_params_match_any(preset, "Read", ["/tmp/notes.md"]))
+
     def test_escaped_space_in_target_is_one_path(self):
         self.assertEqual(extract_bash_subcommands(f"{self.FETCH} > /tmp/x\\ y"), [self.FETCH, "> /tmp/x y"])
 

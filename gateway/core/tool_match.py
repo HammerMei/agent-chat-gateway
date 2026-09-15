@@ -143,14 +143,26 @@ _SINK_DESTINATIONS: frozenset[str] = frozenset({"/dev/null", "/dev/stdout", "/de
 _DEV_FD = re.compile(r"/dev/fd/\d+")
 
 
-def _first_expansion(text: str) -> int:
-    """Index of the first unescaped ``$`` or backtick in ``text``, or -1."""
+# Characters after which the path bash opens is no longer knowable from the
+# text: an expansion (``$``, backtick) or a pathname-expansion metacharacter
+# (``*``, ``?``, ``[`` — with ``globstar``, ``**`` can match zero directories,
+# so ``normpath`` on the literal text would collapse the wrong components).
+_UNKNOWABLE_FROM = "$`*?["
+
+
+def _first_unknowable(text: str) -> int:
+    """Index of the first unescaped character from ``_UNKNOWABLE_FROM``, or -1.
+
+    Quotes are skipped over as characters but not as regions: a ``$`` inside
+    double quotes still expands, and a ``*`` inside single quotes does not —
+    that second case is a false positive we accept (it fails closed).
+    """
     i = 0
     while i < len(text):
         if text[i] == "\\":
             i += 2
             continue
-        if text[i] in "$`":
+        if text[i] in _UNKNOWABLE_FROM:
             return i
         i += 1
     return -1
@@ -162,17 +174,24 @@ def _redirect_param(file_redirect, src: bytes) -> str | None:
     ``cmd > /tmp/x`` yields ``"> /tmp/x"``.  The operator is kept so a rule that
     allows a redirect (``>>?\\s*/tmp/.*``) cannot also allow *running* ``/tmp/x``.
 
-    The target is matched as the path bash will open, as far as that is knowable:
+    The rule: **a target is normalized and matched as a path only when the
+    path bash will open is knowable from the text.**
 
-    - A **literal** target (no unescaped ``$`` or backtick) is shell-unquoted
-      as a whole — ``/tmp/'..'/etc/passwd`` is ``/tmp/../etc/passwd`` — and
-      then ``normpath``-ed, relative or absolute, so ``..`` cannot hide behind
-      quotes or a prefix: ``> /tmp/../etc/passwd`` matches as ``> /etc/passwd``,
-      ``> logs/../../x`` as ``> ../x``.
-    - A target with an **expansion** in it has no knowable value before bash
-      runs, so it is returned from the first ``$`` / backtick onward —
-      ``> ${HOME//root/../..}/etc/passwd`` — and no path-anchored rule can
-      match it (the same rule as for unparsed substitutions).
+    - A **literal** target (no unescaped ``$``, backtick, ``*``, ``?``, ``[``)
+      is shell-unquoted as a whole — ``/tmp/'..'/etc/passwd`` is
+      ``/tmp/../etc/passwd`` — and then ``normpath``-ed, relative or absolute,
+      so ``..`` cannot hide behind quotes or a prefix: ``> /tmp/../etc/passwd``
+      matches as ``> /etc/passwd``, ``> logs/../../x`` as ``> ../x``.
+    - Otherwise the value is not knowable before bash runs, so the string is
+      returned from the first unknowable character onward, every literal
+      prefix cut — ``> ${HOME//root/../..}/etc/passwd``, ``> **/../../x`` —
+      and no rule anchored on a path prefix can match it (the same rule as
+      for unparsed substitutions).
+
+    Matching is lexical: symlinks are not resolved, exactly as for the file
+    tools' ``normpath``.  A rule that confines writes to a directory confines
+    the *path text*; a symlink planted inside that directory is outside what
+    a path rule can see.
 
     Not returned, because nothing is opened by the user's choice: descriptor
     duplications, moves and closes (``2>&1``, ``3>&1-``, ``3>&-``); sinks
@@ -198,14 +217,18 @@ def _redirect_param(file_redirect, src: bytes) -> str | None:
             dest_type = child.type
     if dest_type == "process_substitution":
         return None
-    expansion_at = _first_expansion(dest)
-    if expansion_at >= 0:
-        # Cut off a literal path prefix (``/tmp/`` in ``/tmp/${X}``) so no
-        # directory rule can match a value bash has not computed; a target
-        # that has no such prefix (``"$HOME/x"``) is returned whole.
-        if "/" in dest[:expansion_at]:
-            dest = dest[expansion_at:]
-        return f"{fd}{operator} {dest}"
+    unknowable_at = _first_unknowable(dest)
+    if unknowable_at >= 0:
+        # The path bash opens is not knowable from here on, so nothing before
+        # this point may be matched either: cut every literal prefix
+        # (``/tmp/`` in ``/tmp/${X}``, ``logs`` in ``logs${X}``) so no rule
+        # anchored on a prefix can approve a value bash has not computed.  A
+        # prefix that is only quote characters is kept — ``"$HOME/x"`` reads
+        # better than ``$HOME/x"`` and anchors nothing.
+        prefix = dest[:unknowable_at]
+        if prefix.strip("'\"") == "":
+            return f"{fd}{operator} {dest}"
+        return f"{fd}{operator} {dest[unknowable_at:]}"
     if dest:
         try:
             parts = shlex.split(dest)

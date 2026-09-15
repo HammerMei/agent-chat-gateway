@@ -97,14 +97,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   included (`"> /tmp/x"`, `"2> err.log"`, `"< /etc/passwd"`), so it has to
   match a rule and a rule that allows the redirect cannot allow running the
   same path. A literal target is shell-unquoted and normalized so `..` cannot
-  hide behind quotes or a prefix; a target with an expansion in it is matched
-  from the expansion onward, so no path rule can approve a value bash has not
-  computed yet. Descriptor duplications (`2>&1`, `>&2`,
+  hide behind quotes or a prefix; a target with an expansion or a glob in it
+  is matched from that character onward, every literal prefix cut, so no path
+  rule can approve a value bash has not computed yet. Matching is lexical —
+  symlinks are not resolved, as for the file tools. Descriptor duplications (`2>&1`, `>&2`,
   `3>&-`) and sinks (`/dev/null`, `/dev/stdout`, `/dev/stderr`, `/dev/fd/N`)
   write nothing and are not matched. Guests get no write anywhere by default;
   owners who want scratch files reference the new `scratch-dir` preset
-  (`config.example.yaml`), which covers the Write tool and bash redirects to
-  `/tmp` together. **Upgrade note:** an owner command that redirects to a file
+  (`config.example.yaml`), which covers Write/Edit/MultiEdit (OpenCode's
+  `edit`) and bash redirects to `/tmp` together. **Upgrade note:** an owner command that redirects to a file
   now needs a matching rule — with `permissions.enabled: true` it prompts,
   with `false` it is denied — where it used to pass unchecked.
 - **The OpenCode broker splits a bash command itself instead of trusting only
