@@ -55,6 +55,10 @@ tool_presets:
       params: "(?-i:/tmp/).*"
     - tool: "Bash"
       params: ">>?\\s*(?-i:/tmp/).*"
+    # OpenCode also asks `external_directory` (pattern `<dir>/*`) before any
+    # file tool touches a path outside the agent's working directory.
+    - tool: "external_directory"
+      params: "(?-i:/tmp)(/.*)?"
 
 connectors:
   # ── Voice Gateway (Siri / iOS Shortcuts) ─────────────────────────────────

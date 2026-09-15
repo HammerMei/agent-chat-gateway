@@ -105,7 +105,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   write nothing and are not matched. Guests get no write anywhere by default;
   owners who want scratch files reference the new `scratch-dir` preset
   (`config.example.yaml`), which covers Write/Edit/MultiEdit (OpenCode's
-  `edit`) and bash redirects to `/tmp` together. **Upgrade note:** an owner command that redirects to a file
+  `edit` and its `external_directory` ask) and bash redirects to `/tmp`
+  together. **Upgrade note:** an owner command that redirects to a file
   now needs a matching rule — with `permissions.enabled: true` it prompts,
   with `false` it is denied — where it used to pass unchecked.
 - **The OpenCode broker splits a bash command itself instead of trusting only

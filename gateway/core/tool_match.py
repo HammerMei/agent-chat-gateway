@@ -203,7 +203,7 @@ def _redirect_param(file_redirect, src: bytes) -> str | None:
     fd = ""
     operator = ""
     dest = ""
-    dest_type = ""
+    dest_children: list = []
     for child in file_redirect.children:
         text = src[child.start_byte:child.end_byte].decode()
         if child.type == "file_descriptor":
@@ -213,9 +213,20 @@ def _redirect_param(file_redirect, src: bytes) -> str | None:
         elif child.type == "ERROR":
             operator += text.strip()
         else:
-            dest = text.strip()
-            dest_type = child.type
-    if dest_type == "process_substitution":
+            dest_children.append(child)
+    if dest_children:
+        # The whole span from the first destination node to the end of the
+        # redirect, not the last node only: a backslash-newline inside the
+        # word (``> /var\\<newline>/tmp/x``) makes the grammar emit one
+        # ``word`` per line while bash joins them.  Drop the continuations so
+        # the text is the path bash sees.
+        dest = (
+            src[dest_children[0].start_byte:file_redirect.end_byte]
+            .decode()
+            .replace("\\\n", "")
+            .strip()
+        )
+    if len(dest_children) == 1 and dest_children[0].type == "process_substitution":
         return None
     unknowable_at = _first_unknowable(dest)
     if unknowable_at >= 0:
@@ -366,6 +377,25 @@ def extract_bash_subcommands(command: str) -> list[str]:
             # expansion) is returned as a sub-command that must match a rule on
             # its own (fail closed).  A stray plain word (the ``EOF`` the grammar
             # drops after a ``<< E"OF"`` heredoc) is not.  Walked either way.
+            heredoc_start = next(
+                (c for c in node.children if c.type == "heredoc_start"), None
+            )
+            if heredoc_start is not None:
+                # A heredoc the grammar could not attach (``<< E"OF"`` with a
+                # plain body lands here whole).  It is a heredoc all the same:
+                # a quoted delimiter means a literal body, an unquoted one
+                # means the body is walked for substitutions; a ``> file`` on
+                # the line is a redirect either way.  Nothing else in it is a
+                # fragment to match.
+                quoted = any(
+                    ch in src[heredoc_start.start_byte:heredoc_start.end_byte].decode()
+                    for ch in ("'", '"', "\\")
+                )
+                for child in node.children:
+                    if child.type == "heredoc_body" and quoted:
+                        continue
+                    walk(child)
+                return
             text = src[node.start_byte:node.end_byte].decode().strip()
             if any(ch in text for ch in "<>|&;$`"):
                 commands.append(text)

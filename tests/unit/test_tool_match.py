@@ -642,6 +642,32 @@ class TestRedirectTargets(unittest.TestCase):
                 self.assertFalse(all_params_match_any(preset, tool, ["/etc/passwd"]))
         self.assertFalse(all_params_match_any(preset, "Read", ["/tmp/notes.md"]))
 
+    # ── Codex round 3 on #177 ────────────────────────────────────────────────
+
+    def test_line_continuation_in_target_is_joined_like_bash_does(self):
+        """`> /var\\<newline>/tmp/x` is `/var/tmp/x` to bash; the grammar emits two words."""
+        params = extract_bash_subcommands(f"{self.FETCH} > /var\\\n/tmp/x")
+        self.assertEqual(params, [self.FETCH, "> /var/tmp/x"])
+        self.assertFalse(all_params_match_any(self._preset(), "Bash", params))
+
+    def test_misparsed_quoted_heredoc_is_not_a_fragment(self):
+        """`<< E"OF"` with a plain body lands in an ERROR node; it is a quoted heredoc, not stray text."""
+        cmd = 'coop send --room r - << E"OF"\nhello\nEOF'
+        params = extract_bash_subcommands(cmd)
+        self.assertTrue(all_params_match_any(self.OWNER, "Bash", params), params)
+        # a redirect on the same line still counts
+        with_redirect = 'coop send --room r - << E"OF" > out\nhello\nEOF'
+        self.assertIn("> out", extract_bash_subcommands(with_redirect))
+
+    def test_shipped_preset_covers_opencode_external_directory_ask(self):
+        """OpenCode asks `external_directory` with `<dir>/*` before editing outside the cwd."""
+        preset = self._preset()
+        self.assertTrue(all_params_match_any(preset, "external_directory", ["/tmp/*"]))
+        self.assertTrue(all_params_match_any(preset, "external_directory", ["/tmp/sub/*"]))
+        self.assertFalse(all_params_match_any(preset, "external_directory", ["/tmpfoo/*"]))
+        self.assertFalse(all_params_match_any(preset, "external_directory", ["/TMP/*"]))
+        self.assertFalse(all_params_match_any(preset, "external_directory", ["/etc/*"]))
+
     def test_escaped_space_in_target_is_one_path(self):
         self.assertEqual(extract_bash_subcommands(f"{self.FETCH} > /tmp/x\\ y"), [self.FETCH, "> /tmp/x y"])
 
