@@ -659,11 +659,24 @@ class TestRedirectTargets(unittest.TestCase):
         # outside quotes it is still joined
         self.assertEqual(extract_bash_subcommands(f"{self.FETCH} > /tmp/sa\\\nfe/x"), [self.FETCH, "> /tmp/safe/x"])
 
-    def test_misparsed_quoted_heredoc_is_not_a_fragment(self):
-        """`<< E"OF"` with a plain body lands in an ERROR node; it is a quoted heredoc, not stray text."""
+    def test_misparsed_quoted_heredoc_keeps_command_and_body_as_one_string(self):
+        """`<< E"OF"` with a plain body lands in an ERROR node next to its command.
+
+        It gets the same shape as an attached heredoc: one string with the
+        command and the whole heredoc, so `coop send …` still matches the
+        built-in rule while `python3` alone cannot approve a script body.
+        """
         cmd = 'coop send --room r - << E"OF"\nhello\nEOF'
         params = extract_bash_subcommands(cmd)
+        self.assertEqual(params, [cmd])
         self.assertTrue(all_params_match_any(self.OWNER, "Bash", params), params)
+        script = 'python3 << E"OF"\nimport os; os.remove("/important")\nEOF'
+        params = extract_bash_subcommands(script)
+        self.assertEqual(params, [script])
+        self.assertFalse(all_params_match_any([ToolRule(tool="Bash", params="python3")], "Bash", params))
+        # same as the attached spelling
+        attached = "python3 << 'EOF'\nimport os; os.remove(\"/important\")\nEOF"
+        self.assertFalse(all_params_match_any([ToolRule(tool="Bash", params="python3")], "Bash", extract_bash_subcommands(attached)))
         # a redirect on the same line still counts
         with_redirect = 'coop send --room r - << E"OF" > out\nhello\nEOF'
         self.assertIn("> out", extract_bash_subcommands(with_redirect))

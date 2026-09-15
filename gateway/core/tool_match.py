@@ -417,11 +417,21 @@ def extract_bash_subcommands(command: str) -> list[str]:
             )
             if heredoc_start is not None:
                 # A heredoc the grammar could not attach (``<< E"OF"`` with a
-                # plain body lands here whole).  It is a heredoc all the same:
-                # a quoted delimiter means a literal body, an unquoted one
-                # means the body is walked for substitutions; a ``> file`` on
-                # the line is a redirect either way.  Nothing else in it is a
-                # fragment to match.
+                # plain body lands here whole, next to its command instead of
+                # inside a ``redirected_statement``).  Give it the same shape
+                # the attached case gets: one string holding command *and*
+                # heredoc, so a rule has to match the body too — ``python3``
+                # alone must not approve ``python3 << E"OF" …``.  The command
+                # was appended just before this node; replace it.
+                prev = node.prev_sibling
+                if prev is not None and prev.type == "command" and commands:
+                    commands.pop()
+                    commands.append(src[prev.start_byte:node.end_byte].decode())
+                else:
+                    commands.append(src[node.start_byte:node.end_byte].decode())
+                # Then, as for an attached heredoc: a quoted delimiter means a
+                # literal body, an unquoted one is walked for substitutions,
+                # and a ``> file`` on the line is a redirect either way.
                 quoted = any(
                     ch in src[heredoc_start.start_byte:heredoc_start.end_byte].decode()
                     for ch in ("'", '"', "\\")
