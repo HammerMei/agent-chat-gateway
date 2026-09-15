@@ -80,23 +80,21 @@ RELOAD_IN_PROGRESS = "a config reload is in progress — retry when it finishes"
 
 
 def _build_agent_backend(agent_cfg: AgentConfig) -> AgentBackend:
-    """Instantiate the correct AgentBackend from an AgentConfig."""
-    if not agent_cfg.permissions.enabled and agent_cfg.permissions.skip_owner_approval:
-        logger.warning(
-            "Agent '%s': permissions.skip_owner_approval=true has no effect because "
-            "permissions.enabled=false — the permission broker is disabled entirely. "
-            "Set permissions.enabled=true to activate skip_owner_approval.",
-            agent_cfg.name,
-        )
-    broker_config = (
-        GatewayBrokerConfig(
-            owner_allowed_tools=agent_cfg.effective_owner_allowed_tools(),
-            guest_allowed_tools=agent_cfg.effective_guest_allowed_tools(),
-            timeout=agent_cfg.permissions.timeout,
-            skip_owner_approval=agent_cfg.permissions.skip_owner_approval,
-        )
-        if agent_cfg.permissions.enabled
-        else None
+    """Instantiate the correct AgentBackend from an AgentConfig.
+
+    Every agent gets a permission broker. ``permissions.enabled`` decides only
+    what an owner's tool call gets when no allow-list matches it: a human is
+    asked in chat (``true``) or the call is denied at once (``false``) — never
+    an ask that nobody answers (#165), and never a backend left to its own
+    permission engine (ADR-0002). The allow-lists, including the built-in
+    ``coop …`` rules, apply in both modes.
+    """
+    broker_config = GatewayBrokerConfig(
+        owner_allowed_tools=agent_cfg.effective_owner_allowed_tools(),
+        guest_allowed_tools=agent_cfg.effective_guest_allowed_tools(),
+        timeout=agent_cfg.permissions.timeout,
+        skip_owner_approval=agent_cfg.permissions.skip_owner_approval,
+        human_approval=agent_cfg.permissions.enabled,
     )
 
     if agent_cfg.type == "claude":
@@ -110,7 +108,9 @@ def _build_agent_backend(agent_cfg: AgentConfig) -> AgentBackend:
         # sidecar_env is intentionally hardcoded: the opencode sidecar process
         # always runs as "owner" because it is the gateway's own agent backend.
         # Per-message guest enforcement (tool allow-lists, permission prompts)
-        # is handled by the PermissionBroker, not by environment variables.
+        # is handled by the PermissionBroker, not by environment variables —
+        # and the broker always runs, so every ask the sidecar raises is
+        # answered (approved, denied, or put to a human).
         return OpenCodeBackend(
             command=agent_cfg.command,
             new_session_args=agent_cfg.new_session_args,

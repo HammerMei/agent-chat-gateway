@@ -57,6 +57,11 @@ class ClaudePermissionBroker(PermissionBroker):
       5. Owner replies /approve <id> or /deny <id> in RC chat.
       6. Future resolves → hook handler returns {"decision": "allow/deny"}.
       7. Claude resumes or skips the tool call.
+
+    With ``human_approval=False`` (``permissions.enabled: false``) step 4 never
+    happens: the same call is blocked at once, with a reason the model reads.
+    The broker still runs — every ``claude -p`` carries the hook — so the
+    allow-lists still decide what runs (ADR-0002).
     """
 
     def __init__(
@@ -71,6 +76,7 @@ class ClaudePermissionBroker(PermissionBroker):
         timeout_seconds: int = 300,
         skip_owner_approval: bool = False,
         backend: "ClaudeBackend | None" = None,
+        human_approval: bool = True,
     ) -> None:
         super().__init__(registry, notifier, timeout_seconds)
         self._session_room_map = session_room_map
@@ -81,6 +87,9 @@ class ClaudePermissionBroker(PermissionBroker):
         self._owner_allowed_tools: list[ToolRule] = owner_allowed_tools if owner_allowed_tools is not None else []
         self._guest_allowed_tools: list[ToolRule] = guest_allowed_tools if guest_allowed_tools is not None else []
         self._skip_owner_approval: bool = skip_owner_approval
+        # permissions.enabled: False → an owner tool outside the allow-list is
+        # blocked with a reason instead of asked (ADR-0002).
+        self._human_approval: bool = human_approval
         self._server: asyncio.Server | None = None
         self._port: int = 0
         # Tracks every in-flight _handle_connection coroutine so that stop()
@@ -170,9 +179,10 @@ class ClaudePermissionBroker(PermissionBroker):
     ) -> tuple[str, str]:
         """Return a ``(action, reason)`` policy decision for a tool call.
 
-        This method is **pure** — it reads only ``self._guest_allowed_tools``,
-        ``self._owner_allowed_tools``, and the arguments.  It performs no async
-        I/O and holds no locks, making it independently unit-testable.
+        This method is **pure** — it reads only the allow-lists, the two
+        policy flags (``_skip_owner_approval``, ``_human_approval``) and the
+        arguments.  It performs no async I/O and holds no locks, making it
+        independently unit-testable.
 
         ``action`` is one of:
           - ``"allow"``  — auto-approve without notifying the owner
@@ -200,6 +210,16 @@ class ClaudePermissionBroker(PermissionBroker):
         # Owner path — check auto-allow list first
         if all_params_match_any(self._owner_allowed_tools, tool_name, param_strings):
             return "allow", ""
+
+        # Owner + unlisted tool, and nobody is to be asked: deny with a reason
+        # the model can act on. Checked before the room lookup — the answer is
+        # the same with or without a room.
+        if not self._human_approval:
+            return "block", (
+                f"Tool '{tool_name}' needs human approval, and this agent runs with "
+                "permissions.enabled: false, so it is denied. Ask the operator to add "
+                "it to owner_allowed_tools, or to enable approval."
+            )
 
         # Owner + unlisted tool: need a room to post the approval request
         if not room_id:

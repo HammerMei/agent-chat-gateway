@@ -1017,6 +1017,19 @@ def _parse_one_agent(
             f"permissions.timeout ({agent_cfg.permissions.timeout}s). "
             f"Suggested: set timeout to at least {agent_cfg.permissions.timeout + 60}s."
         )
+    # The two settings contradict each other: enabled: false means every owner
+    # tool call outside the allow-list is denied without asking anyone, so
+    # there is no approval step for skip_owner_approval to skip. Rejecting the
+    # pair at load time is what keeps the intent legible (ADR-0002); silently
+    # picking one would hide a real misconfiguration.
+    if not agent_cfg.permissions.enabled and agent_cfg.permissions.skip_owner_approval:
+        raise ValueError(
+            f"Agent '{agent_name}': permissions.skip_owner_approval: true needs "
+            f"permissions.enabled: true. With enabled: false, every tool call that is "
+            f"not in the allow-list is denied without asking anyone, so there is no "
+            f"approval to skip. Set permissions.enabled: true (owners then run "
+            f"unprompted), or remove skip_owner_approval."
+        )
 
     return agent_cfg
 

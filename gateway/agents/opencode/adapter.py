@@ -381,6 +381,7 @@ class OpenCodeBackend(AgentBackend):
             guest_allowed_tools=self._broker_config.guest_allowed_tools,
             timeout_seconds=self._broker_config.timeout,
             skip_owner_approval=self._broker_config.skip_owner_approval,
+            human_approval=self._broker_config.human_approval,
         )
 
     def create_callable_broker(self, handler, timeout_seconds: int):
