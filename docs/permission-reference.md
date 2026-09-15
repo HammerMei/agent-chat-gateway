@@ -163,10 +163,12 @@ command: "echo hello && rm -rf /"
 # "rm -rf /" does NOT match "echo .*" → blocked
 ```
 
-**Opaque nodes (treated as single units):**
-- Command substitutions: `echo $(dangerous_cmd)` — the full substitution is treated opaque
-- Process substitutions: `<(sort file) >(wc -l)` — treated opaque
-- Config authors should be aware: `params: "echo .*"` permits `echo $(anything)`
+**Substitutions are recursed into (every nested command must match too):**
+- Command substitutions: `echo $(dangerous_cmd)` → sub-commands `["echo $(dangerous_cmd)", "dangerous_cmd"]`
+- Process substitutions: `diff <(sort a) <(sort b)` → `["diff <(sort a) <(sort b)", "sort a", "sort b"]`
+- Nesting is followed wherever it sits: quoted strings, `${var:-$(cmd)}`, `x=$(cmd) prog`, redirect targets, herestrings and unquoted heredoc bodies. A quoted heredoc (`<< 'EOF'`) is not expanded by bash and is not recursed into.
+- The parser misses a few forms bash still executes (a `$(…)` on an indented line of an unquoted heredoc, a backtick inside a heredoc body or inside `${x:-…}`). **An unparsed substitution is unknown code**: the text is returned as a sub-command *starting at the `$(` or backtick*, so a rule anchored on a command name can never match it and only an allow-everything rule approves it. Single-quoted strings, `$'…'`, comments and quoted heredoc bodies are literal and not scanned; `<(`/`>(` is not scanned because bash performs process substitution only as a bare word, which the parser already structures.
+- So `params: "echo .*"` permits `echo $(date)` only if `date` also matches a rule — `echo $(rm -rf /)` is denied because `rm -rf /` matches nothing. This is what OpenCode's own shell tool emits as well, so the Claude and OpenCode brokers agree.
 
 **Fallback (tree-sitter unavailable):**
 - If `tree-sitter` or `tree-sitter-bash` is not installed, the whole command is treated as one string
@@ -645,7 +647,7 @@ agents:
 
 - Compound commands split via tree-sitter AST
 - All sub-commands must match for auto-approval
-- Command substitutions treated as opaque (regex sees full text, not recursive evaluation)
+- Command and process substitutions are recursed into: the parent keeps the substitution text and every nested command is a sub-command of its own that must also match
 - If tree-sitter unavailable: whole command treated as one string (degrades safely, no bypass)
 
 ### Path Normalization
@@ -818,7 +820,6 @@ def matches_any_custom(rules, tool_name, param_string):
 | **Matcher** | Regex rule that determines if a tool call matches an allow-list |
 | **Normpath** | Path normalization via `os.path.normpath()` (collapses `..` components) |
 | **SSE** | Server-Sent Events (OpenCode's event transport) |
-| **Opaque node** | Bash subtree that is not recursed into (command substitutions, process substitutions) |
 
 ---
 

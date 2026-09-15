@@ -89,6 +89,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `skip_owner_approval: true` is corrected — it never was one.
 
 ### Fixed
+- **Bash allow rules now see the command inside a `$(…)` / backtick / `<(…)`
+  substitution** (#171). The Claude broker's command splitter treated
+  substitutions as opaque, so `coop fetch-history --room r $(rm -rf x)` was one
+  string that the built-in `coop fetch-history` rule matched — a guest got
+  arbitrary command execution under the gateway account, auto-approved, in every
+  `permissions` mode, since the initial release. Every command nested in a
+  substitution is now a sub-command of its own and must match a rule too, wherever
+  it sits (quoted string, `${v:-$(…)}`, `x=$(…) prog`, redirect target,
+  herestring, unquoted heredoc body). This is what OpenCode's shell tool already
+  emits, so the two brokers agree. Where the parser leaves a substitution as
+  plain text (an indented heredoc line, a backtick inside `${x:-…}`) the text
+  from the `$(` or backtick onward is returned as its own sub-command, so no
+  command-anchored rule can approve it. Owners: `coop send … $(date …)` still passes
+  through the built-in `date` rule; any other substitution inside an allow-listed
+  command is no longer auto-approved unless the nested command has a rule of its
+  own. Redirect targets themselves are still not matched — #173.
 - **OpenCode file edits and web access now go through the permission broker;
   they never did** (found while verifying #165 live on 1.18.13). The
   role-enforcement plugin was believed to gate owner `write`/`edit`/`multiedit`

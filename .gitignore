@@ -29,3 +29,7 @@ docker_env/
 
 # Local E2E diagnostics (make e2e-dump) — same set CI uploads as an artifact
 e2e-logs/
+
+# editor swap files
+*.swp
+*.swo

@@ -17,8 +17,10 @@ per AST node.  All patterns must match for auto-approve.
 Security notes:
   - Bash: compound commands (e.g. "echo hi && rm -rf /") are split by tree-sitter
     into individual sub-commands; ALL sub-commands must satisfy the params regex.
-    Command substitutions ($(...) / backticks) are treated as opaque — the regex
-    sees the full substitution text, not the nested command.
+    Command substitutions ($(...) / backticks) and process substitutions
+    (<(...) / >(...)) are recursed into: the nested command is returned as its
+    own sub-command and must match a rule too, so "coop fetch-history $(rm -rf x)"
+    needs both "coop fetch-history $(rm -rf x)" and "rm -rf x" to be allowed.
   - File paths: os.path.normpath() is applied before matching to prevent
     path-traversal bypasses ("/project/../../../etc/passwd").
   - WebFetch: avoid ".*" as params — it allows fetching internal network addresses
@@ -82,10 +84,65 @@ def _get_bash_parser():
         return None
 
 
-_OPAQUE_NODE_TYPES: frozenset[str] = frozenset({
-    "command_substitution",
-    "process_substitution",
+# Text that opens a substitution bash will execute.  The AST is not a complete
+# oracle for these: with tree-sitter-bash 0.25.1 a ``$(...)`` on an indented
+# heredoc line, any backtick in a heredoc body, or a backtick inside a
+# ``${x:-...}`` / ``${x#...}`` expansion, comes back as a plain
+# ``heredoc_body`` / ``word`` / ``regex`` leaf with no
+# ``command_substitution`` child, while bash runs it.
+#
+# The rule for such a leaf: **an unparsed substitution is unknown code, and is
+# returned as a sub-command starting at its opener.**  Nothing before the opener
+# is included, so a rule anchored on a command name (every built-in rule, and
+# every sensible user rule) can never match it; only an allow-everything rule
+# does.  Returning the whole leaf instead would let ``coop fetch-history `rm x```
+# on a heredoc line satisfy the ``coop fetch-history`` rule.
+#
+# Process substitution (``<(...)`` / ``>(...)``) is not a marker: bash performs
+# it only as a bare word, which the parser does structure, and not inside
+# double quotes, heredoc bodies or ``${x:-...}`` (checked against bash).
+_SUBSTITUTION_MARKERS: tuple[str, ...] = ("$(", "`")
+
+
+def _unparsed_substitution(text: str) -> str | None:
+    r"""Return ``text`` from its first unescaped substitution opener, or None.
+
+    A backslash-escaped ``\``` or ``\$`` is literal in a word, a double-quoted
+    string and an unquoted heredoc body alike, so ``\x`` pairs are skipped.
+    """
+    i = 0
+    while i < len(text):
+        if text[i] == "\\":
+            i += 2
+            continue
+        for marker in _SUBSTITUTION_MARKERS:
+            if text.startswith(marker, i):
+                return text[i:]
+        i += 1
+    return None
+
+# Leaves bash never expands, so a marker inside them is literal text.  A quoted
+# heredoc body is the other case and is handled where the heredoc is walked.
+_NEVER_EXPANDED_LEAVES: frozenset[str] = frozenset({
+    "raw_string",     # '...'
+    "ansi_c_string",  # $'...'
+    "comment",
 })
+
+
+def _heredoc_is_quoted(heredoc_redirect, src: bytes) -> bool:
+    """True when bash will not expand the heredoc body.
+
+    bash treats the body as quoted if *any part* of the delimiter is quoted:
+    ``<< 'EOF'``, ``<< "EOF"``, ``<< \\EOF``, but also ``<< E"OF"``, ``<< E\\OF``
+    and ``<< $'EOF'``.  So any quote or backslash anywhere in the delimiter
+    counts, not only a leading one.
+    """
+    for child in heredoc_redirect.children:
+        if child.type == "heredoc_start":
+            start = src[child.start_byte:child.end_byte].decode()
+            return any(ch in start for ch in ("'", '"', "\\"))
+    return False
 
 
 def extract_bash_subcommands(command: str) -> list[str]:
@@ -96,9 +153,23 @@ def extract_bash_subcommands(command: str) -> list[str]:
     caller can require ALL of them to satisfy the allow rule.
 
     Command substitutions (``$(...)`` / backticks) and process substitutions
-    (``<(...)`` / ``>(...)`` ) are treated as **opaque** — they appear as part
-    of their parent command's text but are not recursed into.  This is the same
-    behavior as OpenCode.
+    (``<(...)`` / ``>(...)``) are **recursed into**: the parent command is
+    returned with the substitution text still in place, and every ``command``
+    nested inside the substitution is returned as well, wherever it sits — a
+    bare word, a quoted string, a ``${var:-$(...)}`` expansion, a variable
+    assignment prefix, a redirect target, a herestring or an unquoted heredoc
+    body.  Requiring all of them to match is what stops ``$(rm -rf x)`` riding
+    through a ``.*`` rule on the parent.  OpenCode's shell tool does the same
+    (``descendantsOfType("command")``), so both brokers see the same list.
+
+    The parser misses some substitutions bash executes (an indented line in an
+    unquoted heredoc body; a backtick inside a ``${x:-...}`` expansion — see
+    ``_SUBSTITUTION_MARKERS``).  Any named leaf that still contains an
+    unescaped ``$(`` or backtick, and is not one bash never expands
+    (single-quoted string, ``$'...'``, comment, quoted heredoc body), is
+    returned as a sub-command **starting at that opener**: an unparsed
+    substitution is unknown code, and cutting off everything before the opener
+    is what stops a rule anchored on a command name from ever matching it.
 
     Heredoc redirections (``cmd << 'EOF' ... EOF``): the full
     ``redirected_statement`` text is returned as a single string so that
@@ -119,11 +190,46 @@ def extract_bash_subcommands(command: str) -> list[str]:
     tree = parser.parse(src)
     commands: list[str] = []
 
+    def descend(node) -> None:
+        for child in node.children:
+            walk(child)
+
+    def arithmetic(node) -> None:
+        # Never append a ``command`` from inside an arithmetic expansion; do
+        # walk every substitution node and scan every leaf found under it.
+        for child in node.children:
+            if child.type in ("command_substitution", "process_substitution") or child.child_count == 0:
+                walk(child)
+            else:
+                arithmetic(child)
+
     def walk(node) -> None:
-        if node.type in _OPAQUE_NODE_TYPES:
+        if node.child_count == 0:
+            if node.is_named and node.type not in _NEVER_EXPANDED_LEAVES:
+                text = src[node.start_byte:node.end_byte].decode()
+                unparsed = _unparsed_substitution(text)
+                if unparsed is not None:
+                    # A substitution the parser did not turn into a node (see
+                    # ``_SUBSTITUTION_MARKERS``): unknown code, returned from its
+                    # opener so no command-anchored rule can approve it.
+                    commands.append(unparsed)
+            return
+        if node.type == "command_substitution" and src.startswith(b"$((", node.start_byte):
+            # Arithmetic expansion.  In a heredoc body the parser mis-reads
+            # ``$((1+2))`` as a command substitution of a subshell running
+            # ``1+2``.  bash evaluates it as arithmetic — an invalid expression
+            # is an error and no substitution occurs (bash manual, "Arithmetic
+            # Expansion") — so the inner ``command`` is not a command.  Real
+            # substitutions nested in the expression (``$((1+$(id)))``) are
+            # still nodes below it and are still collected.
+            arithmetic(node)
             return
         if node.type == "command":
             commands.append(src[node.start_byte:node.end_byte].decode())
+            # A substitution nested in this command's words, strings, assignments
+            # or herestring is a ``command_substitution`` / ``process_substitution``
+            # child; the ``command`` nodes inside it are collected by the descent.
+            descend(node)
             return
         if node.type == "redirected_statement":
             # When a command uses a heredoc redirect (e.g. ``python3 << 'EOF'``),
@@ -141,9 +247,23 @@ def extract_bash_subcommands(command: str) -> list[str]:
             )
             if has_heredoc:
                 commands.append(src[node.start_byte:node.end_byte].decode())
+                # The ``command`` child is already covered by the full text;
+                # descend into it (not ``walk`` it, which would append the bare
+                # command a second time) and walk the redirects so substitutions
+                # in an unquoted heredoc body are collected too.  tree-sitter
+                # emits no substitution nodes inside a quoted heredoc
+                # (``<< 'EOF'``), matching bash, which does not expand them.
+                for child in node.children:
+                    if child.type == "command":
+                        descend(child)
+                    elif child.type == "heredoc_redirect" and _heredoc_is_quoted(child, src):
+                        # A quoted delimiter (``'EOF'``, ``E"OF"``, ``\EOF``, …): bash
+                        # does not expand the body, so a ``$(`` in it is text.
+                        continue
+                    else:
+                        walk(child)
                 return
-        for child in node.children:
-            walk(child)
+        descend(node)
 
     walk(tree.root_node)
     return commands or [command]  # fallback: treat whole string as one command
