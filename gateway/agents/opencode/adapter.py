@@ -137,48 +137,75 @@ _CONFIG_PROBE_TIMEOUT = 10.0  # seconds
 # _ensure_live_runtime() fast-fails instead of blocking callers for ~30s each.
 _MAX_RESTART_FAILURES = 3
 
-# ── OpenCode bash permission injection ───────────────────────────────────────
+# ── OpenCode permission injection ────────────────────────────────────────────
 #
-# OpenCode's default permission ruleset uses ``"*": "allow"`` which means ALL
-# bash commands run without emitting a ``permission.asked`` SSE event.  This
-# completely bypasses AgentCoop's permission broker, so guest and owner tool
-# restrictions defined in ``guest_allowed_tools`` / ``owner_allowed_tools``
-# have no effect for bash in the default configuration.
+# OpenCode's default permission ruleset is ``"*": "allow"``: bash, edits,
+# web fetches and searches all run without emitting a ``permission.asked`` SSE
+# event, which bypasses AgentCoop's permission broker — ``owner_allowed_tools``
+# / ``guest_allowed_tools`` would have no effect on them.
 #
-# Fix: inject ``bash["*"] = "ask"`` via OPENCODE_CONFIG_CONTENT so OpenCode
-# emits ``permission.asked`` for every bash command, letting AgentCoop enforce its
-# own allow-lists and approval flow.  A short set of read-only patterns is
-# pre-approved so common safe operations do not require manual approval.
+# Fix: inject ``"ask"`` for those permissions via OPENCODE_CONFIG_CONTENT so
+# opencode emits ``permission.asked`` and the broker decides (allow-list, a
+# human, or a denial). This ruleset is the gate; the role-enforcement plugin's
+# owner path is not — see ``_OPENCODE_GATED_PERMISSIONS``.
 #
 # See ``_build_safe_opencode_config()`` for the full merge logic.
 
-_DEFAULT_BASH_ALLOW_PATTERNS: list[str] = [
-    "git log *",
-    "git diff *",
-    "git status *",
-    "git show *",
-    "coop send *",
-]
-
+# opencode permission keys the gateway forces to "ask" (unless the user set a
+# value). ``edit`` is what the write, edit and multiedit tools ask under —
+# verified on 1.18.13 by reading the binary and by a live run: with the default
+# ``edit: allow`` a write completed with no ``permission.asked`` at all, and the
+# role-enforcement plugin's ``output.status = "ask"`` changed nothing, because
+# opencode's ``tool.execute.before`` trigger discards the hook's output. So the
+# plugin never gated owner writes on this version; this ruleset does. Read-only
+# and in-directory permissions (``read``, ``glob``, ``grep``, ``list``) are left
+# at opencode's defaults — see ADR-0002 for the asymmetry with Claude.
+_OPENCODE_GATED_PERMISSIONS: tuple[str, ...] = ("edit", "webfetch", "websearch")
 
 def _build_safe_opencode_config(sidecar_env: dict[str, str]) -> str | None:
-    """Return a safe ``OPENCODE_CONFIG_CONTENT`` value with bash permission defaults.
+    """Return a safe ``OPENCODE_CONFIG_CONTENT`` value with permission defaults.
 
-    OpenCode's default bash permission is ``"allow"`` (all bash commands run
-    without asking), which bypasses AgentCoop's permission broker entirely.  This
-    function ensures ``bash["*"] = "ask"`` is always present so that AgentCoop can
-    intercept bash tool calls and enforce its own ``owner_allowed_tools`` /
-    ``guest_allowed_tools`` rules.
+    OpenCode's default is ``"allow"`` for every permission, which bypasses
+    AgentCoop's permission broker entirely. This function makes sure the
+    permissions the gateway gates emit ``permission.asked`` so the broker can
+    apply ``owner_allowed_tools`` / ``guest_allowed_tools`` and either ask a
+    human or deny (ADR-0002):
+
+    - ``bash["*"] = "ask"`` — every bash command, as a nested ruleset so the
+      user's own bash patterns in this value can still be more specific;
+    - ``edit`` / ``webfetch`` / ``websearch`` ``= "ask"`` — the write, edit
+      and multiedit tools all ask under ``edit``; the two web tools reach the
+      network. See :data:`_OPENCODE_GATED_PERMISSIONS`.
+
+    The broker always runs, so an ``ask`` is always answered — the value is
+    ``"ask"`` in every mode. A user value for any of these keys is respected
+    and not overwritten.
+
+    The bash ruleset is the catch-all plus the user's own patterns and nothing
+    else. The gateway used to add "read-only" allow patterns here (``git
+    log/diff/status/show *``, ``coop send *``); a trailing catch-all silenced
+    them, and making them effective would have let a guest run ``coop send`` —
+    the sidecar runs as ``COOP_ROLE=owner`` for every chatter, and an allow
+    opencode applies itself never reaches the broker — and let any of the git
+    commands overwrite a file via ``--output=<path>``. They are gone; ``coop
+    send`` is allowed by the broker's built-in owner rule instead.
 
     Merge rules
     -----------
     1. ``OPENCODE_CONFIG_CONTENT`` contains invalid JSON
        → raise ``ValueError`` — never silently drop the user's config.
-    2. ``bash["*"]`` is already set (e.g. user explicitly chose ``"allow"`` or
-       ``"ask"``) → return ``None`` (respect the user's explicit choice).
-    3. ``bash["*"]`` is not set → append ``_DEFAULT_BASH_ALLOW_PATTERNS`` for
-       known-safe read-only commands, then add ``"*": "ask"`` as the catch-all.
-       Existing user-defined bash patterns are preserved unchanged.
+    2. Each gated permission the user has not set → ``"ask"``. For bash that
+       means ``bash["*"]``: a user ``"*"`` is respected (e.g. an explicit
+       ``"allow"`` or ``"ask"``); otherwise the catch-all is emitted first, then
+       the user's own bash patterns unchanged.
+    3. Nothing to add → return ``None``.
+
+    Ordering is only guaranteed *within this value*. opencode merges a project
+    or global ``opencode.json`` first and this environment value after it, so
+    a bash pattern from ``opencode.json`` lands *before* the catch-all and is
+    still overridden by it (verified on 1.18.13: ``GET /config`` returns the
+    file's pattern, then ``"*"``). Under the gateway, bash policy is the
+    broker's allow-lists; ``opencode.json`` bash patterns do not take part.
 
     Args:
         sidecar_env: The environment dict that will be passed to the sidecar
@@ -205,21 +232,26 @@ def _build_safe_opencode_config(sidecar_env: dict[str, str]) -> str | None:
         config = {}
 
     perms: dict = config.setdefault("permission", {})
-    bash: dict = perms.setdefault("bash", {})
+    changed = False
 
-    # User explicitly set a "*" catch-all — respect their decision, no injection.
-    if "*" in bash:
-        return None
+    for key in _OPENCODE_GATED_PERMISSIONS:
+        if key not in perms:
+            perms[key] = "ask"
+            changed = True
 
-    # Append default allow patterns only if not already configured by the user.
-    for pattern in _DEFAULT_BASH_ALLOW_PATTERNS:
-        if pattern not in bash:
-            bash[pattern] = "allow"
+    bash = perms.get("bash", {})
+    # A user "*" catch-all on bash is their decision — no bash injection. A
+    # string shorthand (``"bash": "allow"``) is a catch-all too.
+    if isinstance(bash, dict) and "*" not in bash:
+        # Order is the rule: opencode evaluates bash patterns with the LAST
+        # match winning, so the catch-all must come FIRST or it overrides every
+        # pattern after it (verified against 1.18.13: {"git status *": "allow",
+        # "*": "deny"} denies git status; the reverse order runs it). Then the
+        # user's own patterns from this same value, which are the most specific.
+        perms["bash"] = {"*": "ask", **bash}
+        changed = True
 
-    # Always add the "*": "ask" catch-all so unlisted commands route through AgentCoop.
-    bash["*"] = "ask"
-
-    return json.dumps(config)
+    return json.dumps(config) if changed else None
 
 
 def _classify_http_error(status_code: int, message: str) -> AgentExecutionError:
@@ -271,9 +303,9 @@ class OpenCodeBackend(AgentBackend):
                 Guest enforcement is handled by the PermissionBroker at the
                 per-request level, not via process environment.
                 ``OPENCODE_CONFIG_CONTENT`` in this dict is merged with AgentCoop's
-                safe bash permission defaults (``bash["*"] = "ask"``) unless
-                the user has already set a ``"*"`` catch-all.  Raises
-                ``ValueError`` if the value is malformed JSON.
+                safe permission defaults (``bash["*"]``, ``edit``, ``webfetch``,
+                ``websearch`` = ``"ask"``) wherever the user has not set a value.
+                Raises ``ValueError`` if the value is malformed JSON.
             sidecar_cwd: Working directory for the ``opencode serve`` process.
                 ``None`` inherits the gateway's cwd. Set this to the project root
                 so opencode picks up that project's own ``.opencode/`` config.
@@ -293,10 +325,13 @@ class OpenCodeBackend(AgentBackend):
         # Raises ValueError on malformed OPENCODE_CONFIG_CONTENT so the caller
         # gets a clear error rather than silently losing their config.
         _env: dict[str, str] = sidecar_env or {}
+        # Not gated on `broker_config`: the AgentSession/TUI path attaches an
+        # OpenCodeCallablePermissionBroker after start() with no broker_config,
+        # and its handler must still be asked.
         _safe_config = _build_safe_opencode_config(_env)
         if _safe_config is not None:
             _env = {**_env, "OPENCODE_CONFIG_CONTENT": _safe_config}
-            logger.info("Injected safe bash permission defaults via OPENCODE_CONFIG_CONTENT")
+            logger.info("Injected safe permission defaults via OPENCODE_CONFIG_CONTENT")
         # The role-enforcement plugin rides in the same variable, as a file://
         # entry pointing at the copy shipped in this package — unconditionally,
         # unlike the bash defaults above, which yield to a user "*" catch-all.
@@ -783,9 +818,11 @@ class OpenCodeBackend(AgentBackend):
         An entry whose file is gone is opencode's stale ``opencode.json`` line,
         which it ignores; so do we.
 
-        The plugin is injected whether or not a permission broker runs; with
-        ``permissions.enabled: false`` it still marks owner write tools ``ask``
-        and nothing answers (#165, pre-existing — the bash defaults do the same).
+        The plugin is injected unconditionally; it still enforces the guest
+        allow-list for a ``COOP_ROLE=guest`` process. Its owner path (marking a
+        tool ``ask``) is inert on opencode 1.18.13 — the injected permission
+        ruleset is what makes owner tools ask, and the gateway's broker always
+        answers (ADR-0002).
         """
         params = {"directory": self._sidecar_cwd} if self._sidecar_cwd else None
         async with httpx.AsyncClient(timeout=_CONFIG_PROBE_TIMEOUT) as client:

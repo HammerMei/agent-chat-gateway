@@ -9,11 +9,16 @@
  * Supports * wildcard suffix (e.g. "mcp__rocketchat__*").
  * If COOP_ALLOWED_TOOLS is empty, all tools are blocked for guests.
  *
- * For owner sessions, sensitive write/exec tools require human-in-the-loop
- * approval via the RC chat gateway.  COOP_APPROVAL_TOOLS lists the tool
- * patterns that trigger the opencode built-in permission.ask flow.
- * The gateway's OpenCodePermissionBroker listens for the resulting
- * permission.asked SSE event and posts an approval request to RC chat.
+ * For owner sessions this hook sets output.status = "ask" on write/exec
+ * tools (COOP_APPROVAL_TOOLS overrides the list). On opencode 1.18.13 that
+ * is INERT: the tool.execute.before trigger discards the hook's output, so
+ * the assignment gates nothing (verified live — a write completed with no
+ * permission.asked). Owner tools reach the gateway's broker through the
+ * permission ruleset the adapter injects (bash / edit / webfetch /
+ * websearch → "ask"), and the broker always answers: approve (allow-list),
+ * ask a human, or reject when permissions.enabled is false (#165,
+ * ADR-0002). The owner branch is kept for a future opencode that honours
+ * the output; do not rely on it.
  */
 
 /** Tools that require owner approval when running via the RC gateway. */
@@ -64,9 +69,10 @@ export default function () {
       )
 
       if (needsApproval) {
-        // Setting output.status = "ask" triggers opencode's built-in
-        // permission.asked SSE event, which the OpenCodePermissionBroker
-        // listens to and forwards as an RC approval request.
+        // Intended to trigger opencode's built-in permission.asked flow.
+        // opencode 1.18.13 discards this hook's output, so it does nothing
+        // there (see the header); the adapter's injected permission ruleset
+        // is what makes these tools ask. Kept for a version that honours it.
         (output as { status?: string }).status = "ask"
       }
     },
