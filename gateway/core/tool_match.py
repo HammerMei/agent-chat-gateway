@@ -17,8 +17,10 @@ per AST node.  All patterns must match for auto-approve.
 Security notes:
   - Bash: compound commands (e.g. "echo hi && rm -rf /") are split by tree-sitter
     into individual sub-commands; ALL sub-commands must satisfy the params regex.
-    Command substitutions ($(...) / backticks) are treated as opaque — the regex
-    sees the full substitution text, not the nested command.
+    Command substitutions ($(...) / backticks) and process substitutions
+    (<(...) / >(...)) are recursed into: the nested command is returned as its
+    own sub-command and must match a rule too, so "coop fetch-history $(rm -rf x)"
+    needs both "coop fetch-history $(rm -rf x)" and "rm -rf x" to be allowed.
   - File paths: os.path.normpath() is applied before matching to prevent
     path-traversal bypasses ("/project/../../../etc/passwd").
   - WebFetch: avoid ".*" as params — it allows fetching internal network addresses
@@ -82,12 +84,6 @@ def _get_bash_parser():
         return None
 
 
-_OPAQUE_NODE_TYPES: frozenset[str] = frozenset({
-    "command_substitution",
-    "process_substitution",
-})
-
-
 def extract_bash_subcommands(command: str) -> list[str]:
     """Split a compound bash command string into individual sub-command strings.
 
@@ -96,9 +92,14 @@ def extract_bash_subcommands(command: str) -> list[str]:
     caller can require ALL of them to satisfy the allow rule.
 
     Command substitutions (``$(...)`` / backticks) and process substitutions
-    (``<(...)`` / ``>(...)`` ) are treated as **opaque** — they appear as part
-    of their parent command's text but are not recursed into.  This is the same
-    behavior as OpenCode.
+    (``<(...)`` / ``>(...)``) are **recursed into**: the parent command is
+    returned with the substitution text still in place, and every ``command``
+    nested inside the substitution is returned as well, wherever it sits — a
+    bare word, a quoted string, a ``${var:-$(...)}`` expansion, a variable
+    assignment prefix, a redirect target, a herestring or an unquoted heredoc
+    body.  Requiring all of them to match is what stops ``$(rm -rf x)`` riding
+    through a ``.*`` rule on the parent.  OpenCode's shell tool does the same
+    (``descendantsOfType("command")``), so both brokers see the same list.
 
     Heredoc redirections (``cmd << 'EOF' ... EOF``): the full
     ``redirected_statement`` text is returned as a single string so that
@@ -119,11 +120,17 @@ def extract_bash_subcommands(command: str) -> list[str]:
     tree = parser.parse(src)
     commands: list[str] = []
 
+    def descend(node) -> None:
+        for child in node.children:
+            walk(child)
+
     def walk(node) -> None:
-        if node.type in _OPAQUE_NODE_TYPES:
-            return
         if node.type == "command":
             commands.append(src[node.start_byte:node.end_byte].decode())
+            # A substitution nested in this command's words, strings, assignments
+            # or herestring is a ``command_substitution`` / ``process_substitution``
+            # child; the ``command`` nodes inside it are collected by the descent.
+            descend(node)
             return
         if node.type == "redirected_statement":
             # When a command uses a heredoc redirect (e.g. ``python3 << 'EOF'``),
@@ -141,9 +148,19 @@ def extract_bash_subcommands(command: str) -> list[str]:
             )
             if has_heredoc:
                 commands.append(src[node.start_byte:node.end_byte].decode())
+                # The ``command`` child is already covered by the full text;
+                # descend into it (not ``walk`` it, which would append the bare
+                # command a second time) and walk the redirects so substitutions
+                # in an unquoted heredoc body are collected too.  tree-sitter
+                # emits no substitution nodes inside a quoted heredoc
+                # (``<< 'EOF'``), matching bash, which does not expand them.
+                for child in node.children:
+                    if child.type == "command":
+                        descend(child)
+                    else:
+                        walk(child)
                 return
-        for child in node.children:
-            walk(child)
+        descend(node)
 
     walk(tree.root_node)
     return commands or [command]  # fallback: treat whole string as one command

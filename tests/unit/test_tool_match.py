@@ -3,7 +3,8 @@
 Covers:
   - _normalize_path: path traversal prevention, relative paths, absolute paths
   - matches_rule: tool name regex, params regex, case insensitivity, params=None
-  - extract_bash_subcommands: compound commands, heredoc redirects, file redirects
+  - extract_bash_subcommands: compound commands, heredoc redirects, file redirects,
+    command / process substitutions (recursed into, nested commands must match too)
   - get_param_strings_for_claude: Bash, file tools, WebFetch, unknown tools
   - get_param_strings_for_opencode: patterns list, empty patterns fallback
   - all_params_match_any: all-match semantics, partial match fails, empty allow-list
@@ -14,6 +15,7 @@ from __future__ import annotations
 import unittest
 
 from gateway.config import ToolRule
+from gateway.core.config import AgentConfig
 from gateway.core.tool_match import (
     _normalize_path,
     all_params_match_any,
@@ -214,6 +216,101 @@ class TestExtractBashSubcommands(unittest.TestCase):
         result = extract_bash_subcommands(cmd)
         self.assertEqual(len(result), 1)
         self.assertIn("example.com", result[0])
+
+
+# ── substitutions are recursed into (#171) ───────────────────────────────────
+
+
+class TestExtractBashSubcommandsSubstitutions(unittest.TestCase):
+    """A command nested in a substitution is a sub-command of its own.
+
+    Before #171 substitutions were opaque: ``coop fetch-history --room r $(rm -rf
+    /tmp/x)`` came back as one string, which the built-in fetch-history guest rule (it ends
+    in ``.*``) matched, and the nested ``rm`` ran for a guest.  Every case here
+    asserts the nested command is present so a rule set has to allow it explicitly.
+    """
+
+    FETCH = "coop fetch-history --room r"
+
+    def test_dollar_paren_substitution_yields_nested_command(self):
+        result = extract_bash_subcommands(f"{self.FETCH} $(rm -rf /tmp/x)")
+        self.assertEqual(result, [f"{self.FETCH} $(rm -rf /tmp/x)", "rm -rf /tmp/x"])
+
+    def test_substitution_inside_double_quotes(self):
+        result = extract_bash_subcommands('coop fetch-history --room "$(rm -rf /tmp/x)"')
+        self.assertIn("rm -rf /tmp/x", result)
+
+    def test_backtick_substitution(self):
+        result = extract_bash_subcommands(f"{self.FETCH} `id`")
+        self.assertEqual(result, [f"{self.FETCH} `id`", "id"])
+
+    def test_process_substitution(self):
+        result = extract_bash_subcommands("diff <(sort a) <(sort b)")
+        self.assertEqual(result, ["diff <(sort a) <(sort b)", "sort a", "sort b"])
+
+    def test_substitution_inside_parameter_expansion(self):
+        result = extract_bash_subcommands("coop fetch-history --room ${X:-$(id)}")
+        self.assertIn("id", result)
+
+    def test_substitution_in_variable_assignment_prefix(self):
+        result = extract_bash_subcommands(f"x=$(id) {self.FETCH}")
+        self.assertIn("id", result)
+
+    def test_substitution_in_redirect_target(self):
+        """The redirect target itself is still dropped (#173); the command inside it is not."""
+        result = extract_bash_subcommands(f"{self.FETCH} > $(id)")
+        self.assertEqual(result, [self.FETCH, "id"])
+
+    def test_substitution_in_herestring(self):
+        result = extract_bash_subcommands(f'{self.FETCH} <<< "$(id)"')
+        self.assertEqual(result, [f'{self.FETCH} <<< "$(id)"', "id"])
+
+    def test_substitution_in_unquoted_heredoc_body(self):
+        cmd = f"{self.FETCH} << EOF\n$(id)\nEOF"
+        result = extract_bash_subcommands(cmd)
+        self.assertEqual(result, [cmd, "id"])
+
+    def test_quoted_heredoc_body_is_not_expanded(self):
+        """bash does not expand ``$(…)`` inside ``<< 'EOF'``; neither does the splitter."""
+        cmd = f"{self.FETCH} << 'EOF'\n$(id)\nEOF"
+        self.assertEqual(extract_bash_subcommands(cmd), [cmd])
+
+    def test_heredoc_command_is_not_duplicated_as_bare_command(self):
+        """The heredoc statement is one string; ``python3`` alone must not also appear."""
+        cmd = "python3 << 'EOF'\nprint(1)\nEOF"
+        self.assertEqual(extract_bash_subcommands(cmd), [cmd])
+
+    def test_nested_substitution_two_levels(self):
+        result = extract_bash_subcommands("echo $(echo $(id))")
+        self.assertEqual(result, ["echo $(echo $(id))", "echo $(id)", "id"])
+
+    def test_substitution_in_for_loop_list(self):
+        result = extract_bash_subcommands("for f in $(ls); do echo $f; done")
+        self.assertEqual(result, ["ls", "echo $f"])
+
+    # ── the rules the issue was about ────────────────────────────────────────
+
+    def test_guest_fetch_history_rule_denies_substituted_command(self):
+        """#171: the built-in guest rule must not approve ``$(rm …)`` riding on fetch-history."""
+        guest_rules = AgentConfig().effective_guest_allowed_tools()
+        params = extract_bash_subcommands(f"{self.FETCH} $(rm -rf /tmp/x)")
+        self.assertFalse(all_params_match_any(guest_rules, "Bash", params))
+        # The un-substituted command still passes, so the rule is not simply dead.
+        self.assertTrue(
+            all_params_match_any(guest_rules, "Bash", extract_bash_subcommands(self.FETCH))
+        )
+
+    def test_owner_send_with_date_substitution_still_passes(self):
+        """The owner ``date`` rule covers the nested ``date``; ``coop send … $(date)`` stays approved."""
+        owner_rules = AgentConfig().effective_owner_allowed_tools()
+        params = extract_bash_subcommands('coop send --room r "now: $(date +%s)"')
+        self.assertEqual(params, ['coop send --room r "now: $(date +%s)"', "date +%s"])
+        self.assertTrue(all_params_match_any(owner_rules, "Bash", params))
+
+    def test_owner_send_with_non_date_substitution_is_not_auto_approved(self):
+        owner_rules = AgentConfig().effective_owner_allowed_tools()
+        params = extract_bash_subcommands("coop send --room r $(cat /etc/passwd)")
+        self.assertFalse(all_params_match_any(owner_rules, "Bash", params))
 
 
 # ── get_param_strings_for_claude ─────────────────────────────────────────────
