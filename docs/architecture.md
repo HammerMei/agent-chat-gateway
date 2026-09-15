@@ -37,7 +37,7 @@ AgentCoop was previously known as agent-chat-gateway, or ACG.
 - **Multi-agent support** — Different rooms can use different agent backends
 - **Stateful** — Agent sessions and watcher state persist to `~/.agentcoop/state.<connector>.json`
 - **Graceful shutdown** — Drains queues with 30-second grace period before terminating agent subprocesses
-- **Security by design** — Roles resolved by connector (never from message content), permission broker is fail-closed (no broker = no watcher start)
+- **Security by design** — Roles resolved by connector (never from message content); every agent has a permission broker and it is fail-closed (no broker = no watcher start)
 
 ---
 
@@ -428,7 +428,10 @@ When the agent attempts a sensitive tool call (Bash, Write, Edit, etc.), the per
 - **Guests + tool NOT in allow-list** → deny immediately (no owner notification—guest doesn't know the tool exists)
 - **Owners + skip_owner_approval** → allow immediately (sandbox mode)
 - **Owners + tool in owner_allowed_tools** → allow immediately
-- **All others** → post notification, await owner approval
+- **All others, `permissions.enabled: true`** → post notification, await owner approval
+- **All others, `permissions.enabled: false`** → deny immediately (with a reason on Claude; opencode's generic rejection on OpenCode)
+
+The broker runs for every agent; `permissions.enabled` only chooses between the last two rows (ADR-0002). The backend's own permission engine is not part of the chain — on Claude every `claude -p` runs with `--dangerously-skip-permissions` and the hook, so the gateway is the only gate.
 
 ### Layer 4: Tool Parameter Matching (tool_match.py)
 
@@ -442,13 +445,15 @@ Optional fine-grained tool validation using:
 
 ## Permission Workflow
 
-When a tool call requires approval:
+When a tool call requires approval (`permissions.enabled: true`; with `false` the
+`_decide()` step ends in a deny and nothing below it happens):
 
 ```
 Agent attempts sensitive tool call
 ├─ PermissionBroker._decide()
 │  ├─ Check guest_allowed_tools (auto-allow or auto-deny)
-│  └─ Check owner_allowed_tools (auto-allow or request)
+│  ├─ Check owner_allowed_tools (auto-allow or fall through)
+│  └─ permissions.enabled? (false → deny now; true → request)
 │
 ├─ request_permission()
 │  ├─ Generate 4-char collision-free ID: `a3k9`
@@ -515,12 +520,12 @@ claude -p \
   --resume <session-id> \
   --output-format stream-json \
   --verbose \
-  [--settings <path>]  # injected when permissions enabled
+  --dangerously-skip-permissions --settings <path>  # always, under the gateway
 ```
 
 Streams one JSON object per line; extracts text from content blocks and metadata (tokens, cost, duration).
 
-**Permission handling:** When permissions enabled, a temporary `settings.json` file is generated with an HTTP hook URL and passed via `--settings`. Claude CLI calls the hook before executing sensitive tools.
+**Permission handling:** The broker generates a temporary `settings.json` with an HTTP PreToolUse hook (matcher `.*`) and the backend passes it via `--settings` together with `--dangerously-skip-permissions`, so Claude's own permission engine is bypassed and every tool call — read-only ones included — is decided by the gateway's broker. This is unconditional: with `permissions.enabled: false` the broker denies what it would otherwise have put to a human (ADR-0002). Only the AgentSession/TUI path, which constructs the backend without a broker config, runs without these flags until its callable broker attaches.
 
 **Environment isolation:** Strips `CLAUDECODE` from subprocess environment; injects `COOP_ROLE` and `COOP_ALLOWED_TOOLS` for per-message RBAC.
 
@@ -538,9 +543,9 @@ opencode run --format json <new_session_args>
 opencode run -s <session-id> --format json [-f <file> ...]
 ```
 
-**Permission handling:** Uses opencode's native `permission.asked` SSE events triggered by the `role-enforcement.ts` plugin. The plugin sets `output.status = "ask"` on sensitive tool calls, firing the SSE event.
+**Permission handling:** Uses opencode's native `permission.asked` SSE events. They fire because the adapter injects `"ask"` for `bash`, `edit`, `webfetch` and `websearch` into opencode's permission ruleset via `OPENCODE_CONFIG_CONTENT` (see *Plugin delivery* below for why the `role-enforcement.ts` plugin's own `ask` does not).
 
-**Plugin delivery:** the sidecar receives `role-enforcement.ts` as a `file://` entry in the `plugin` array of `OPENCODE_CONFIG_CONTENT` — the same variable the adapter uses for its bash permission defaults — pointing at the copy shipped in `gateway/agents/opencode/hooks/`. Nothing is copied to disk, so the plugin is the one this gateway's code was written against by construction, and the user's own `opencode` sessions are untouched. The entry is injected unconditionally (the bash defaults yield to a user `"*"` catch-all; the plugin does not). Unconditional also means not gated on the permission broker: with `permissions.enabled: false` (the default) the sidecar still runs as `COOP_ROLE=owner`, so the plugin marks owner write tools `ask` and nothing answers — pre-existing, shared with the bash defaults, tracked in #165. Two checks guard it, both in `_start_inner()` so the self-heal restart gets them too: the shipped file must exist before spawning, and after the health check `GET /config` on the sidecar must list the exact injected spec in its merged `plugin` array — otherwise the sidecar is killed and the start fails, because opencode itself says nothing about a plugin it dropped. The second check proves opencode *accepted* the entry, not that the module loaded (a spec pointing at a missing file is listed the same way). A second `role-enforcement.ts` in that array whose file exists — the copy the wizard installed at `~/.opencode/plugins/` up to v1.0.0 — is logged as a warning and left alone; `docs/migration-v1.md` says what to remove. Verified against opencode 1.18.13 (#157).
+**Plugin delivery:** the sidecar receives `role-enforcement.ts` as a `file://` entry in the `plugin` array of `OPENCODE_CONFIG_CONTENT` — the same variable the adapter uses for its bash permission defaults — pointing at the copy shipped in `gateway/agents/opencode/hooks/`. Nothing is copied to disk, so the plugin is the one this gateway's code was written against by construction, and the user's own `opencode` sessions are untouched. The entry is injected unconditionally (the bash defaults yield to a user `"*"` catch-all; the plugin is always present). That is safe because the gateway's permission broker runs for every agent (ADR-0002) and every ask reaches it. What makes owner tools ask is the permission ruleset the adapter injects into the same variable — `bash["*"]`, `edit` (the key `write`/`edit`/`multiedit` ask under), `webfetch`, `websearch` → `"ask"`, wherever the user set no value — **not** the plugin: its owner path sets `output.status = "ask"` in `tool.execute.before`, and opencode 1.18.13 discards that output (verified live — a `write` completed with no `permission.asked`; the plugin's guest path, which throws, does work). Every resulting `permission.asked` is answered by the broker — approved by an allow-list, put to a human when `permissions.enabled` is true, or rejected at once when it is false. opencode's own ask-by-default rules (`external_directory`, `doom_loop`, `.env` reads) reach the broker the same way, as permission names, so nothing waits on an answer that never comes (#165); its in-directory `read`/`glob`/`grep`/`list` are not gated. A `reject` ends the model's turn with no text, so a denied call surfaces in chat as an empty reply. The bash ruleset is the catch-all plus the user's own patterns and nothing else. The gateway once added "read-only" allow patterns (`git log/diff/status/show *`, `coop send *`); a trailing catch-all silenced them on every release, and making them effective would have let a guest run `coop send` — the sidecar runs as `COOP_ROLE=owner` for every chatter, and an allow opencode applies itself never reaches the broker — and let any of those git commands truncate a file via `--output=<path>`. They were removed; `coop send` is allowed by the broker's built-in owner rule instead. The catch-all is emitted *first* — opencode applies the last matching rule, so a trailing `"*"` overrides every pattern before it (verified on 1.18.13). That ordering holds only within the injected value: opencode merges `opencode.json` before it, so a bash pattern from the file still lands before `"*"` and is overridden — under the gateway, bash policy is the broker's allow-lists. Two checks guard it, both in `_start_inner()` so the self-heal restart gets them too: the shipped file must exist before spawning, and after the health check `GET /config` on the sidecar must list the exact injected spec in its merged `plugin` array — otherwise the sidecar is killed and the start fails, because opencode itself says nothing about a plugin it dropped. The second check proves opencode *accepted* the entry, not that the module loaded (a spec pointing at a missing file is listed the same way). A second `role-enforcement.ts` in that array whose file exists — the copy the wizard installed at `~/.opencode/plugins/` up to v1.0.0 — is logged as a warning and left alone; `docs/migration-v1.md` says what to remove. Verified against opencode 1.18.13 (#157).
 
 **Attachments:** Native `-f` flag support (unlike Claude which requires inline path injection).
 
@@ -613,7 +618,7 @@ GatewayService.run()
 
 **Startup ordering rationale:**
 1. Backends first — need to be running before messages arrive
-2. Permission brokers second — only if backend succeeded
+2. Permission brokers second — only if backend succeeded; every agent has one
 3. Connectors authenticate third — no subscription yet, so nothing is delivered
 4. **Identity barrier fourth** — two connectors logged in as one bot account receive
    the identical stream, so every shared room would get two agents answering. Only this
@@ -732,10 +737,10 @@ The core never touches raw platform user data or makes RBAC decisions.
 
 ### 4. **Fail-Closed Permission System**
 
-If a permission broker cannot start, the daemon refuses to start watchers. This prevents messages reaching an agent with no tool approval layer active.
+If a permission broker cannot start, the daemon refuses to start watchers on that agent. This prevents messages reaching an agent with no tool gate active — and since ADR-0002 every agent has a broker, the rule has no `permissions.enabled` exception:
 
 ```python
-if agent_cfg.permissions.enabled and not broker:
+if not broker:
     raise RuntimeError(f"Permission broker failed for agent {agent_name}")
 ```
 

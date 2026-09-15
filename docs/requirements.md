@@ -166,7 +166,15 @@ Additionally, the gateway SHALL:
 When an owner uses a tool:
 1. If the tool is in the owner's auto-approved allow-list, the tool executes without further approval
 2. If permissions are enabled and the tool is NOT in the auto-approved allow-list, the tool enters the human approval workflow
-3. If permissions are disabled, all tools are auto-approved for owners
+3. If permissions are disabled, a tool that is NOT in the auto-approved
+   allow-list is **denied by the gateway** — not approved, and not left waiting
+   for an approval nobody can give. The allow-list (including the gateway's
+   built-in owner rules) applies exactly as when permissions are enabled; only
+   the fate of the remainder changes, from "ask a human" to "deny". The
+   gateway is the sole permission gate on every backend; the backend's own
+   permission settings do not take part (ADR-0002).
+4. `skip_owner_approval: true` requires permissions to be enabled; the pair
+   with `enabled: false` SHALL be rejected at config load.
 
 ### 6.3 Guest Tool Access
 
@@ -191,10 +199,13 @@ Tool allow-list policies SHALL support:
 
 ### 7.1 Triggering Approval
 
-When permissions are enabled, the gateway SHALL:
-1. Intercept tool actions by owners that fall outside the auto-approved set
-2. Post an approval request visible in chat to eligible owners (other owners in the same room)
-3. Include a short, human-typable approval ID in the request message
+The gateway SHALL intercept every tool action by an owner that falls outside
+the auto-approved set, whether or not permissions are enabled. When permissions
+are enabled, it SHALL additionally:
+1. Post an approval request visible in chat to eligible owners (other owners in the same room)
+2. Include a short, human-typable approval ID in the request message
+
+When permissions are disabled the intercepted action is denied (§6.2).
 
 ### 7.2 Approval Commands
 
