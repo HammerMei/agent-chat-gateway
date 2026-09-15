@@ -46,12 +46,13 @@ tool_presets:
   # guests are read-only, and owners opt in by referencing the preset.
   # params regexes match case-insensitively; `(?-i:...)` keeps the directory
   # prefix exact so `/TMP/x` (a different directory on Linux) is not granted.
-  # The tool regex covers Claude's Write/Edit/MultiEdit and OpenCode's `edit`
-  # (the permission name its write, edit and multiedit tools ask under).
+  # The tool regex covers Claude's Write/Edit/MultiEdit/NotebookEdit and
+  # OpenCode's `edit` (the permission name its write, edit and multiedit
+  # tools ask under).
   # Rules are lexical: a symlink planted at /tmp/x pointing elsewhere is not
   # resolved. If that matters, point the preset at a private scratch directory.
   scratch-dir:
-    - tool: "(Write|Edit|MultiEdit)"
+    - tool: "(Write|Edit|MultiEdit|NotebookEdit)"
       params: "(?-i:/tmp/).*"
     # A target with whitespace in it comes back shell-quoted (`> '/tmp/x y'`),
     # hence the optional quote before the prefix.

@@ -147,9 +147,11 @@ _DEV_FD = re.compile(r"/dev/fd/\d+")
 
 
 # Characters after which the path bash opens is no longer knowable from the
-# text: an expansion (``$``, backtick) or a pathname-expansion metacharacter
+# text: an expansion (``$``, backtick), a pathname-expansion metacharacter
 # (``*``, ``?``, ``[`` — with ``globstar``, ``**`` can match zero directories,
-# so ``normpath`` on the literal text would collapse the wrong components).
+# so ``normpath`` on the literal text would collapse the wrong components),
+# and — handled in the scan — a backslash-newline.  A leading ``~`` is checked
+# by the caller.
 _UNKNOWABLE_FROM = "$`*?["
 
 
@@ -163,38 +165,17 @@ def _first_unknowable(text: str) -> int:
     i = 0
     while i < len(text):
         if text[i] == "\\":
+            if text[i + 1:i + 2] == "\n":
+                # A line continuation: bash removes it outside single quotes
+                # and keeps it inside them, and telling those apart is a
+                # shell lexer this module does not carry.
+                return i
             i += 2
             continue
         if text[i] in _UNKNOWABLE_FROM:
             return i
         i += 1
     return -1
-
-
-def _join_continuations(text: str) -> str:
-    """Remove backslash-newline the way bash does: everywhere except inside single quotes."""
-    out: list[str] = []
-    in_single = False
-    i = 0
-    while i < len(text):
-        ch = text[i]
-        if in_single:
-            if ch == "'":
-                in_single = False
-            out.append(ch)
-        elif ch == "\\" and i + 1 < len(text) and text[i + 1] == "\n":
-            i += 2
-            continue
-        elif ch == "\\" and i + 1 < len(text):
-            out.append(text[i:i + 2])
-            i += 2
-            continue
-        else:
-            if ch == "'":
-                in_single = True
-            out.append(ch)
-        i += 1
-    return "".join(out)
 
 
 def _redirect_param(file_redirect, src: bytes) -> str | None:
@@ -248,15 +229,20 @@ def _redirect_param(file_redirect, src: bytes) -> str | None:
             dest_children.append(child)
     if dest_children:
         # The whole span from the end of the operator to the end of the
-        # redirect — not the destination nodes only.  A backslash-newline in
-        # the word (``> /var\\<newline>/tmp/x``) makes the grammar emit one
-        # ``word`` per line while bash joins them, and an escaped space right
+        # redirect — not the destination nodes only: an escaped space right
         # after the operator (``>\\ /tmp/x``, a path that starts with a space)
         # is outside the first destination node's span altogether.
-        dest = _join_continuations(src[dest_from:file_redirect.end_byte].decode())
+        dest = src[dest_from:file_redirect.end_byte].decode()
         dest = dest.lstrip(" \t") if not dest.startswith(("\\ ", "\\\t")) else dest
         dest = dest.rstrip()
-    if len(dest_children) == 1 and dest_children[0].type == "process_substitution":
+    if (
+        len(dest_children) == 1
+        and dest_children[0].type == "process_substitution"
+        and dest == src[dest_children[0].start_byte:dest_children[0].end_byte].decode()
+    ):
+        # Exactly ``> >(cmd)``: a pipe, not a path; the nested command is
+        # collected by the walk.  ``>\\ >(cmd)`` is not that — it opens the
+        # relative path `` /dev/fd/N`` — and goes on to be matched as text.
         return None
     unknowable_at = _first_unknowable(dest)
     if dest.startswith("~"):

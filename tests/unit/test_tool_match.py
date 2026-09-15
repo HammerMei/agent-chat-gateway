@@ -597,6 +597,13 @@ class TestRedirectTargets(unittest.TestCase):
         self.assertEqual(params, [self.FETCH, "coop send --room r -"])
         self.assertTrue(all_params_match_any(self.OWNER, "Bash", params))
 
+    def test_prefixed_process_substitution_is_a_path(self):
+        """`>\\ >(date)` opens the relative path ` /dev/fd/N`; only the bare `> >(cmd)` is a pipe."""
+        params = extract_bash_subcommands(f"{self.FETCH} >\\ >(date)")
+        self.assertIn("date", params)
+        self.assertEqual(len(params), 3, params)
+        self.assertFalse(all_params_match_any(self.OWNER + self._preset(), "Bash", params), params)
+
     def test_shipped_preset_is_case_sensitive_on_the_directory(self):
         preset = self._preset()
         self.assertTrue(all_params_match_any(preset, "Bash", ["> /tmp/x"]))
@@ -633,9 +640,9 @@ class TestRedirectTargets(unittest.TestCase):
         self.assertEqual(extract_bash_subcommands(f"{self.FETCH} > '$HOME/x'"), [self.FETCH, "> '$HOME/x'"])
 
     def test_shipped_preset_covers_every_file_writing_permission_name(self):
-        """Claude asks as Write/Edit/MultiEdit; OpenCode asks as `edit` for all three."""
+        """Claude asks as Write/Edit/MultiEdit/NotebookEdit; OpenCode asks as `edit` for all of them."""
         preset = self._preset()
-        for tool in ("Write", "Edit", "MultiEdit", "edit"):
+        for tool in ("Write", "Edit", "MultiEdit", "NotebookEdit", "edit"):
             with self.subTest(tool):
                 self.assertTrue(all_params_match_any(preset, tool, ["/tmp/notes.md"]))
                 self.assertFalse(all_params_match_any(preset, tool, ["/TMP/notes.md"]))
@@ -644,20 +651,21 @@ class TestRedirectTargets(unittest.TestCase):
 
     # ── Codex round 3 on #177 ────────────────────────────────────────────────
 
-    def test_line_continuation_in_target_is_joined_like_bash_does(self):
-        """`> /var\\<newline>/tmp/x` is `/var/tmp/x` to bash; the grammar emits two words."""
-        params = extract_bash_subcommands(f"{self.FETCH} > /var\\\n/tmp/x")
-        self.assertEqual(params, [self.FETCH, "> /var/tmp/x"])
-        self.assertFalse(all_params_match_any(self._preset(), "Bash", params))
-
-    def test_line_continuation_inside_single_quotes_is_kept(self):
-        """bash keeps `\\<newline>` inside single quotes: the directory really is named `sa\\<nl>fe`."""
-        params = extract_bash_subcommands(f"{self.FETCH} > '/tmp/sa\\\nfe/x'")
-        self.assertEqual(params, [self.FETCH, "> '/tmp/sa\\\nfe/x'"])
-        rule = [ToolRule(tool="Bash", params=r">>?\s*/tmp/safe/.*")]
-        self.assertFalse(all_params_match_any(rule, "Bash", params[1:]))
-        # outside quotes it is still joined
-        self.assertEqual(extract_bash_subcommands(f"{self.FETCH} > /tmp/sa\\\nfe/x"), [self.FETCH, "> /tmp/safe/x"])
+    def test_line_continuation_in_target_fails_closed(self):
+        """`\\<newline>` in a target is matched as raw text: joined or kept depends on quoting bash
+        rules this module does not lex, so neither reading is trusted."""
+        cases = {
+            "outside quotes": f"{self.FETCH} > /var\\\n/tmp/x",
+            "inside single quotes": f"{self.FETCH} > '/tmp/sa\\\nfe/x'",
+            "single quote inside double quotes": f"{self.FETCH} > \"/tmp/a'/.\\\n./../../etc/passwd\"",
+        }
+        for label, cmd in cases.items():
+            with self.subTest(label):
+                params = extract_bash_subcommands(cmd)
+                self.assertEqual(len(params), 2, params)
+                self.assertIn("\\\n", params[1])
+                self.assertFalse(all_params_match_any(self._preset(), "Bash", params), params)
+                self.assertFalse(all_params_match_any([ToolRule(tool="Bash", params=r">>?\s*/tmp/safe/.*")], "Bash", params[1:]))
 
     def test_grammar_failure_fails_closed_and_keeps_nested_commands(self):
         """An ERROR node is not reconstructed: its shell-syntax text is a fragment nothing matches.
