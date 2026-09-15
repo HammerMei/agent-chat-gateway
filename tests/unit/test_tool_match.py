@@ -653,7 +653,7 @@ class TestRedirectTargets(unittest.TestCase):
     def test_line_continuation_inside_single_quotes_is_kept(self):
         """bash keeps `\\<newline>` inside single quotes: the directory really is named `sa\\<nl>fe`."""
         params = extract_bash_subcommands(f"{self.FETCH} > '/tmp/sa\\\nfe/x'")
-        self.assertEqual(params, [self.FETCH, "> /tmp/sa\\\nfe/x"])
+        self.assertEqual(params, [self.FETCH, "> '/tmp/sa\\\nfe/x'"])
         rule = [ToolRule(tool="Bash", params=r">>?\s*/tmp/safe/.*")]
         self.assertFalse(all_params_match_any(rule, "Bash", params[1:]))
         # outside quotes it is still joined
@@ -678,7 +678,15 @@ class TestRedirectTargets(unittest.TestCase):
         self.assertFalse(all_params_match_any(preset, "external_directory", ["/etc/*"]))
 
     def test_escaped_space_in_target_is_one_path(self):
-        self.assertEqual(extract_bash_subcommands(f"{self.FETCH} > /tmp/x\\ y"), [self.FETCH, "> /tmp/x y"])
+        """A path with a space is returned quoted, so a rule sees one word."""
+        self.assertEqual(extract_bash_subcommands(f"{self.FETCH} > /tmp/x\\ y"), [self.FETCH, "> '/tmp/x y'"])
+        self.assertTrue(all_params_match_any(self._preset(), "Bash", ["> '/tmp/x y'"]))
+
+    def test_escaped_space_right_after_the_operator_is_part_of_the_path(self):
+        """`>\\ /tmp/x` opens the relative path ` /tmp/x` (a directory named " "), not /tmp/x."""
+        params = extract_bash_subcommands(f"{self.FETCH} >\\ /tmp/x")
+        self.assertEqual(params, [self.FETCH, "> ' /tmp/x'"])
+        self.assertFalse(all_params_match_any(self._preset(), "Bash", params))
 
     def test_owner_coop_send_with_stderr_to_dev_null_still_passes(self):
         params = extract_bash_subcommands('coop send --room r "hi" 2>/dev/null')

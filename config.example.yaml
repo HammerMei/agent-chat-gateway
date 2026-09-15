@@ -53,8 +53,10 @@ tool_presets:
   scratch-dir:
     - tool: "(Write|Edit|MultiEdit)"
       params: "(?-i:/tmp/).*"
+    # A target with whitespace in it comes back shell-quoted (`> '/tmp/x y'`),
+    # hence the optional quote before the prefix.
     - tool: "Bash"
-      params: ">>?\\s*(?-i:/tmp/).*"
+      params: ">>?\\s*'?(?-i:/tmp/).*"
     # OpenCode also asks `external_directory` (pattern `<dir>/*`) before any
     # file tool touches a path outside the agent's working directory.
     - tool: "external_directory"

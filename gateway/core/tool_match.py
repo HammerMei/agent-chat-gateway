@@ -232,6 +232,7 @@ def _redirect_param(file_redirect, src: bytes) -> str | None:
     fd = ""
     operator = ""
     dest = ""
+    dest_from = file_redirect.end_byte
     dest_children: list = []
     for child in file_redirect.children:
         text = src[child.start_byte:child.end_byte].decode()
@@ -239,19 +240,22 @@ def _redirect_param(file_redirect, src: bytes) -> str | None:
             fd = text
         elif not child.is_named:
             operator = text
+            dest_from = child.end_byte
         elif child.type == "ERROR":
             operator += text.strip()
+            dest_from = child.end_byte
         else:
             dest_children.append(child)
     if dest_children:
-        # The whole span from the first destination node to the end of the
-        # redirect, not the last node only: a backslash-newline inside the
-        # word (``> /var\\<newline>/tmp/x``) makes the grammar emit one
-        # ``word`` per line while bash joins them.  Drop the continuations so
-        # the text is the path bash sees.
-        dest = _join_continuations(
-            src[dest_children[0].start_byte:file_redirect.end_byte].decode()
-        ).strip()
+        # The whole span from the end of the operator to the end of the
+        # redirect — not the destination nodes only.  A backslash-newline in
+        # the word (``> /var\\<newline>/tmp/x``) makes the grammar emit one
+        # ``word`` per line while bash joins them, and an escaped space right
+        # after the operator (``>\\ /tmp/x``, a path that starts with a space)
+        # is outside the first destination node's span altogether.
+        dest = _join_continuations(src[dest_from:file_redirect.end_byte].decode())
+        dest = dest.lstrip(" \t") if not dest.startswith(("\\ ", "\\\t")) else dest
+        dest = dest.rstrip()
     if len(dest_children) == 1 and dest_children[0].type == "process_substitution":
         return None
     unknowable_at = _first_unknowable(dest)
@@ -280,6 +284,11 @@ def _redirect_param(file_redirect, src: bytes) -> str | None:
         dest = os.path.normpath(dest)
     if dest in _SINK_DESTINATIONS or _DEV_FD.fullmatch(dest):
         return None
+    if dest:
+        # Quote the way a shell would print it, so a path with whitespace or
+        # other special characters is visibly one word — ``> ' /tmp/x'``, not
+        # ``>  /tmp/x`` that a ``\\s*`` in a rule would read as ``/tmp/x``.
+        dest = shlex.quote(dest)
     return f"{fd}{operator} {dest}".rstrip()
 
 
