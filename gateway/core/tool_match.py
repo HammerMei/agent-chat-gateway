@@ -33,6 +33,7 @@ import json
 import logging
 import os
 import re
+import shlex
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -130,6 +131,155 @@ _NEVER_EXPANDED_LEAVES: frozenset[str] = frozenset({
 })
 
 
+# Redirect operators that duplicate, move or close a descriptor rather than
+# open a file: ``2>&1``, ``>&2``, ``3>&1-``, ``3>&-``, ``<&0``.  Nothing is
+# written anywhere.
+_FD_ONLY_REDIRECT_OPERATORS: frozenset[str] = frozenset({">&", "<&", ">&-", "<&-"})
+_FD_OPERAND = re.compile(r"\d*-?")  # "1", "1-" (move), "-" (close), "" (with >&-)
+
+# Destinations that are sinks, not files: writing to them has no persistent
+# effect, so a redirect to one is not a parameter to match.  /dev/stdout,
+# /dev/stderr and /dev/fd/N are sinks *here* because the tool process's stdio
+# are pipes owned by the agent harness (Claude Code's Bash tool, opencode's
+# shell tool); a redirect to them cannot reach a file on disk.
+_SINK_DESTINATIONS: frozenset[str] = frozenset({"/dev/null", "/dev/stdout", "/dev/stderr"})
+_DEV_FD = re.compile(r"/dev/fd/\d+")
+
+
+# Characters after which the path bash opens is no longer knowable from the
+# text: an expansion (``$``, backtick), a pathname-expansion metacharacter
+# (``*``, ``?``, ``[`` — with ``globstar``, ``**`` can match zero directories,
+# so ``normpath`` on the literal text would collapse the wrong components),
+# and — handled in the scan — a backslash-newline.  A leading ``~`` is checked
+# by the caller.
+_UNKNOWABLE_FROM = "$`*?["
+
+
+def _first_unknowable(text: str) -> int:
+    """Index of the first unescaped character from ``_UNKNOWABLE_FROM``, or -1.
+
+    Quotes are skipped over as characters but not as regions: a ``$`` inside
+    double quotes still expands, and a ``*`` inside single quotes does not —
+    that second case is a false positive we accept (it fails closed).
+    """
+    i = 0
+    while i < len(text):
+        if text[i] == "\\":
+            if text[i + 1:i + 2] == "\n":
+                # A line continuation: bash removes it outside single quotes
+                # and keeps it inside them, and telling those apart is a
+                # shell lexer this module does not carry.
+                return i
+            i += 2
+            continue
+        if text[i] in _UNKNOWABLE_FROM:
+            return i
+        i += 1
+    return -1
+
+
+def _redirect_param(file_redirect, src: bytes) -> str | None:
+    """Return the parameter string for a ``file_redirect`` node, or None.
+
+    ``cmd > /tmp/x`` yields ``"> /tmp/x"``.  The operator is kept so a rule that
+    allows a redirect (``>>?\\s*/tmp/.*``) cannot also allow *running* ``/tmp/x``.
+
+    The rule: **a target is normalized and matched as a path only when the
+    path bash will open is knowable from the text.**
+
+    - A **literal** target (no unescaped ``$``, backtick, ``*``, ``?``, ``[``,
+      and no leading ``~``) is shell-unquoted as a whole — ``/tmp/'..'/etc/passwd`` is
+      ``/tmp/../etc/passwd`` — and then ``normpath``-ed, relative or absolute,
+      so ``..`` cannot hide behind quotes or a prefix: ``> /tmp/../etc/passwd``
+      matches as ``> /etc/passwd``, ``> logs/../../x`` as ``> ../x``.
+    - Otherwise the value is not knowable before bash runs, so the string is
+      returned from the first unknowable character onward, every literal
+      prefix cut — ``> ${HOME//root/../..}/etc/passwd``, ``> **/../../x`` —
+      and no rule anchored on a path prefix can match it (the same rule as
+      for unparsed substitutions).
+
+    Matching is lexical: symlinks are not resolved, exactly as for the file
+    tools' ``normpath``.  A rule that confines writes to a directory confines
+    the *path text*; a symlink planted inside that directory is outside what
+    a path rule can see.
+
+    Not returned, because nothing is opened by the user's choice: descriptor
+    duplications, moves and closes (``2>&1``, ``3>&1-``, ``3>&-``); sinks
+    (``/dev/null``, ``/dev/stdout``, ``/dev/stderr``, ``/dev/fd/N``); a
+    process substitution target (``> >(cmd)`` — the nested command is
+    returned by the walk).  Input redirects (``< file``) are returned — the
+    file's contents reach the command.
+    """
+    fd = ""
+    operator = ""
+    dest = ""
+    dest_from = file_redirect.end_byte
+    dest_children: list = []
+    for child in file_redirect.children:
+        text = src[child.start_byte:child.end_byte].decode()
+        if child.type == "file_descriptor":
+            fd = text
+        elif not child.is_named:
+            operator = text
+            dest_from = child.end_byte
+        elif child.type == "ERROR":
+            operator += text.strip()
+            dest_from = child.end_byte
+        else:
+            dest_children.append(child)
+    if dest_children:
+        # The whole span from the end of the operator to the end of the
+        # redirect — not the destination nodes only: an escaped space right
+        # after the operator (``>\\ /tmp/x``, a path that starts with a space)
+        # is outside the first destination node's span altogether.
+        dest = src[dest_from:file_redirect.end_byte].decode()
+        dest = dest.lstrip(" \t") if not dest.startswith(("\\ ", "\\\t")) else dest
+        dest = dest.rstrip()
+    if (
+        len(dest_children) == 1
+        and dest_children[0].type == "process_substitution"
+        and dest == src[dest_children[0].start_byte:dest_children[0].end_byte].decode()
+    ):
+        # Exactly ``> >(cmd)``: a pipe, not a path; the nested command is
+        # collected by the walk.  ``>\\ >(cmd)`` is not that — it opens the
+        # relative path `` /dev/fd/N`` — and goes on to be matched as text.
+        return None
+    unknowable_at = _first_unknowable(dest)
+    if dest.startswith("~"):
+        unknowable_at = 0  # tilde expansion: ``~/../tmp/x`` is not ``tmp/x``
+    if unknowable_at >= 0:
+        # The path bash opens is not knowable from here on, so nothing before
+        # this point may be matched either: cut every literal prefix
+        # (``/tmp/`` in ``/tmp/${X}``, ``logs`` in ``logs${X}``) so no rule
+        # anchored on a prefix can approve a value bash has not computed.  A
+        # prefix that is only quote characters is kept — ``"$HOME/x"`` reads
+        # better than ``$HOME/x"`` and anchors nothing.
+        prefix = dest[:unknowable_at]
+        if prefix.strip("'\"") == "":
+            return f"{fd}{operator} {dest}"
+        return f"{fd}{operator} {dest[unknowable_at:]}"
+    if dest:
+        try:
+            parts = shlex.split(dest)
+        except ValueError:
+            parts = []
+        if len(parts) != 1:
+            return f"{fd}{operator} {dest}"  # not one plain word: match the raw text
+        dest = parts[0]
+    if operator in _FD_ONLY_REDIRECT_OPERATORS and _FD_OPERAND.fullmatch(dest):
+        return None
+    if dest:
+        dest = os.path.normpath(dest)
+    if dest in _SINK_DESTINATIONS or _DEV_FD.fullmatch(dest):
+        return None
+    if dest:
+        # Quote the way a shell would print it, so a path with whitespace or
+        # other special characters is visibly one word — ``> ' /tmp/x'``, not
+        # ``>  /tmp/x`` that a ``\\s*`` in a rule would read as ``/tmp/x``.
+        dest = shlex.quote(dest)
+    return f"{fd}{operator} {dest}".rstrip()
+
+
 def _heredoc_is_quoted(heredoc_redirect, src: bytes) -> bool:
     """True when bash will not expand the heredoc body.
 
@@ -174,9 +324,15 @@ def extract_bash_subcommands(command: str) -> list[str]:
     Heredoc redirections (``cmd << 'EOF' ... EOF``): the full
     ``redirected_statement`` text is returned as a single string so that
     allow-list patterns can inspect the heredoc body content (e.g. a Python
-    script piped to the interpreter).  For regular file redirections
-    (``> file``, ``< file``, etc.) only the ``command`` child is returned —
-    consistent with non-redirected commands.
+    script piped to the interpreter).
+
+    File redirections (``> file``, ``>> file``, ``2> file``, ``< file``): the
+    command is returned on its own, and each redirect is returned as a
+    parameter string of its own **with its operator** — ``"> /tmp/x"`` — so
+    the target has to match a rule too, and a rule that allows the redirect
+    cannot be mistaken for one that allows running ``/tmp/x``.  Descriptor
+    duplications (``2>&1``) and sinks (``/dev/null``) write nothing and are
+    not returned.  See :func:`_redirect_param`.
 
     Falls back to ``[command]`` (treat whole string as one command) when:
       - tree-sitter is not installed
@@ -224,6 +380,36 @@ def extract_bash_subcommands(command: str) -> list[str]:
             # still nodes below it and are still collected.
             arithmetic(node)
             return
+        if node.type == "file_redirect":
+            # The target of ``> file`` is a consequence of its own — the file is
+            # created or truncated under the gateway account — so it is a
+            # parameter string of its own, operator included (#173).  Descend
+            # too: ``> $(id)`` still has a command in it.  An ERROR child is
+            # already folded into the operator by ``_redirect_param``.
+            param = _redirect_param(node, src)
+            if param is not None:
+                commands.append(param)
+            for child in node.children:
+                if child.type != "ERROR":
+                    walk(child)
+            return
+        if node.type == "ERROR":
+            # Text the grammar could not place.  It is not reconstructed —
+            # every attempt to guess what the parser meant has been a second
+            # grammar with its own holes — so a fragment carrying shell syntax
+            # (a redirect, pipe, list operator or expansion) is returned as a
+            # sub-command that must match a rule on its own, which fails closed
+            # for every command-anchored rule.  A stray plain word (the ``EOF``
+            # the grammar drops after ``<< E"OF"``) is not returned.  The node
+            # is still walked, so a command or redirect nested in it is
+            # collected too.  Known over-denials, accepted: a heredoc with a
+            # partly quoted delimiter (``<< E"OF"``) and a here-string that
+            # follows another redirect (``2>/dev/null <<< hi``) both land here.
+            text = src[node.start_byte:node.end_byte].decode().strip()
+            if any(ch in text for ch in "<>|&;$`"):
+                commands.append(text)
+            descend(node)
+            return
         if node.type == "command":
             commands.append(src[node.start_byte:node.end_byte].decode())
             # A substitution nested in this command's words, strings, assignments
@@ -239,8 +425,8 @@ def extract_bash_subcommands(command: str) -> list[str]:
             # can inspect the heredoc body.
             #
             # For non-heredoc redirections (file I/O, e.g. ``echo hi > /tmp/f``),
-            # fall through to normal child traversal so only the ``command`` node
-            # text is extracted — consistent with prior behaviour.
+            # fall through to normal child traversal: the ``command`` node and
+            # each ``file_redirect`` become parameter strings of their own.
             has_heredoc = any(
                 child.type in ("heredoc_redirect", "herestring_redirect")
                 for child in node.children
@@ -258,8 +444,11 @@ def extract_bash_subcommands(command: str) -> list[str]:
                         descend(child)
                     elif child.type == "heredoc_redirect" and _heredoc_is_quoted(child, src):
                         # A quoted delimiter (``'EOF'``, ``E"OF"``, ``\EOF``, …): bash
-                        # does not expand the body, so a ``$(`` in it is text.
-                        continue
+                        # does not expand the body, so a ``$(`` in it is text.  Only
+                        # a ``> file`` sharing the line still counts.
+                        for part in child.children:
+                            if part.type == "file_redirect":
+                                walk(part)
                     else:
                         walk(child)
                 return

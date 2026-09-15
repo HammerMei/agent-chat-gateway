@@ -3,7 +3,8 @@
 Covers:
   - _normalize_path: path traversal prevention, relative paths, absolute paths
   - matches_rule: tool name regex, params regex, case insensitivity, params=None
-  - extract_bash_subcommands: compound commands, heredoc redirects, file redirects,
+  - extract_bash_subcommands: compound commands, heredoc redirects, file redirects
+    (targets are parameter strings of their own, fd dups and sinks are not),
     command / process substitutions (recursed into, nested commands must match too)
   - get_param_strings_for_claude: Bash, file tools, WebFetch, unknown tools
   - get_param_strings_for_opencode: patterns list, empty patterns fallback
@@ -12,6 +13,7 @@ Covers:
 
 from __future__ import annotations
 
+import pathlib
 import unittest
 
 from gateway.config import ToolRule
@@ -22,6 +24,7 @@ from gateway.core.tool_match import (
     extract_bash_subcommands,
     get_param_strings_for_claude,
     get_param_strings_for_opencode,
+    matches_any,
     matches_rule,
 )
 
@@ -200,15 +203,10 @@ class TestExtractBashSubcommands(unittest.TestCase):
         rule = ToolRule(tool="Bash", params=r"python3.*github\.com/trending.*")
         self.assertFalse(all_params_match_any([rule], "Bash", param_strings))
 
-    def test_file_redirect_does_not_include_redirect_target(self):
-        """echo hi > /tmp/out — only 'echo hi' is extracted, not the redirect target."""
+    def test_file_redirect_target_is_its_own_param_string(self):
+        """echo hi > /tmp/out → the command and the redirect, operator kept (#173)."""
         result = extract_bash_subcommands("echo hi > /tmp/out")
-        # Should have exactly one entry containing the command (not the file path)
-        self.assertEqual(len(result), 1)
-        self.assertIn("echo", result[0])
-        # The redirect operator and filename may or may not appear but the command
-        # must be present; crucially the result must NOT be 'python3' alone
-        self.assertNotEqual(result[0].strip(), "echo")  # params included
+        self.assertEqual(result, ["echo hi", "> /tmp/out"])
 
     def test_herestring_full_text_extracted(self):
         """cmd <<< 'value' — herestring content included in extracted text."""
@@ -257,9 +255,9 @@ class TestExtractBashSubcommandsSubstitutions(unittest.TestCase):
         self.assertIn("id", result)
 
     def test_substitution_in_redirect_target(self):
-        """The redirect target itself is still dropped (#173); the command inside it is not."""
+        """Both the redirect (#173) and the command inside its target are returned."""
         result = extract_bash_subcommands(f"{self.FETCH} > $(id)")
-        self.assertEqual(result, [self.FETCH, "id"])
+        self.assertEqual(result, [self.FETCH, "> $(id)", "id"])
 
     def test_substitution_in_herestring(self):
         result = extract_bash_subcommands(f'{self.FETCH} <<< "$(id)"')
@@ -437,6 +435,294 @@ class TestUnparsedSubstitutionsFailClosed(unittest.TestCase):
         """
         cmd = "coop send --room r --file - << EOF\nuse `ls` here\nEOF"
         self.assertEqual(extract_bash_subcommands(cmd), [cmd, "`ls` here\n"])
+
+
+# ── redirect targets are parameter strings (#173) ────────────────────────────
+
+
+class TestRedirectTargets(unittest.TestCase):
+    """A ``> file`` redirect is a consequence of its own and must match a rule.
+
+    Before #173 the redirect was dropped from the returned strings, so
+    ``coop fetch-history --room r > ~/.ssh/authorized_keys`` matched the
+    built-in guest rule and truncated the file under the gateway account.
+    """
+
+    FETCH = "coop fetch-history --room r"
+    GUEST = AgentConfig().effective_guest_allowed_tools()
+    OWNER = AgentConfig().effective_owner_allowed_tools()
+
+    WRITES = {
+        "truncate": (f"{FETCH} > /tmp/x", "> /tmp/x"),
+        "append": (f"{FETCH} >> /tmp/x", ">> /tmp/x"),
+        "stderr to file": (f"{FETCH} 2> err.log", "2> err.log"),
+        "both streams": (f"{FETCH} &> all.log", "&> all.log"),
+        "clobber": (f"{FETCH} >| f", ">| f"),
+        "input from file": (f"{FETCH} < /etc/passwd", "< /etc/passwd"),
+        "read-write": (f"{FETCH} <> rw", "<> rw"),
+        "expansion in target": (f'{FETCH} > "$HOME/x"', '> "$HOME/x"'),
+        "no space": (f"{FETCH} >/tmp/x", "> /tmp/x"),
+    }
+
+    def test_every_file_redirect_is_returned_with_its_operator(self):
+        for label, (cmd, expected) in self.WRITES.items():
+            with self.subTest(label):
+                self.assertEqual(extract_bash_subcommands(cmd), [self.FETCH, expected])
+
+    def test_every_file_redirect_is_denied_for_a_guest(self):
+        for label, (cmd, _) in self.WRITES.items():
+            with self.subTest(label):
+                params = extract_bash_subcommands(cmd)
+                self.assertFalse(all_params_match_any(self.GUEST, "Bash", params), params)
+
+    def test_traversal_in_target_is_normalized(self):
+        result = extract_bash_subcommands(f"{self.FETCH} > /tmp/../etc/passwd")
+        self.assertEqual(result, [self.FETCH, "> /etc/passwd"])
+
+    def test_multiple_redirects_each_returned(self):
+        result = extract_bash_subcommands(f"{self.FETCH} 2> err.log >> out.log")
+        self.assertEqual(result, [self.FETCH, "2> err.log", ">> out.log"])
+
+    def test_substitution_in_target_yields_both(self):
+        result = extract_bash_subcommands(f"{self.FETCH} > $(id)")
+        self.assertEqual(result, [self.FETCH, "> $(id)", "id"])
+
+    def test_heredoc_with_file_redirect(self):
+        cmd = f"{self.FETCH} <<EOF > out\nbody\nEOF"
+        self.assertEqual(extract_bash_subcommands(cmd), [cmd, "> out"])
+
+    def test_quoted_heredoc_with_file_redirect_still_returns_the_redirect(self):
+        """Skipping a quoted heredoc's body must not skip the `> out` on the same line."""
+        cmd = f"{self.FETCH} <<'EOF' > out\n$(id)\nEOF"
+        self.assertEqual(extract_bash_subcommands(cmd), [cmd, "> out"])
+
+    def test_plainly_quoted_target_is_unquoted(self):
+        self.assertEqual(extract_bash_subcommands(f'{self.FETCH} > "/tmp/x"'), [self.FETCH, "> /tmp/x"])
+        self.assertEqual(extract_bash_subcommands(f"{self.FETCH} > '/dev/null'"), [self.FETCH])
+        # an expansion inside quotes is kept verbatim — its value is unknown
+        self.assertEqual(extract_bash_subcommands(f'{self.FETCH} > "$HOME/x"'), [self.FETCH, '> "$HOME/x"'])
+
+    # ── not writes: nothing to match ─────────────────────────────────────────
+
+    NOT_WRITES = {
+        "stderr to stdout": f"{FETCH} 2>&1",
+        "stdout to stderr": f"{FETCH} >&2",
+        "close descriptor": f"{FETCH} 3>&-",
+        "dev null": f"{FETCH} > /dev/null",
+        "dev null no space + dup": f"{FETCH} >/dev/null 2>&1",
+        "dev stderr": f"{FETCH} > /dev/stderr",
+        "dev fd": f"{FETCH} > /dev/fd/1",
+        "stderr to dev null": f"{FETCH} 2>/dev/null",
+    }
+
+    def test_descriptor_duplications_and_sinks_are_not_params(self):
+        for label, cmd in self.NOT_WRITES.items():
+            with self.subTest(label):
+                self.assertEqual(extract_bash_subcommands(cmd), [self.FETCH])
+                self.assertTrue(all_params_match_any(self.GUEST, "Bash", [self.FETCH]))
+
+    # ── writing a rule for it ────────────────────────────────────────────────
+
+    def test_redirect_rule_does_not_allow_running_the_same_path(self):
+        """The operator in the string is what keeps ``>>?\\s*/tmp/.*`` from allowing ``/tmp/evil.sh``."""
+        rules = [ToolRule(tool="Bash", params=r">>?\s*/tmp/.*")]
+        self.assertTrue(matches_any(rules, "Bash", "> /tmp/x"))
+        self.assertTrue(matches_any(rules, "Bash", ">> /tmp/x"))
+        self.assertFalse(matches_any(rules, "Bash", "/tmp/evil.sh"))
+        self.assertFalse(matches_any(rules, "Bash", "> /etc/passwd"))
+
+    def test_shipped_scratch_dir_preset_allows_tmp_redirects_only(self):
+        """The preset in config.example.yaml, as YAML-escaped, matches `> /tmp/x` and nothing else."""
+        import yaml
+
+        example = yaml.safe_load(
+            (pathlib.Path(__file__).resolve().parents[2] / "config.example.yaml").read_text()
+        )
+        rules = [ToolRule(**r) for r in example["tool_presets"]["scratch-dir"]]
+        self.assertTrue(all_params_match_any(rules, "Bash", ["> /tmp/x"]))
+        self.assertTrue(all_params_match_any(rules, "Bash", [">> /tmp/x"]))
+        self.assertTrue(all_params_match_any(rules, "Write", ["/tmp/notes.md"]))
+        self.assertFalse(all_params_match_any(rules, "Bash", ["/tmp/evil.sh"]))
+        self.assertFalse(all_params_match_any(rules, "Bash", ["> /etc/passwd"]))
+        self.assertFalse(all_params_match_any(rules, "Bash", ["< /tmp/x"]))  # read is not granted
+        self.assertFalse(all_params_match_any(rules, "Write", ["/etc/passwd"]))
+
+    # ── Codex round 1 on #177: the target must be the path bash opens ────────
+
+    def _preset(self):
+        import yaml
+
+        example = yaml.safe_load(
+            (pathlib.Path(__file__).resolve().parents[2] / "config.example.yaml").read_text()
+        )
+        return self.OWNER + [ToolRule(**r) for r in example["tool_presets"]["scratch-dir"]]
+
+    def test_expansion_in_target_is_returned_from_the_opener(self):
+        """`/tmp/${HOME//root/../..}/etc/passwd` has no knowable value; no path rule may match it."""
+        cmd = f"{self.FETCH} > /tmp/${{HOME//root/../..}}/etc/passwd"
+        params = extract_bash_subcommands(cmd)
+        self.assertEqual(params, [self.FETCH, "> ${HOME//root/../..}/etc/passwd"])
+        self.assertFalse(all_params_match_any(self._preset(), "Bash", params))
+        self.assertEqual(extract_bash_subcommands(f"{self.FETCH} > $HOME/x"), [self.FETCH, "> $HOME/x"])
+        self.assertEqual(extract_bash_subcommands(f"{self.FETCH} > /tmp/$(id)"), [self.FETCH, "> $(id)", "id"])
+
+    def test_quote_fragments_are_removed_before_normalizing(self):
+        for cmd in (f"{self.FETCH} > /tmp/'..'/etc/passwd", f'{self.FETCH} > "/tmp/../etc/passwd"', f"{self.FETCH} > /tmp/\"..\"/etc/passwd"):
+            with self.subTest(cmd):
+                params = extract_bash_subcommands(cmd)
+                self.assertEqual(params, [self.FETCH, "> /etc/passwd"])
+                self.assertFalse(all_params_match_any(self._preset(), "Bash", params))
+
+    def test_relative_target_is_normalized_so_traversal_shows(self):
+        params = extract_bash_subcommands(f"{self.FETCH} > logs/../../secrets")
+        self.assertEqual(params, [self.FETCH, "> ../secrets"])
+        rule = [ToolRule(tool="Bash", params=r">>?\s*logs/.*")]
+        self.assertFalse(all_params_match_any(rule, "Bash", params[1:]))
+        self.assertTrue(all_params_match_any(rule, "Bash", extract_bash_subcommands("x > logs/a/../b.log")[1:]))
+
+    def test_compact_read_write_redirect_fails_closed(self):
+        """`<>/tmp/f` parses as ERROR(`<`) + `>/tmp/f`; the stray `<` is a fragment nothing matches."""
+        params = extract_bash_subcommands("grep root <>/tmp/link")
+        self.assertIn("<", params)
+        self.assertFalse(all_params_match_any(self._preset() + [ToolRule(tool="Bash", params="grep .*")], "Bash", params))
+
+    def test_descriptor_moves_closes_and_quoted_operands_are_not_params(self):
+        for cmd in (f'{self.FETCH} 2>&"1"', f"{self.FETCH} 3>&1-", f"{self.FETCH} 3>& -", f"{self.FETCH} 4<&0"):
+            with self.subTest(cmd):
+                self.assertEqual(extract_bash_subcommands(cmd), [self.FETCH])
+
+    def test_process_substitution_target_is_not_a_file(self):
+        """`> >(cmd)` opens a pipe, not a path; the nested command is what must match."""
+        params = extract_bash_subcommands(f"{self.FETCH} > >(coop send --room r -)")
+        self.assertEqual(params, [self.FETCH, "coop send --room r -"])
+        self.assertTrue(all_params_match_any(self.OWNER, "Bash", params))
+
+    def test_prefixed_process_substitution_is_a_path(self):
+        """`>\\ >(date)` opens the relative path ` /dev/fd/N`; only the bare `> >(cmd)` is a pipe."""
+        params = extract_bash_subcommands(f"{self.FETCH} >\\ >(date)")
+        self.assertIn("date", params)
+        self.assertEqual(len(params), 3, params)
+        self.assertFalse(all_params_match_any(self.OWNER + self._preset(), "Bash", params), params)
+
+    def test_shipped_preset_is_case_sensitive_on_the_directory(self):
+        preset = self._preset()
+        self.assertTrue(all_params_match_any(preset, "Bash", ["> /tmp/x"]))
+        self.assertFalse(all_params_match_any(preset, "Bash", ["> /TMP/x"]))
+        self.assertFalse(all_params_match_any(preset, "Write", ["/Tmp/x"]))
+        self.assertTrue(all_params_match_any(preset, "Write", ["/tmp/x"]))
+
+    # ── Codex round 2 on #177: the value must be knowable, not just slash-prefixed ──
+
+    def test_every_literal_prefix_before_an_expansion_is_cut(self):
+        """`logs${…}` with a relative `logs.*` rule — no slash in the prefix, still cut."""
+        params = extract_bash_subcommands(f"{self.FETCH} > logs${{HOME//root/../../..}}/etc/passwd")
+        self.assertEqual(params, [self.FETCH, "> ${HOME//root/../../..}/etc/passwd"])
+        rule = [ToolRule(tool="Bash", params=r">>?\s*logs.*")]
+        self.assertFalse(all_params_match_any(rule, "Bash", params[1:]))
+
+    def test_glob_metacharacters_make_the_target_unknowable(self):
+        """`normpath` on `/tmp/a/**/../../home/u/f` collapses the wrong components when `**` matches nothing."""
+        cases = {
+            "globstar": (f"{self.FETCH} > /tmp/a/**/../../home/user/file", "> **/../../home/user/file"),
+            "star": (f"{self.FETCH} > /tmp/*.log", "> *.log"),
+            "bracket": (f"{self.FETCH} > /tmp/[ab]/../../etc/x", "> [ab]/../../etc/x"),
+            "question": (f"{self.FETCH} > /tmp/?/../../etc/x", "> ?/../../etc/x"),
+        }
+        for label, (cmd, expected) in cases.items():
+            with self.subTest(label):
+                params = extract_bash_subcommands(cmd)
+                self.assertEqual(params, [self.FETCH, expected])
+                self.assertFalse(all_params_match_any(self._preset(), "Bash", params))
+
+    def test_quote_only_prefix_is_kept_for_readability(self):
+        self.assertEqual(extract_bash_subcommands(f'{self.FETCH} > "$HOME/x"'), [self.FETCH, '> "$HOME/x"'])
+        # single quotes would make bash treat `$HOME` literally; we still fail closed on it
+        self.assertEqual(extract_bash_subcommands(f"{self.FETCH} > '$HOME/x'"), [self.FETCH, "> '$HOME/x'"])
+
+    def test_shipped_preset_covers_every_file_writing_permission_name(self):
+        """Claude asks as Write/Edit/MultiEdit/NotebookEdit; OpenCode asks as `edit` for all of them."""
+        preset = self._preset()
+        for tool in ("Write", "Edit", "MultiEdit", "NotebookEdit", "edit"):
+            with self.subTest(tool):
+                self.assertTrue(all_params_match_any(preset, tool, ["/tmp/notes.md"]))
+                self.assertFalse(all_params_match_any(preset, tool, ["/TMP/notes.md"]))
+                self.assertFalse(all_params_match_any(preset, tool, ["/etc/passwd"]))
+        self.assertFalse(all_params_match_any(preset, "Read", ["/tmp/notes.md"]))
+
+    # ── Codex round 3 on #177 ────────────────────────────────────────────────
+
+    def test_line_continuation_in_target_fails_closed(self):
+        """`\\<newline>` in a target is matched as raw text: joined or kept depends on quoting bash
+        rules this module does not lex, so neither reading is trusted."""
+        cases = {
+            "outside quotes": f"{self.FETCH} > /var\\\n/tmp/x",
+            "inside single quotes": f"{self.FETCH} > '/tmp/sa\\\nfe/x'",
+            "single quote inside double quotes": f"{self.FETCH} > \"/tmp/a'/.\\\n./../../etc/passwd\"",
+        }
+        for label, cmd in cases.items():
+            with self.subTest(label):
+                params = extract_bash_subcommands(cmd)
+                self.assertEqual(len(params), 2, params)
+                self.assertIn("\\\n", params[1])
+                self.assertFalse(all_params_match_any(self._preset(), "Bash", params), params)
+                self.assertFalse(all_params_match_any([ToolRule(tool="Bash", params=r">>?\s*/tmp/safe/.*")], "Bash", params[1:]))
+
+    def test_grammar_failure_fails_closed_and_keeps_nested_commands(self):
+        """An ERROR node is not reconstructed: its shell-syntax text is a fragment nothing matches.
+
+        `<< E"OF"` with a plain body lands there whole — a valid quoted heredoc
+        that is now over-denied, by design. What must never happen is the
+        opposite: a nested `$(id)` next to it must still be collected, and
+        `python3` alone must never approve a script body.
+        """
+        cmd = 'coop send --room r - << E"OF"\nhello\nEOF'
+        params = extract_bash_subcommands(cmd)
+        self.assertFalse(all_params_match_any(self.OWNER, "Bash", params), params)
+        script = 'python3 << E"OF"\nimport os; os.remove("/important")\nEOF'
+        self.assertFalse(all_params_match_any([ToolRule(tool="Bash", params="python3")], "Bash", extract_bash_subcommands(script)))
+        nested = 'coop fetch-history --room r $(id) << E"OF"\nhello\nEOF'
+        params = extract_bash_subcommands(nested)
+        self.assertIn("id", params)
+        self.assertFalse(all_params_match_any(self.GUEST, "Bash", params), params)
+        # a redirect nested in the failed parse is still a redirect
+        self.assertIn("> out", extract_bash_subcommands('coop send --room r - << E"OF" > out\nhello\nEOF'))
+
+    def test_here_string_after_another_redirect_is_an_accepted_over_denial(self):
+        """`2>/dev/null <<< hi` is valid bash the grammar fails on; it fails closed rather than being guessed at."""
+        params = extract_bash_subcommands(f"{self.FETCH} 2>/dev/null <<< hi")
+        self.assertFalse(all_params_match_any(self.GUEST, "Bash", params), params)
+        # the plain here-string is fine
+        self.assertTrue(all_params_match_any(self.GUEST, "Bash", extract_bash_subcommands(f"{self.FETCH} <<< hi")))
+
+    def test_leading_tilde_is_an_expansion(self):
+        params = extract_bash_subcommands(f"{self.FETCH} > ~/../tmp/x")
+        self.assertEqual(params, [self.FETCH, "> ~/../tmp/x"])
+        self.assertFalse(all_params_match_any([ToolRule(tool="Bash", params=r">>?\s*tmp/.*")], "Bash", params[1:]))
+        self.assertFalse(all_params_match_any(self._preset(), "Bash", params))
+
+    def test_shipped_preset_covers_opencode_external_directory_ask(self):
+        """OpenCode asks `external_directory` with `<dir>/*` before editing outside the cwd."""
+        preset = self._preset()
+        self.assertTrue(all_params_match_any(preset, "external_directory", ["/tmp/*"]))
+        self.assertTrue(all_params_match_any(preset, "external_directory", ["/tmp/sub/*"]))
+        self.assertFalse(all_params_match_any(preset, "external_directory", ["/tmpfoo/*"]))
+        self.assertFalse(all_params_match_any(preset, "external_directory", ["/TMP/*"]))
+        self.assertFalse(all_params_match_any(preset, "external_directory", ["/etc/*"]))
+
+    def test_escaped_space_in_target_is_one_path(self):
+        """A path with a space is returned quoted, so a rule sees one word."""
+        self.assertEqual(extract_bash_subcommands(f"{self.FETCH} > /tmp/x\\ y"), [self.FETCH, "> '/tmp/x y'"])
+        self.assertTrue(all_params_match_any(self._preset(), "Bash", ["> '/tmp/x y'"]))
+
+    def test_escaped_space_right_after_the_operator_is_part_of_the_path(self):
+        """`>\\ /tmp/x` opens the relative path ` /tmp/x` (a directory named " "), not /tmp/x."""
+        params = extract_bash_subcommands(f"{self.FETCH} >\\ /tmp/x")
+        self.assertEqual(params, [self.FETCH, "> ' /tmp/x'"])
+        self.assertFalse(all_params_match_any(self._preset(), "Bash", params))
+
+    def test_owner_coop_send_with_stderr_to_dev_null_still_passes(self):
+        params = extract_bash_subcommands('coop send --room r "hi" 2>/dev/null')
+        self.assertTrue(all_params_match_any(self.OWNER, "Bash", params))
 
 
 # ── get_param_strings_for_claude ─────────────────────────────────────────────

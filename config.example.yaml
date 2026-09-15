@@ -39,6 +39,29 @@ tool_presets:
     - tool: "Glob"
     - tool: "Grep"
     - tool: "WebSearch"
+  # Scratch files under /tmp — the Write tool and a bash redirect (`> /tmp/x`,
+  # `>> /tmp/x`) are two doors to the same directory, so they are one rule.
+  # A bash redirect is matched as its own string, operator included, so this
+  # never allows *running* something from /tmp. Not in any built-in list:
+  # guests are read-only, and owners opt in by referencing the preset.
+  # params regexes match case-insensitively; `(?-i:...)` keeps the directory
+  # prefix exact so `/TMP/x` (a different directory on Linux) is not granted.
+  # The tool regex covers Claude's Write/Edit/MultiEdit/NotebookEdit and
+  # OpenCode's `edit` (the permission name its write, edit and multiedit
+  # tools ask under).
+  # Rules are lexical: a symlink planted at /tmp/x pointing elsewhere is not
+  # resolved. If that matters, point the preset at a private scratch directory.
+  scratch-dir:
+    - tool: "(Write|Edit|MultiEdit|NotebookEdit)"
+      params: "(?-i:/tmp/).*"
+    # A target with whitespace in it comes back shell-quoted (`> '/tmp/x y'`),
+    # hence the optional quote before the prefix.
+    - tool: "Bash"
+      params: ">>?\\s*'?(?-i:/tmp/).*"
+    # OpenCode also asks `external_directory` (pattern `<dir>/*`) before any
+    # file tool touches a path outside the agent's working directory.
+    - tool: "external_directory"
+      params: "(?-i:/tmp)(/.*)?"
 
 connectors:
   # ── Voice Gateway (Siri / iOS Shortcuts) ─────────────────────────────────
