@@ -313,6 +313,100 @@ class TestExtractBashSubcommandsSubstitutions(unittest.TestCase):
         self.assertFalse(all_params_match_any(owner_rules, "Bash", params))
 
 
+# ── substitutions the parser misses fail closed ──────────────────────────────
+
+
+class TestUnparsedSubstitutionsFailClosed(unittest.TestCase):
+    """tree-sitter-bash 0.25.1 leaves some substitutions as plain text; bash runs them.
+
+    Codex review of #174 found two: a ``$(…)`` on an indented line of an unquoted
+    heredoc body, and a backtick inside a ``${x:-…}`` expansion. Each is returned
+    as its own sub-command so a rule has to match the raw text — the built-in
+    ``coop`` rules never do.
+    """
+
+    FETCH = "coop fetch-history --room r"
+    GUEST = AgentConfig().effective_guest_allowed_tools()
+
+    # Every placement bash expands but the parser does not structure. Adding a
+    # newly discovered one here is the whole fix for it.
+    EXECUTED_BUT_UNPARSED = {
+        "indented heredoc line (<<)": f"{FETCH} << EOF\n\t$(rm -rf /tmp/x)\nEOF",
+        "indented heredoc line (<<-)": f"{FETCH} <<-EOF\n\t$(rm -rf /tmp/x)\nEOF",
+        "indented second heredoc line": f"{FETCH} << EOF\nline1\n  $(rm -rf /tmp/x)\nEOF",
+        "backtick in ${x:-…}": "coop fetch-history --room ${x:-`rm -rf /tmp/x`}",
+        "backtick in quoted ${x:-…}": 'coop fetch-history --room "${x:-`rm -rf /tmp/x`}"',
+        "backtick in ${x#…} pattern": "coop fetch-history --room ${x#`rm -rf /tmp/x`}",
+        "backtick in unquoted heredoc body": f"{FETCH} << EOF\n`rm -rf /tmp/x`\nEOF",
+    }
+
+    def test_every_unparsed_placement_yields_an_extra_sub_command(self):
+        for label, cmd in self.EXECUTED_BUT_UNPARSED.items():
+            with self.subTest(label):
+                result = extract_bash_subcommands(cmd)
+                self.assertGreater(len(result), 1, result)
+                self.assertTrue(any("rm -rf /tmp/x" in extra for extra in result[1:]), result)
+
+    def test_every_unparsed_placement_is_denied_for_a_guest(self):
+        for label, cmd in self.EXECUTED_BUT_UNPARSED.items():
+            with self.subTest(label):
+                params = extract_bash_subcommands(cmd)
+                self.assertFalse(all_params_match_any(self.GUEST, "Bash", params), params)
+
+    def test_backtick_in_expansion_returns_the_raw_text(self):
+        result = extract_bash_subcommands("coop fetch-history --room ${x:-`id`}")
+        self.assertEqual(result, ["coop fetch-history --room ${x:-`id`}", "`id`"])
+
+    def test_indented_heredoc_returns_the_body(self):
+        cmd = f"{self.FETCH} <<-EOF\n\t$(id)\nEOF"
+        self.assertEqual(extract_bash_subcommands(cmd), [cmd, "$(id)\n"])
+
+    # ── places bash does not expand: a marker there is literal text ──────────
+
+    NEVER_EXPANDED = {
+        "single-quoted heredoc": f"{FETCH} << 'EOF'\n$(id)\nEOF",
+        "double-quoted heredoc": f'{FETCH} << "EOF"\n$(id)\nEOF',
+        "backslash-quoted heredoc": f"{FETCH} << \\EOF\n$(id)\nEOF",
+        "single-quoted word": "coop fetch-history --room '$(id)'",
+        "ansi-c string": "coop fetch-history --room $'$(id)'",
+        "arithmetic expansion": f"{FETCH} $((1+1))",
+    }
+
+    def test_never_expanded_places_stay_a_single_sub_command(self):
+        for label, cmd in self.NEVER_EXPANDED.items():
+            with self.subTest(label):
+                result = extract_bash_subcommands(cmd)
+                self.assertEqual(len(result), 1, result)
+                self.assertTrue(all_params_match_any(self.GUEST, "Bash", result), result)
+
+    def test_marker_in_trailing_comment_is_ignored(self):
+        self.assertEqual(extract_bash_subcommands(f"{self.FETCH} # $(id)"), [self.FETCH])
+
+    def test_escaped_markers_are_literal(self):
+        """``coop send … "use \\`ls\\`"`` is markdown, not a substitution — bash does not run it."""
+        cases = {
+            "escaped backtick in double quotes": 'coop send --room r "use \\`ls\\` here"',
+            "escaped dollar-paren in double quotes": 'coop send --room r "costs \\$(5)"',
+            "escaped backtick in bare word": "coop send --room r use\\ \\`ls\\`",
+            "escaped backtick in unquoted heredoc": "coop send --room r --file - << EOF\nuse \\`ls\\` here\nEOF",
+        }
+        owner = AgentConfig().effective_owner_allowed_tools()
+        for label, cmd in cases.items():
+            with self.subTest(label):
+                result = extract_bash_subcommands(cmd)
+                self.assertEqual(len(result), 1, result)
+                self.assertTrue(all_params_match_any(owner, "Bash", result), result)
+
+    def test_unescaped_backtick_in_unquoted_heredoc_fails_closed(self):
+        """The same heredoc without the escapes runs ``ls``.
+
+        The parser leaves a backtick in a heredoc body unparsed (only ``$(…)``
+        gets a node there), so this is the raw-text path, not the AST path.
+        """
+        cmd = "coop send --room r --file - << EOF\nuse `ls` here\nEOF"
+        self.assertEqual(extract_bash_subcommands(cmd), [cmd, "use `ls` here\n"])
+
+
 # ── get_param_strings_for_claude ─────────────────────────────────────────────
 
 

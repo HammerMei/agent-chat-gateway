@@ -84,6 +84,35 @@ def _get_bash_parser():
         return None
 
 
+# Text that opens a substitution bash will execute.  The AST is not a complete
+# oracle for these: with tree-sitter-bash 0.25.1 a ``$(...)`` on an indented
+# heredoc line, any backtick in a heredoc body, or a backtick inside a
+# ``${x:-...}`` / ``${x#...}`` expansion, comes back as a plain
+# ``heredoc_body`` / ``word`` / ``regex`` leaf with no
+# ``command_substitution`` child, while bash runs it.  So every named leaf the
+# walker reaches is also scanned for these markers, and a hit is returned as its
+# own sub-command (fail closed: it must match a rule on its own).
+_SUBSTITUTION_MARKERS: tuple[str, ...] = ("$(", "`", "<(", ">(")
+_ESCAPED_CHAR = re.compile(r"\\.", re.DOTALL)
+
+# Leaves bash never expands, so a marker inside them is literal text.  A quoted
+# heredoc body is the other case and is handled where the heredoc is walked.
+_NEVER_EXPANDED_LEAVES: frozenset[str] = frozenset({
+    "raw_string",     # '...'
+    "ansi_c_string",  # $'...'
+    "comment",
+})
+
+
+def _heredoc_is_quoted(heredoc_redirect, src: bytes) -> bool:
+    """True for ``<< 'EOF'``, ``<< "EOF"`` and ``<< \\EOF`` — bodies bash does not expand."""
+    for child in heredoc_redirect.children:
+        if child.type == "heredoc_start":
+            start = src[child.start_byte:child.end_byte].decode()
+            return start[:1] in ("'", '"', "\\")
+    return False
+
+
 def extract_bash_subcommands(command: str) -> list[str]:
     """Split a compound bash command string into individual sub-command strings.
 
@@ -100,6 +129,14 @@ def extract_bash_subcommands(command: str) -> list[str]:
     body.  Requiring all of them to match is what stops ``$(rm -rf x)`` riding
     through a ``.*`` rule on the parent.  OpenCode's shell tool does the same
     (``descendantsOfType("command")``), so both brokers see the same list.
+
+    The parser misses some substitutions bash executes (an indented line in an
+    unquoted heredoc body; a backtick inside a ``${x:-...}`` expansion — see
+    ``_SUBSTITUTION_MARKERS``).  Any named leaf that still contains ``$(``, a
+    backtick, ``<(`` or ``>(`` and is not one bash never expands (single-quoted
+    string, ``$'...'``, comment, quoted heredoc body) is therefore returned as a
+    sub-command of its own, so it fails closed against every rule that does not
+    match that raw text.
 
     Heredoc redirections (``cmd << 'EOF' ... EOF``): the full
     ``redirected_statement`` text is returned as a single string so that
@@ -125,6 +162,20 @@ def extract_bash_subcommands(command: str) -> list[str]:
             walk(child)
 
     def walk(node) -> None:
+        if node.child_count == 0:
+            if node.is_named and node.type not in _NEVER_EXPANDED_LEAVES:
+                text = src[node.start_byte:node.end_byte].decode()
+                # A backslash-escaped ``\``` or ``\$`` is literal in a word, a
+                # double-quoted string and an unquoted heredoc body alike, so
+                # drop escaped characters before looking for an opener.
+                unescaped = _ESCAPED_CHAR.sub("", text)
+                if any(marker in unescaped for marker in _SUBSTITUTION_MARKERS):
+                    # A substitution the parser did not turn into a node (see
+                    # ``_SUBSTITUTION_MARKERS``).  bash will still run it, so it
+                    # becomes a sub-command of its own: only a rule that matches
+                    # this raw text approves it.
+                    commands.append(text)
+            return
         if node.type == "command":
             commands.append(src[node.start_byte:node.end_byte].decode())
             # A substitution nested in this command's words, strings, assignments
@@ -157,6 +208,10 @@ def extract_bash_subcommands(command: str) -> list[str]:
                 for child in node.children:
                     if child.type == "command":
                         descend(child)
+                    elif child.type == "heredoc_redirect" and _heredoc_is_quoted(child, src):
+                        # ``<< 'EOF'`` / ``<< "EOF"`` / ``<< \EOF``: bash does not
+                        # expand the body, so a ``$(`` in it is text, not a command.
+                        continue
                     else:
                         walk(child)
                 return

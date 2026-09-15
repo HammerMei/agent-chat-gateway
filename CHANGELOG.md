@@ -98,7 +98,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   substitution is now a sub-command of its own and must match a rule too, wherever
   it sits (quoted string, `${v:-$(…)}`, `x=$(…) prog`, redirect target,
   herestring, unquoted heredoc body). This is what OpenCode's shell tool already
-  emits, so the two brokers agree. Owners: `coop send … $(date …)` still passes
+  emits, so the two brokers agree. Where the parser leaves a substitution as
+  plain text (an indented heredoc line, a backtick inside `${x:-…}`) the raw
+  text is returned as its own sub-command, so it fails closed. Owners: `coop send … $(date …)` still passes
   through the built-in `date` rule; any other substitution inside an allow-listed
   command is no longer auto-approved unless the nested command has a rule of its
   own. Redirect targets themselves are still not matched — #173.
