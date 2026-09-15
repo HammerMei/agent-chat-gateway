@@ -105,11 +105,17 @@ _NEVER_EXPANDED_LEAVES: frozenset[str] = frozenset({
 
 
 def _heredoc_is_quoted(heredoc_redirect, src: bytes) -> bool:
-    """True for ``<< 'EOF'``, ``<< "EOF"`` and ``<< \\EOF`` — bodies bash does not expand."""
+    """True when bash will not expand the heredoc body.
+
+    bash treats the body as quoted if *any part* of the delimiter is quoted:
+    ``<< 'EOF'``, ``<< "EOF"``, ``<< \\EOF``, but also ``<< E"OF"``, ``<< E\\OF``
+    and ``<< $'EOF'``.  So any quote or backslash anywhere in the delimiter
+    counts, not only a leading one.
+    """
     for child in heredoc_redirect.children:
         if child.type == "heredoc_start":
             start = src[child.start_byte:child.end_byte].decode()
-            return start[:1] in ("'", '"', "\\")
+            return any(ch in start for ch in ("'", '"', "\\"))
     return False
 
 
@@ -209,8 +215,8 @@ def extract_bash_subcommands(command: str) -> list[str]:
                     if child.type == "command":
                         descend(child)
                     elif child.type == "heredoc_redirect" and _heredoc_is_quoted(child, src):
-                        # ``<< 'EOF'`` / ``<< "EOF"`` / ``<< \EOF``: bash does not
-                        # expand the body, so a ``$(`` in it is text, not a command.
+                        # A quoted delimiter (``'EOF'``, ``E"OF"``, ``\EOF``, …): bash
+                        # does not expand the body, so a ``$(`` in it is text.
                         continue
                     else:
                         walk(child)
