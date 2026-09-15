@@ -659,27 +659,38 @@ class TestRedirectTargets(unittest.TestCase):
         # outside quotes it is still joined
         self.assertEqual(extract_bash_subcommands(f"{self.FETCH} > /tmp/sa\\\nfe/x"), [self.FETCH, "> /tmp/safe/x"])
 
-    def test_misparsed_quoted_heredoc_keeps_command_and_body_as_one_string(self):
-        """`<< E"OF"` with a plain body lands in an ERROR node next to its command.
+    def test_grammar_failure_fails_closed_and_keeps_nested_commands(self):
+        """An ERROR node is not reconstructed: its shell-syntax text is a fragment nothing matches.
 
-        It gets the same shape as an attached heredoc: one string with the
-        command and the whole heredoc, so `coop send …` still matches the
-        built-in rule while `python3` alone cannot approve a script body.
+        `<< E"OF"` with a plain body lands there whole — a valid quoted heredoc
+        that is now over-denied, by design. What must never happen is the
+        opposite: a nested `$(id)` next to it must still be collected, and
+        `python3` alone must never approve a script body.
         """
         cmd = 'coop send --room r - << E"OF"\nhello\nEOF'
         params = extract_bash_subcommands(cmd)
-        self.assertEqual(params, [cmd])
-        self.assertTrue(all_params_match_any(self.OWNER, "Bash", params), params)
+        self.assertFalse(all_params_match_any(self.OWNER, "Bash", params), params)
         script = 'python3 << E"OF"\nimport os; os.remove("/important")\nEOF'
-        params = extract_bash_subcommands(script)
-        self.assertEqual(params, [script])
-        self.assertFalse(all_params_match_any([ToolRule(tool="Bash", params="python3")], "Bash", params))
-        # same as the attached spelling
-        attached = "python3 << 'EOF'\nimport os; os.remove(\"/important\")\nEOF"
-        self.assertFalse(all_params_match_any([ToolRule(tool="Bash", params="python3")], "Bash", extract_bash_subcommands(attached)))
-        # a redirect on the same line still counts
-        with_redirect = 'coop send --room r - << E"OF" > out\nhello\nEOF'
-        self.assertIn("> out", extract_bash_subcommands(with_redirect))
+        self.assertFalse(all_params_match_any([ToolRule(tool="Bash", params="python3")], "Bash", extract_bash_subcommands(script)))
+        nested = 'coop fetch-history --room r $(id) << E"OF"\nhello\nEOF'
+        params = extract_bash_subcommands(nested)
+        self.assertIn("id", params)
+        self.assertFalse(all_params_match_any(self.GUEST, "Bash", params), params)
+        # a redirect nested in the failed parse is still a redirect
+        self.assertIn("> out", extract_bash_subcommands('coop send --room r - << E"OF" > out\nhello\nEOF'))
+
+    def test_here_string_after_another_redirect_is_an_accepted_over_denial(self):
+        """`2>/dev/null <<< hi` is valid bash the grammar fails on; it fails closed rather than being guessed at."""
+        params = extract_bash_subcommands(f"{self.FETCH} 2>/dev/null <<< hi")
+        self.assertFalse(all_params_match_any(self.GUEST, "Bash", params), params)
+        # the plain here-string is fine
+        self.assertTrue(all_params_match_any(self.GUEST, "Bash", extract_bash_subcommands(f"{self.FETCH} <<< hi")))
+
+    def test_leading_tilde_is_an_expansion(self):
+        params = extract_bash_subcommands(f"{self.FETCH} > ~/../tmp/x")
+        self.assertEqual(params, [self.FETCH, "> ~/../tmp/x"])
+        self.assertFalse(all_params_match_any([ToolRule(tool="Bash", params=r">>?\s*tmp/.*")], "Bash", params[1:]))
+        self.assertFalse(all_params_match_any(self._preset(), "Bash", params))
 
     def test_shipped_preset_covers_opencode_external_directory_ask(self):
         """OpenCode asks `external_directory` with `<dir>/*` before editing outside the cwd."""

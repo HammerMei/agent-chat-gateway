@@ -206,8 +206,8 @@ def _redirect_param(file_redirect, src: bytes) -> str | None:
     The rule: **a target is normalized and matched as a path only when the
     path bash will open is knowable from the text.**
 
-    - A **literal** target (no unescaped ``$``, backtick, ``*``, ``?``, ``[``)
-      is shell-unquoted as a whole — ``/tmp/'..'/etc/passwd`` is
+    - A **literal** target (no unescaped ``$``, backtick, ``*``, ``?``, ``[``,
+      and no leading ``~``) is shell-unquoted as a whole — ``/tmp/'..'/etc/passwd`` is
       ``/tmp/../etc/passwd`` — and then ``normpath``-ed, relative or absolute,
       so ``..`` cannot hide behind quotes or a prefix: ``> /tmp/../etc/passwd``
       matches as ``> /etc/passwd``, ``> logs/../../x`` as ``> ../x``.
@@ -259,6 +259,8 @@ def _redirect_param(file_redirect, src: bytes) -> str | None:
     if len(dest_children) == 1 and dest_children[0].type == "process_substitution":
         return None
     unknowable_at = _first_unknowable(dest)
+    if dest.startswith("~"):
+        unknowable_at = 0  # tilde expansion: ``~/../tmp/x`` is not ``tmp/x``
     if unknowable_at >= 0:
         # The path bash opens is not knowable from here on, so nothing before
         # this point may be matched either: cut every literal prefix
@@ -406,41 +408,17 @@ def extract_bash_subcommands(command: str) -> list[str]:
                     walk(child)
             return
         if node.type == "ERROR":
-            # Text the grammar could not place.  bash will still interpret it —
-            # ``grep x <>/tmp/f`` parses as ERROR(``<``) + ``>/tmp/f`` — so a
-            # fragment carrying shell syntax (a redirect, pipe, list operator or
-            # expansion) is returned as a sub-command that must match a rule on
-            # its own (fail closed).  A stray plain word (the ``EOF`` the grammar
-            # drops after a ``<< E"OF"`` heredoc) is not.  Walked either way.
-            heredoc_start = next(
-                (c for c in node.children if c.type == "heredoc_start"), None
-            )
-            if heredoc_start is not None:
-                # A heredoc the grammar could not attach (``<< E"OF"`` with a
-                # plain body lands here whole, next to its command instead of
-                # inside a ``redirected_statement``).  Give it the same shape
-                # the attached case gets: one string holding command *and*
-                # heredoc, so a rule has to match the body too — ``python3``
-                # alone must not approve ``python3 << E"OF" …``.  The command
-                # was appended just before this node; replace it.
-                prev = node.prev_sibling
-                if prev is not None and prev.type == "command" and commands:
-                    commands.pop()
-                    commands.append(src[prev.start_byte:node.end_byte].decode())
-                else:
-                    commands.append(src[node.start_byte:node.end_byte].decode())
-                # Then, as for an attached heredoc: a quoted delimiter means a
-                # literal body, an unquoted one is walked for substitutions,
-                # and a ``> file`` on the line is a redirect either way.
-                quoted = any(
-                    ch in src[heredoc_start.start_byte:heredoc_start.end_byte].decode()
-                    for ch in ("'", '"', "\\")
-                )
-                for child in node.children:
-                    if child.type == "heredoc_body" and quoted:
-                        continue
-                    walk(child)
-                return
+            # Text the grammar could not place.  It is not reconstructed —
+            # every attempt to guess what the parser meant has been a second
+            # grammar with its own holes — so a fragment carrying shell syntax
+            # (a redirect, pipe, list operator or expansion) is returned as a
+            # sub-command that must match a rule on its own, which fails closed
+            # for every command-anchored rule.  A stray plain word (the ``EOF``
+            # the grammar drops after ``<< E"OF"``) is not returned.  The node
+            # is still walked, so a command or redirect nested in it is
+            # collected too.  Known over-denials, accepted: a heredoc with a
+            # partly quoted delimiter (``<< E"OF"``) and a here-string that
+            # follows another redirect (``2>/dev/null <<< hi``) both land here.
             text = src[node.start_byte:node.end_byte].decode().strip()
             if any(ch in text for ch in "<>|&;$`"):
                 commands.append(text)
