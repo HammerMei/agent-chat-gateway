@@ -170,6 +170,12 @@ command: "echo hello && rm -rf /"
 - The parser misses a few forms bash still executes (a `$(…)` on an indented line of an unquoted heredoc, a backtick inside a heredoc body or inside `${x:-…}`). **An unparsed substitution is unknown code**: the text is returned as a sub-command *starting at the `$(` or backtick*, so a rule anchored on a command name can never match it and only an allow-everything rule approves it. Single-quoted strings, `$'…'`, comments and quoted heredoc bodies are literal and not scanned; `<(`/`>(` is not scanned because bash performs process substitution only as a bare word, which the parser already structures.
 - So `params: "echo .*"` permits `echo $(date)` only if `date` also matches a rule — `echo $(rm -rf /)` is denied because `rm -rf /` matches nothing. This is what OpenCode's own shell tool emits as well, so the Claude and OpenCode brokers agree.
 
+**Redirect targets are parameter strings of their own:**
+- `coop fetch-history --room r > /tmp/x` → sub-commands `["coop fetch-history --room r", "> /tmp/x"]`. The target must match a rule too — the file is created or truncated under the gateway account, which is a consequence the command's own rule did not grant. The built-in guest rules never match a redirect, so guests cannot write anywhere by default.
+- The operator is part of the string, so a rule allowing a redirect (`">>?\\s*/tmp/.*"`) cannot also allow running `/tmp/evil.sh`. Absolute targets are `normpath`-ed (`> /tmp/../etc/passwd` matches as `> /etc/passwd`). Input redirects (`< file`) are returned as well.
+- Not returned, because nothing is written: descriptor duplications and closes (`2>&1`, `>&2`, `3>&-`) and sinks (`/dev/null`, `/dev/stdout`, `/dev/stderr`, `/dev/fd/N`).
+- The `scratch-dir` preset in `config.example.yaml` is the one-line opt-in for owners who want `/tmp` writes (Write tool and bash redirect together).
+
 **Fallback (tree-sitter unavailable):**
 - If `tree-sitter` or `tree-sitter-bash` is not installed, the whole command is treated as one string
 - Warning logged on first use; compound splitting is disabled but gateway continues operating

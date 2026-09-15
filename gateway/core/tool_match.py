@@ -130,6 +130,54 @@ _NEVER_EXPANDED_LEAVES: frozenset[str] = frozenset({
 })
 
 
+# Redirect operators that duplicate or close a descriptor rather than open a
+# file: ``2>&1``, ``>&2``, ``3>&-``, ``<&0``.  Nothing is written anywhere.
+_FD_ONLY_REDIRECT_OPERATORS: frozenset[str] = frozenset({">&", "<&", ">&-", "<&-"})
+
+# Destinations that are sinks, not files: writing to them has no persistent
+# effect, so a redirect to one is not a parameter to match.
+_SINK_DESTINATIONS: frozenset[str] = frozenset({"/dev/null", "/dev/stdout", "/dev/stderr"})
+_DEV_FD = re.compile(r"/dev/fd/\d+")
+
+
+def _redirect_param(file_redirect, src: bytes) -> str | None:
+    """Return the parameter string for a ``file_redirect`` node, or None.
+
+    ``cmd > /tmp/x`` yields ``"> /tmp/x"``: the operator is kept so a rule
+    that allows a redirect (``>>?\\s*/tmp/.*``) cannot also allow *running*
+    ``/tmp/x``, and an absolute destination is ``normpath``-ed so
+    ``> /tmp/../etc/passwd`` is matched as ``> /etc/passwd``.  A descriptor
+    duplication (``2>&1``), a descriptor close (``3>&-``) and a redirect to
+    ``/dev/null`` / ``/dev/stdout`` / ``/dev/stderr`` / ``/dev/fd/N`` write
+    nothing and return None.  Input redirects (``< file``) are returned too —
+    the file's contents reach the command.
+    """
+    fd = ""
+    operator = ""
+    dest = ""
+    for child in file_redirect.children:
+        text = src[child.start_byte:child.end_byte].decode()
+        if child.type == "file_descriptor":
+            fd = text
+        elif not child.is_named:
+            operator = text
+        elif child.type == "ERROR":
+            operator += text.strip()
+        else:
+            dest = text.strip()
+    if operator in _FD_ONLY_REDIRECT_OPERATORS and (not dest or dest.isdigit()):
+        return None
+    if len(dest) >= 2 and dest[0] == dest[-1] and dest[0] in "'\"" and not any(
+        ch in dest for ch in "$`"
+    ):
+        dest = dest[1:-1]  # a plainly quoted path is the same path
+    if dest.startswith("/"):
+        dest = os.path.normpath(dest)
+    if dest in _SINK_DESTINATIONS or _DEV_FD.fullmatch(dest):
+        return None
+    return f"{fd}{operator} {dest}".rstrip()
+
+
 def _heredoc_is_quoted(heredoc_redirect, src: bytes) -> bool:
     """True when bash will not expand the heredoc body.
 
@@ -174,9 +222,15 @@ def extract_bash_subcommands(command: str) -> list[str]:
     Heredoc redirections (``cmd << 'EOF' ... EOF``): the full
     ``redirected_statement`` text is returned as a single string so that
     allow-list patterns can inspect the heredoc body content (e.g. a Python
-    script piped to the interpreter).  For regular file redirections
-    (``> file``, ``< file``, etc.) only the ``command`` child is returned —
-    consistent with non-redirected commands.
+    script piped to the interpreter).
+
+    File redirections (``> file``, ``>> file``, ``2> file``, ``< file``): the
+    command is returned on its own, and each redirect is returned as a
+    parameter string of its own **with its operator** — ``"> /tmp/x"`` — so
+    the target has to match a rule too, and a rule that allows the redirect
+    cannot be mistaken for one that allows running ``/tmp/x``.  Descriptor
+    duplications (``2>&1``) and sinks (``/dev/null``) write nothing and are
+    not returned.  See :func:`_redirect_param`.
 
     Falls back to ``[command]`` (treat whole string as one command) when:
       - tree-sitter is not installed
@@ -224,6 +278,16 @@ def extract_bash_subcommands(command: str) -> list[str]:
             # still nodes below it and are still collected.
             arithmetic(node)
             return
+        if node.type == "file_redirect":
+            # The target of ``> file`` is a consequence of its own — the file is
+            # created or truncated under the gateway account — so it is a
+            # parameter string of its own, operator included (#173).  Descend
+            # too: ``> $(id)`` still has a command in it.
+            param = _redirect_param(node, src)
+            if param is not None:
+                commands.append(param)
+            descend(node)
+            return
         if node.type == "command":
             commands.append(src[node.start_byte:node.end_byte].decode())
             # A substitution nested in this command's words, strings, assignments
@@ -239,8 +303,8 @@ def extract_bash_subcommands(command: str) -> list[str]:
             # can inspect the heredoc body.
             #
             # For non-heredoc redirections (file I/O, e.g. ``echo hi > /tmp/f``),
-            # fall through to normal child traversal so only the ``command`` node
-            # text is extracted — consistent with prior behaviour.
+            # fall through to normal child traversal: the ``command`` node and
+            # each ``file_redirect`` become parameter strings of their own.
             has_heredoc = any(
                 child.type in ("heredoc_redirect", "herestring_redirect")
                 for child in node.children
@@ -258,8 +322,11 @@ def extract_bash_subcommands(command: str) -> list[str]:
                         descend(child)
                     elif child.type == "heredoc_redirect" and _heredoc_is_quoted(child, src):
                         # A quoted delimiter (``'EOF'``, ``E"OF"``, ``\EOF``, …): bash
-                        # does not expand the body, so a ``$(`` in it is text.
-                        continue
+                        # does not expand the body, so a ``$(`` in it is text.  Only
+                        # a ``> file`` sharing the line still counts.
+                        for part in child.children:
+                            if part.type == "file_redirect":
+                                walk(part)
                     else:
                         walk(child)
                 return

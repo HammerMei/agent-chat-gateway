@@ -39,6 +39,16 @@ tool_presets:
     - tool: "Glob"
     - tool: "Grep"
     - tool: "WebSearch"
+  # Scratch files under /tmp — the Write tool and a bash redirect (`> /tmp/x`,
+  # `>> /tmp/x`) are two doors to the same directory, so they are one rule.
+  # A bash redirect is matched as its own string, operator included, so this
+  # never allows *running* something from /tmp. Not in any built-in list:
+  # guests are read-only, and owners opt in by referencing the preset.
+  scratch-dir:
+    - tool: "Write"
+      params: "/tmp/.*"
+    - tool: "Bash"
+      params: ">>?\\s*/tmp/.*"
 
 connectors:
   # ── Voice Gateway (Siri / iOS Shortcuts) ─────────────────────────────────
