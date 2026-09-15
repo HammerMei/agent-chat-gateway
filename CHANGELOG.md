@@ -89,6 +89,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `skip_owner_approval: true` is corrected — it never was one.
 
 ### Fixed
+- **Claude now sees the durable header** (#178). Claude Code records the
+  system prompt on a conversation's first request and replays it verbatim on
+  every later request and `--resume`, even when a later launch passes
+  different text. The gateway's first request is the session-creation init
+  prompt, which carries no header, so every `--append-system-prompt-file` that
+  followed was ignored: a Claude watcher never had the Coop identity or the
+  `to:` addressing rules, and answered "no" when asked whether
+  `<end-of-agent-chain>` was in its system prompt while an OpenCode watcher in
+  the same room answered "yes". Every Claude invocation now passes
+  `--system-prompt-snapshot off`, so the file is re-read on each turn — which
+  also makes the rewrite after a room rename take effect, and keeps the
+  prompt's date current instead of frozen at session creation. Prompt-cache
+  reads and creations measured the same with the record on and off. Already
+  running sessions are fixed on their next turn; no reset is needed. The
+  flag needs a Claude CLI that knows it (present from 2.1.270); an older
+  CLI rejects it and session creation fails loudly instead of running
+  without the header.
 - **A bash redirect target must match an allow rule** (#173). `cmd > file`
   returned only `cmd`, so `coop fetch-history --room r > ~/.ssh/authorized_keys`
   matched the built-in guest rule and truncated the file under the gateway

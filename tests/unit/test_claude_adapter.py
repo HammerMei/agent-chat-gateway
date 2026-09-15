@@ -295,9 +295,6 @@ class TestClaudeBackendCreateSession(unittest.IsolatedAsyncioTestCase):
         self.assertIn(b"Chat session initialized", init_bytes)
 
 
-if __name__ == "__main__":
-    unittest.main()
-
 
 # ── Appended from test_round10_fixes.py ───────────────────────────────────────
 
@@ -632,3 +629,68 @@ class TestClaudeBackendTypicalSessionRetentionDays(unittest.TestCase):
     def test_returns_30(self):
         backend = _make_backend()
         self.assertEqual(backend.typical_session_retention_days(), 30)
+
+
+# ── --system-prompt-snapshot off on every invocation (issue #178) ─────────────
+
+
+def _snapshot_flag_value(cmd: list[str]) -> str:
+    """Return the value that follows --system-prompt-snapshot; fail if absent or duplicated."""
+    hits = [i for i, arg in enumerate(cmd) if arg == "--system-prompt-snapshot"]
+    assert len(hits) == 1, f"expected exactly one --system-prompt-snapshot in {cmd}"
+    return cmd[hits[0] + 1]
+
+
+class TestClaudeBackendSystemPromptSnapshotOff(unittest.IsolatedAsyncioTestCase):
+    """Claude replays the system prompt recorded on a conversation's first request
+    and ignores a later --append-system-prompt-file unless the record is off.
+    create_session() is that first request and carries no durable header, so
+    every invocation — create, send, stream — must pass the flag, or the header
+    written for later turns is never read (#178)."""
+
+    async def test_create_session_turns_the_record_off(self):
+        backend = _make_backend()
+        proc = MagicMock()
+        proc.returncode = 0
+        proc.communicate = AsyncMock(
+            return_value=(json.dumps({"session_id": "new-sess-001"}).encode(), b"")
+        )
+
+        with patch("asyncio.create_subprocess_exec", return_value=proc) as mock_exec:
+            await backend.create_session(working_directory="/tmp")
+
+        self.assertEqual(_snapshot_flag_value(_cmd_from_call(mock_exec.call_args)), "off")
+
+    async def test_send_turns_the_record_off(self):
+        backend = _make_backend()
+        proc = _make_mock_process(stdout_bytes=_stream_json_output("ok"))
+
+        with patch("asyncio.create_subprocess_exec", return_value=proc) as mock_exec:
+            await backend.send(
+                session_id="sess-1",
+                prompt="hi",
+                working_directory="/tmp",
+                timeout=10,
+                append_system_prompt_file="/tmp/.acg-system-prompt/w.md",
+            )
+
+        self.assertEqual(_snapshot_flag_value(_cmd_from_call(mock_exec.call_args)), "off")
+
+    async def test_stream_turns_the_record_off(self):
+        backend = _make_backend()
+        proc = _make_mock_process(stdout_bytes=_stream_json_output("ok"))
+
+        with patch("asyncio.create_subprocess_exec", return_value=proc) as mock_exec:
+            async for _ in backend.stream(
+                session_id="sess-1",
+                prompt="hi",
+                working_directory="/tmp",
+                timeout=10,
+                append_system_prompt_file="/tmp/.acg-system-prompt/w.md",
+            ):
+                pass
+
+        self.assertEqual(_snapshot_flag_value(_cmd_from_call(mock_exec.call_args)), "off")
+
+if __name__ == "__main__":
+    unittest.main()

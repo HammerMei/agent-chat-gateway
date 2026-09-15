@@ -190,6 +190,21 @@ async def _terminate_gracefully(proc: asyncio.subprocess.Process) -> None:
         pass  # already dead or unrecoverable
 
 
+# Claude Code records the system prompt on a conversation's first request and
+# replays that record verbatim on every later request and --resume, "even when
+# a later launch passes different text, until the conversation is compacted"
+# (``claude --help``, ``--system-prompt-snapshot``, default ``on``). The
+# gateway's first request is ``create_session()``'s init prompt, which carries
+# no durable header, so with the default every later
+# ``--append-system-prompt-file`` was ignored and Claude never saw the Coop
+# identity / addressing rules (#178). Every invocation turns the record off so
+# the file is re-read on each turn — the contract ``ensure_durable_instructions``
+# documents — which also makes a rewrite after a room rename take effect.
+# Measured against three back-to-back resumes with an identical file, the
+# prompt-cache read/creation counts are the same with the record on and off.
+_SYSTEM_PROMPT_SNAPSHOT_OFF = ("--system-prompt-snapshot", "off")
+
+
 def _atomic_write_text(path: Path, content: str) -> None:
     """Write ``content`` to ``path`` atomically (temp file + ``os.replace``).
 
@@ -492,6 +507,7 @@ class ClaudeBackend(AgentBackend):
             "-p",
             "--output-format",
             "json",
+            *_SYSTEM_PROMPT_SNAPSHOT_OFF,
             *args_to_use,
         ]
         if session_title:
@@ -604,6 +620,7 @@ class ClaudeBackend(AgentBackend):
             "--output-format",
             "stream-json",
             "--verbose",
+            *_SYSTEM_PROMPT_SNAPSHOT_OFF,
         ]
         if self.settings_path:
             cmd += ["--dangerously-skip-permissions", "--settings", self.settings_path]
@@ -808,6 +825,7 @@ class ClaudeBackend(AgentBackend):
             "--output-format",
             "stream-json",
             "--verbose",
+            *_SYSTEM_PROMPT_SNAPSHOT_OFF,
         ]
         if self.settings_path:
             cmd += ["--dangerously-skip-permissions", "--settings", self.settings_path]
