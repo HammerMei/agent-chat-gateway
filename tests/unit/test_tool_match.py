@@ -338,14 +338,24 @@ class TestUnparsedSubstitutionsFailClosed(unittest.TestCase):
         "backtick in quoted ${x:-…}": 'coop fetch-history --room "${x:-`rm -rf /tmp/x`}"',
         "backtick in ${x#…} pattern": "coop fetch-history --room ${x#`rm -rf /tmp/x`}",
         "backtick in unquoted heredoc body": f"{FETCH} << EOF\n`rm -rf /tmp/x`\nEOF",
+        # Codex round 3: the leaf itself begins with allow-listed text.
+        "heredoc line prefixed with an allowed command": f"{FETCH} << EOF\n{FETCH} `rm -rf /tmp/x`\nEOF",
     }
 
     def test_every_unparsed_placement_yields_an_extra_sub_command(self):
+        """The invariant: the extra sub-command *starts at the opener*.
+
+        Nothing before ``$(`` / the backtick is kept, so a rule anchored on a
+        command name cannot match it no matter what the attacker writes first.
+        """
         for label, cmd in self.EXECUTED_BUT_UNPARSED.items():
             with self.subTest(label):
                 result = extract_bash_subcommands(cmd)
                 self.assertGreater(len(result), 1, result)
-                self.assertTrue(any("rm -rf /tmp/x" in extra for extra in result[1:]), result)
+                extras = [x for x in result[1:] if "rm -rf /tmp/x" in x]
+                self.assertTrue(extras, result)
+                for extra in extras:
+                    self.assertTrue(extra.startswith(("$(", "`")), extra)
 
     def test_every_unparsed_placement_is_denied_for_a_guest(self):
         for label, cmd in self.EXECUTED_BUT_UNPARSED.items():
@@ -357,9 +367,22 @@ class TestUnparsedSubstitutionsFailClosed(unittest.TestCase):
         result = extract_bash_subcommands("coop fetch-history --room ${x:-`id`}")
         self.assertEqual(result, ["coop fetch-history --room ${x:-`id`}", "`id`"])
 
-    def test_indented_heredoc_returns_the_body(self):
+    def test_indented_heredoc_returns_from_the_opener(self):
         cmd = f"{self.FETCH} <<-EOF\n\t$(id)\nEOF"
         self.assertEqual(extract_bash_subcommands(cmd), [cmd, "$(id)\n"])
+
+    def test_arithmetic_in_heredoc_keeps_only_real_nested_substitutions(self):
+        """The parser mis-reads ``$((…))`` in a heredoc as a subshell command; bash does arithmetic.
+
+        ``1+2`` must not come back as a command; a genuine ``$(id)`` or backtick
+        inside the expression must.
+        """
+        plain = f"{self.FETCH} << EOF\ntotal $((1+2))\nEOF"
+        self.assertEqual(extract_bash_subcommands(plain), [plain])
+        nested = f"{self.FETCH} << EOF\ntotal $((1+$(id)))\nEOF"
+        self.assertEqual(extract_bash_subcommands(nested), [nested, "id"])
+        backtick = f"{self.FETCH} << EOF\ntotal $((1+`id`))\nEOF"
+        self.assertEqual(extract_bash_subcommands(backtick), [backtick, "id"])
 
     # ── places bash does not expand: a marker there is literal text ──────────
 
@@ -373,6 +396,12 @@ class TestUnparsedSubstitutionsFailClosed(unittest.TestCase):
         "single-quoted word": "coop fetch-history --room '$(id)'",
         "ansi-c string": "coop fetch-history --room $'$(id)'",
         "arithmetic expansion": f"{FETCH} $((1+1))",
+        "arithmetic expansion in heredoc": f"{FETCH} << EOF\ntotal $((1+2))\nEOF",
+        # bash performs process substitution only as a bare word (which the
+        # parser structures), never inside double quotes or a heredoc body.
+        "process-substitution text in double quotes": f'{FETCH} "compare <(old)"',
+        "process-substitution text in heredoc": f"{FETCH} << EOF\ncompare <(old) >(new)\nEOF",
+        "process-substitution text in ${{x:-…}}": "coop fetch-history --room ${x:-<(id)}",
     }
 
     def test_never_expanded_places_stay_a_single_sub_command(self):
@@ -407,7 +436,7 @@ class TestUnparsedSubstitutionsFailClosed(unittest.TestCase):
         gets a node there), so this is the raw-text path, not the AST path.
         """
         cmd = "coop send --room r --file - << EOF\nuse `ls` here\nEOF"
-        self.assertEqual(extract_bash_subcommands(cmd), [cmd, "use `ls` here\n"])
+        self.assertEqual(extract_bash_subcommands(cmd), [cmd, "`ls` here\n"])
 
 
 # ── get_param_strings_for_claude ─────────────────────────────────────────────

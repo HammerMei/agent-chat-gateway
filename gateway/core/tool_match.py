@@ -89,11 +89,37 @@ def _get_bash_parser():
 # heredoc line, any backtick in a heredoc body, or a backtick inside a
 # ``${x:-...}`` / ``${x#...}`` expansion, comes back as a plain
 # ``heredoc_body`` / ``word`` / ``regex`` leaf with no
-# ``command_substitution`` child, while bash runs it.  So every named leaf the
-# walker reaches is also scanned for these markers, and a hit is returned as its
-# own sub-command (fail closed: it must match a rule on its own).
-_SUBSTITUTION_MARKERS: tuple[str, ...] = ("$(", "`", "<(", ">(")
-_ESCAPED_CHAR = re.compile(r"\\.", re.DOTALL)
+# ``command_substitution`` child, while bash runs it.
+#
+# The rule for such a leaf: **an unparsed substitution is unknown code, and is
+# returned as a sub-command starting at its opener.**  Nothing before the opener
+# is included, so a rule anchored on a command name (every built-in rule, and
+# every sensible user rule) can never match it; only an allow-everything rule
+# does.  Returning the whole leaf instead would let ``coop fetch-history `rm x```
+# on a heredoc line satisfy the ``coop fetch-history`` rule.
+#
+# Process substitution (``<(...)`` / ``>(...)``) is not a marker: bash performs
+# it only as a bare word, which the parser does structure, and not inside
+# double quotes, heredoc bodies or ``${x:-...}`` (checked against bash).
+_SUBSTITUTION_MARKERS: tuple[str, ...] = ("$(", "`")
+
+
+def _unparsed_substitution(text: str) -> str | None:
+    r"""Return ``text`` from its first unescaped substitution opener, or None.
+
+    A backslash-escaped ``\``` or ``\$`` is literal in a word, a double-quoted
+    string and an unquoted heredoc body alike, so ``\x`` pairs are skipped.
+    """
+    i = 0
+    while i < len(text):
+        if text[i] == "\\":
+            i += 2
+            continue
+        for marker in _SUBSTITUTION_MARKERS:
+            if text.startswith(marker, i):
+                return text[i:]
+        i += 1
+    return None
 
 # Leaves bash never expands, so a marker inside them is literal text.  A quoted
 # heredoc body is the other case and is handled where the heredoc is walked.
@@ -138,11 +164,12 @@ def extract_bash_subcommands(command: str) -> list[str]:
 
     The parser misses some substitutions bash executes (an indented line in an
     unquoted heredoc body; a backtick inside a ``${x:-...}`` expansion — see
-    ``_SUBSTITUTION_MARKERS``).  Any named leaf that still contains ``$(``, a
-    backtick, ``<(`` or ``>(`` and is not one bash never expands (single-quoted
-    string, ``$'...'``, comment, quoted heredoc body) is therefore returned as a
-    sub-command of its own, so it fails closed against every rule that does not
-    match that raw text.
+    ``_SUBSTITUTION_MARKERS``).  Any named leaf that still contains an
+    unescaped ``$(`` or backtick, and is not one bash never expands
+    (single-quoted string, ``$'...'``, comment, quoted heredoc body), is
+    returned as a sub-command **starting at that opener**: an unparsed
+    substitution is unknown code, and cutting off everything before the opener
+    is what stops a rule anchored on a command name from ever matching it.
 
     Heredoc redirections (``cmd << 'EOF' ... EOF``): the full
     ``redirected_statement`` text is returned as a single string so that
@@ -167,20 +194,35 @@ def extract_bash_subcommands(command: str) -> list[str]:
         for child in node.children:
             walk(child)
 
+    def arithmetic(node) -> None:
+        # Never append a ``command`` from inside an arithmetic expansion; do
+        # walk every substitution node and scan every leaf found under it.
+        for child in node.children:
+            if child.type in ("command_substitution", "process_substitution") or child.child_count == 0:
+                walk(child)
+            else:
+                arithmetic(child)
+
     def walk(node) -> None:
         if node.child_count == 0:
             if node.is_named and node.type not in _NEVER_EXPANDED_LEAVES:
                 text = src[node.start_byte:node.end_byte].decode()
-                # A backslash-escaped ``\``` or ``\$`` is literal in a word, a
-                # double-quoted string and an unquoted heredoc body alike, so
-                # drop escaped characters before looking for an opener.
-                unescaped = _ESCAPED_CHAR.sub("", text)
-                if any(marker in unescaped for marker in _SUBSTITUTION_MARKERS):
+                unparsed = _unparsed_substitution(text)
+                if unparsed is not None:
                     # A substitution the parser did not turn into a node (see
-                    # ``_SUBSTITUTION_MARKERS``).  bash will still run it, so it
-                    # becomes a sub-command of its own: only a rule that matches
-                    # this raw text approves it.
-                    commands.append(text)
+                    # ``_SUBSTITUTION_MARKERS``): unknown code, returned from its
+                    # opener so no command-anchored rule can approve it.
+                    commands.append(unparsed)
+            return
+        if node.type == "command_substitution" and src.startswith(b"$((", node.start_byte):
+            # Arithmetic expansion.  In a heredoc body the parser mis-reads
+            # ``$((1+2))`` as a command substitution of a subshell running
+            # ``1+2``.  bash evaluates it as arithmetic — an invalid expression
+            # is an error and no substitution occurs (bash manual, "Arithmetic
+            # Expansion") — so the inner ``command`` is not a command.  Real
+            # substitutions nested in the expression (``$((1+$(id)))``) are
+            # still nodes below it and are still collected.
+            arithmetic(node)
             return
         if node.type == "command":
             commands.append(src[node.start_byte:node.end_byte].decode())

@@ -167,7 +167,7 @@ command: "echo hello && rm -rf /"
 - Command substitutions: `echo $(dangerous_cmd)` → sub-commands `["echo $(dangerous_cmd)", "dangerous_cmd"]`
 - Process substitutions: `diff <(sort a) <(sort b)` → `["diff <(sort a) <(sort b)", "sort a", "sort b"]`
 - Nesting is followed wherever it sits: quoted strings, `${var:-$(cmd)}`, `x=$(cmd) prog`, redirect targets, herestrings and unquoted heredoc bodies. A quoted heredoc (`<< 'EOF'`) is not expanded by bash and is not recursed into.
-- The parser misses a few forms bash still executes (a `$(…)` on an indented line of an unquoted heredoc, a backtick inside `${x:-…}`); any remaining `$(`, backtick, `<(` or `>(` in a place bash expands is returned as a sub-command of its own — raw text, which only a rule matching that text approves. Single-quoted strings, `$'…'`, comments and quoted heredoc bodies are literal and not scanned.
+- The parser misses a few forms bash still executes (a `$(…)` on an indented line of an unquoted heredoc, a backtick inside a heredoc body or inside `${x:-…}`). **An unparsed substitution is unknown code**: the text is returned as a sub-command *starting at the `$(` or backtick*, so a rule anchored on a command name can never match it and only an allow-everything rule approves it. Single-quoted strings, `$'…'`, comments and quoted heredoc bodies are literal and not scanned; `<(`/`>(` is not scanned because bash performs process substitution only as a bare word, which the parser already structures.
 - So `params: "echo .*"` permits `echo $(date)` only if `date` also matches a rule — `echo $(rm -rf /)` is denied because `rm -rf /` matches nothing. This is what OpenCode's own shell tool emits as well, so the Claude and OpenCode brokers agree.
 
 **Fallback (tree-sitter unavailable):**
