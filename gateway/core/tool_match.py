@@ -138,7 +138,10 @@ _FD_ONLY_REDIRECT_OPERATORS: frozenset[str] = frozenset({">&", "<&", ">&-", "<&-
 _FD_OPERAND = re.compile(r"\d*-?")  # "1", "1-" (move), "-" (close), "" (with >&-)
 
 # Destinations that are sinks, not files: writing to them has no persistent
-# effect, so a redirect to one is not a parameter to match.
+# effect, so a redirect to one is not a parameter to match.  /dev/stdout,
+# /dev/stderr and /dev/fd/N are sinks *here* because the tool process's stdio
+# are pipes owned by the agent harness (Claude Code's Bash tool, opencode's
+# shell tool); a redirect to them cannot reach a file on disk.
 _SINK_DESTINATIONS: frozenset[str] = frozenset({"/dev/null", "/dev/stdout", "/dev/stderr"})
 _DEV_FD = re.compile(r"/dev/fd/\d+")
 
@@ -166,6 +169,32 @@ def _first_unknowable(text: str) -> int:
             return i
         i += 1
     return -1
+
+
+def _join_continuations(text: str) -> str:
+    """Remove backslash-newline the way bash does: everywhere except inside single quotes."""
+    out: list[str] = []
+    in_single = False
+    i = 0
+    while i < len(text):
+        ch = text[i]
+        if in_single:
+            if ch == "'":
+                in_single = False
+            out.append(ch)
+        elif ch == "\\" and i + 1 < len(text) and text[i + 1] == "\n":
+            i += 2
+            continue
+        elif ch == "\\" and i + 1 < len(text):
+            out.append(text[i:i + 2])
+            i += 2
+            continue
+        else:
+            if ch == "'":
+                in_single = True
+            out.append(ch)
+        i += 1
+    return "".join(out)
 
 
 def _redirect_param(file_redirect, src: bytes) -> str | None:
@@ -220,12 +249,9 @@ def _redirect_param(file_redirect, src: bytes) -> str | None:
         # word (``> /var\\<newline>/tmp/x``) makes the grammar emit one
         # ``word`` per line while bash joins them.  Drop the continuations so
         # the text is the path bash sees.
-        dest = (
-            src[dest_children[0].start_byte:file_redirect.end_byte]
-            .decode()
-            .replace("\\\n", "")
-            .strip()
-        )
+        dest = _join_continuations(
+            src[dest_children[0].start_byte:file_redirect.end_byte].decode()
+        ).strip()
     if len(dest_children) == 1 and dest_children[0].type == "process_substitution":
         return None
     unknowable_at = _first_unknowable(dest)

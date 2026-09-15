@@ -650,6 +650,15 @@ class TestRedirectTargets(unittest.TestCase):
         self.assertEqual(params, [self.FETCH, "> /var/tmp/x"])
         self.assertFalse(all_params_match_any(self._preset(), "Bash", params))
 
+    def test_line_continuation_inside_single_quotes_is_kept(self):
+        """bash keeps `\\<newline>` inside single quotes: the directory really is named `sa\\<nl>fe`."""
+        params = extract_bash_subcommands(f"{self.FETCH} > '/tmp/sa\\\nfe/x'")
+        self.assertEqual(params, [self.FETCH, "> /tmp/sa\\\nfe/x"])
+        rule = [ToolRule(tool="Bash", params=r">>?\s*/tmp/safe/.*")]
+        self.assertFalse(all_params_match_any(rule, "Bash", params[1:]))
+        # outside quotes it is still joined
+        self.assertEqual(extract_bash_subcommands(f"{self.FETCH} > /tmp/sa\\\nfe/x"), [self.FETCH, "> /tmp/safe/x"])
+
     def test_misparsed_quoted_heredoc_is_not_a_fragment(self):
         """`<< E"OF"` with a plain body lands in an ERROR node; it is a quoted heredoc, not stray text."""
         cmd = 'coop send --room r - << E"OF"\nhello\nEOF'
