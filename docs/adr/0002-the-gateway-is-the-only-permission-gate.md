@@ -117,10 +117,13 @@ Concretely:
   access outside the allow-list — they were silently allowed before. Operators add
   `tool: edit` / `webfetch` / `websearch` rules or `skip_owner_approval` to keep them
   unprompted.
-- **The AgentSession/TUI path without a permission handler widens an existing gap.** There
-  the sidecar asks and nothing answers; bash already did that before this change, and
-  `edit`/`webfetch`/`websearch` now join it. Pre-existing class, not addressed here;
-  `--no-permissions` on an OpenCode agent is not a working configuration for those tools.
+- **AgentCoop's developer TUI (`python -m gateway.tools.tui`) run with its own
+  `--no-permissions` flag widens an existing gap on OpenCode.** That flag is the TUI's, not
+  opencode's: it only stops the TUI from attaching a terminal approve/deny handler to the
+  `AgentSession`, and is never passed to the sidecar. Without a handler the sidecar's asks
+  have no listener; bash already hung that way before this change, and
+  `edit`/`webfetch`/`websearch` now join it. Pre-existing class, developer-only, not
+  addressed here.
 - **A broker that fails to start marks any agent unavailable**, not only one with
   approval on. The fail-closed rule in `docs/architecture.md` is unconditional.
 - **`docs/requirements.md` §6.2 promises denial, not approval**, for the not-allow-listed
